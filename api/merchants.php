@@ -2122,12 +2122,18 @@ function formatMenuItemData($item, $baseUrl) {
         }
     }
     
-    // Parse variants
+    // Parse variants and REMOVE badge and price_per_unit
     $variants = [];
     if (!empty($item['variants_json'])) {
         $variants = json_decode($item['variants_json'], true);
         if (!is_array($variants)) {
             $variants = [];
+        } else {
+            // Remove badge and price_per_unit from each variant
+            foreach ($variants as &$variant) {
+                unset($variant['badge']);
+                unset($variant['price_per_unit']);
+            }
         }
     }
 
@@ -2155,7 +2161,7 @@ function formatMenuItemData($item, $baseUrl) {
         'description' => $item['description'],
         'price' => floatval($item['price'] ?? 0),
         'display_price' => floatval($displayPrice),
-        'formatted_price' => 'MK ' . number_format(floatval($displayPrice), 2) . ' / ' . $displayUnit,
+        // REMOVED formatted_price completely
         'image_url' => $imageUrl,
         'category' => $item['category'],
         'item_type' => $item['item_type'],
@@ -2165,7 +2171,7 @@ function formatMenuItemData($item, $baseUrl) {
         'is_popular' => boolval($item['is_popular']),
         'has_variants' => boolval($item['has_variants']),
         'variant_type' => $item['variant_type'],
-        'variants' => $variants,
+        'variants' => $variants,  // Now without badge and price_per_unit
         'add_ons' => $addOns,
         'preparation_time' => intval($item['preparation_time']),
         'max_quantity' => intval($item['max_quantity']),
