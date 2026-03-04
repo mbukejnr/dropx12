@@ -18,7 +18,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 /*********************************
- * SESSION CONFIG - MATCHING FLUTTER
+ * SESSION CONFIG
  *********************************/
 if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
@@ -83,17 +83,6 @@ function checkAuthentication($conn) {
         }
     }
     
-    if (!empty($_COOKIE['PHPSESSID'])) {
-        if (session_id() !== $_COOKIE['PHPSESSID']) {
-            session_id($_COOKIE['PHPSESSID']);
-            session_start();
-            
-            if (!empty($_SESSION['user_id'])) {
-                return $_SESSION['user_id'];
-            }
-        }
-    }
-    
     return false;
 }
 
@@ -147,24 +136,22 @@ function handleGetRequest($path, $queryParams) {
     }
 
     $userId = checkAuthentication($conn);
-    if (!$userId) {
-        ResponseHandler::error('Authentication required', 401);
-    }
+    $sessionId = session_id();
 
     if (strpos($path, '/cart') !== false) {
         $cartId = $queryParams['cart_id'] ?? null;
         $action = $queryParams['action'] ?? '';
         
         if ($action === 'count') {
-            getCartItemCount($conn, $userId);
+            getCartItemCount($conn, $userId, $sessionId);
         } elseif ($action === 'summary') {
-            getCartSummary($conn, $userId, $baseUrl);
+            getCartSummary($conn, $userId, $sessionId, $baseUrl);
         } elseif ($action === 'items') {
-            getCartItems($conn, $baseUrl, $userId);
+            getCartItems($conn, $userId, $sessionId, $baseUrl);
         } elseif ($cartId) {
             getCartDetails($conn, $cartId, $baseUrl, $userId);
         } else {
-            getCurrentCart($conn, $baseUrl, $userId);
+            getCurrentCart($conn, $userId, $sessionId, $baseUrl);
         }
     } else {
         ResponseHandler::error('Endpoint not found', 404);
@@ -172,21 +159,93 @@ function handleGetRequest($path, $queryParams) {
 }
 
 /*********************************
+ * GET OR CREATE USER CART
+ *********************************/
+function getOrCreateUserCart($conn, $userId = null, $sessionId = null) {
+    if (!$sessionId) {
+        $sessionId = session_id();
+    }
+    
+    // Try to find cart by user_id if logged in
+    if ($userId) {
+        $stmt = $conn->prepare(
+            "SELECT * FROM carts 
+             WHERE user_id = :user_id AND status = 'active'
+             ORDER BY created_at DESC LIMIT 1"
+        );
+        $stmt->execute([':user_id' => $userId]);
+        $cart = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($cart) {
+            return $cart;
+        }
+    }
+    
+    // Try to find cart by session_id for guest
+    $stmt = $conn->prepare(
+        "SELECT * FROM carts 
+         WHERE session_id = :session_id AND status = 'active'
+         ORDER BY created_at DESC LIMIT 1"
+    );
+    $stmt->execute([':session_id' => $sessionId]);
+    $cart = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if ($cart) {
+        return $cart;
+    }
+    
+    // Create new cart
+    $ipAddress = $_SERVER['REMOTE_ADDR'] ?? null;
+    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? null;
+    $expiresAt = date('Y-m-d H:i:s', strtotime('+30 days'));
+    
+    $insertStmt = $conn->prepare(
+        "INSERT INTO carts (user_id, session_id, status, ip_address, user_agent, expires_at, created_at, updated_at)
+         VALUES (:user_id, :session_id, 'active', :ip_address, :user_agent, :expires_at, NOW(), NOW())"
+    );
+    
+    try {
+        $insertStmt->execute([
+            ':user_id' => $userId,
+            ':session_id' => $sessionId,
+            ':ip_address' => $ipAddress,
+            ':user_agent' => $userAgent,
+            ':expires_at' => $expiresAt
+        ]);
+        $cartId = $conn->lastInsertId();
+        
+        return [
+            'id' => $cartId,
+            'user_id' => $userId,
+            'session_id' => $sessionId,
+            'status' => 'active',
+            'ip_address' => $ipAddress,
+            'user_agent' => $userAgent,
+            'expires_at' => $expiresAt,
+            'created_at' => date('Y-m-d H:i:s'),
+            'updated_at' => date('Y-m-d H:i:s')
+        ];
+    } catch (Exception $e) {
+        error_log("Failed to create cart: " . $e->getMessage());
+        return false;
+    }
+}
+
+/*********************************
  * GET CURRENT CART
  *********************************/
-function getCurrentCart($conn, $baseUrl, $userId) {
-    $cart = getOrCreateUserCart($conn, $userId);
+function getCurrentCart($conn, $userId, $sessionId, $baseUrl) {
+    $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
     if (!$cart) {
         ResponseHandler::error('Failed to retrieve cart', 500);
     }
     
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
-    $totals = calculateCartTotals($conn, $cart['id'], $userId);
-    $promotions = getApplicablePromotions($conn, $userId, $totals['subtotal'] ?? 0);
-    $appliedPromotion = getAppliedPromotion($conn, $cart['id']);
+    $cartItems = getCartItemsByCartId($conn, $cart['id'], $baseUrl);
+    $promotion = getCartPromotion($conn, $cart['id']);
+    $totals = calculateCartTotals($conn, $cart['id'], $cartItems);
     
-    // Get merchant grouping for better display
+    // Get merchant grouping
     $groupedItems = groupCartItemsByMerchant($cartItems);
     
     ResponseHandler::success([
@@ -195,26 +254,17 @@ function getCurrentCart($conn, $baseUrl, $userId) {
             'cart' => [
                 'id' => $cart['id'],
                 'user_id' => $cart['user_id'],
-                'status' => $cart['status'] ?? 'active',
+                'session_id' => $cart['session_id'],
+                'status' => $cart['status'],
+                'expires_at' => $cart['expires_at'],
                 'created_at' => $cart['created_at'],
                 'updated_at' => $cart['updated_at']
             ],
             'items' => $cartItems,
             'grouped_by_merchant' => $groupedItems,
-            'summary' => [
-                'subtotal' => $totals['subtotal'] ?? 0,
-                'delivery_fee' => $totals['delivery_fee'] ?? 0,
-                'service_fee' => $totals['service_fee'] ?? 0,
-                'tax_amount' => $totals['tax_amount'] ?? 0,
-                'discount_amount' => $totals['discount_amount'] ?? 0,
-                'total_amount' => $totals['total_amount'] ?? 0,
-                'item_count' => $totals['item_count'] ?? 0,
-                'total_quantity' => $totals['total_quantity'] ?? 0,
-                'merchant_count' => count($groupedItems)
-            ],
-            'promotions' => $promotions,
-            'applied_promotion' => $appliedPromotion,
-            'is_eligible_for_checkout' => ($totals['item_count'] ?? 0) > 0
+            'promotion' => $promotion,
+            'summary' => $totals,
+            'is_eligible_for_checkout' => !empty($cartItems)
         ]
     ]);
 }
@@ -222,8 +272,8 @@ function getCurrentCart($conn, $baseUrl, $userId) {
 /*********************************
  * GET CART ITEMS
  *********************************/
-function getCartItems($conn, $baseUrl, $userId) {
-    $cart = getOrCreateUserCart($conn, $userId);
+function getCartItems($conn, $userId, $sessionId, $baseUrl) {
+    $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
     if (!$cart) {
         ResponseHandler::success([
@@ -232,7 +282,7 @@ function getCartItems($conn, $baseUrl, $userId) {
         ]);
     }
     
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
+    $cartItems = getCartItemsByCartId($conn, $cart['id'], $baseUrl);
     
     ResponseHandler::success([
         'success' => true,
@@ -245,17 +295,23 @@ function getCartItems($conn, $baseUrl, $userId) {
  *********************************/
 function getCartDetails($conn, $cartId, $baseUrl, $userId) {
     $cartStmt = $conn->prepare(
-        "SELECT * FROM carts WHERE id = :id AND user_id = :user_id"
+        "SELECT * FROM carts WHERE id = :id"
     );
-    $cartStmt->execute([':id' => $cartId, ':user_id' => $userId]);
+    $cartStmt->execute([':id' => $cartId]);
     $cart = $cartStmt->fetch(PDO::FETCH_ASSOC);
     
     if (!$cart) {
         ResponseHandler::error('Cart not found', 404);
     }
     
+    // Verify ownership
+    if ($cart['user_id'] && $cart['user_id'] != $userId) {
+        ResponseHandler::error('Unauthorized', 403);
+    }
+    
     $cartItems = getCartItemsByCartId($conn, $cartId, $baseUrl);
-    $totals = calculateCartTotals($conn, $cartId, $userId);
+    $promotion = getCartPromotion($conn, $cartId);
+    $totals = calculateCartTotals($conn, $cartId, $cartItems);
     $groupedItems = groupCartItemsByMerchant($cartItems);
     
     ResponseHandler::success([
@@ -264,6 +320,7 @@ function getCartDetails($conn, $cartId, $baseUrl, $userId) {
             'cart' => $cart,
             'items' => $cartItems,
             'grouped_by_merchant' => $groupedItems,
+            'promotion' => $promotion,
             'summary' => $totals
         ]
     ]);
@@ -272,8 +329,8 @@ function getCartDetails($conn, $cartId, $baseUrl, $userId) {
 /*********************************
  * GET CART SUMMARY
  *********************************/
-function getCartSummary($conn, $userId, $baseUrl) {
-    $cart = getOrCreateUserCart($conn, $userId);
+function getCartSummary($conn, $userId, $sessionId, $baseUrl) {
+    $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
     if (!$cart) {
         ResponseHandler::success([
@@ -289,15 +346,14 @@ function getCartSummary($conn, $userId, $baseUrl) {
     
     $stmt = $conn->prepare(
         "SELECT 
-            COUNT(ci.id) as item_count,
-            SUM(ci.quantity) as total_quantity,
-            SUM(COALESCE(mi.price, 0) * ci.quantity) as subtotal
-         FROM cart_items ci
-         LEFT JOIN menu_items mi ON ci.menu_item_id = mi.id
-         WHERE ci.user_id = :user_id AND ci.is_active = 1"
+            COUNT(id) as item_count,
+            SUM(quantity) as total_quantity,
+            SUM(price * quantity) as subtotal
+         FROM cart_items 
+         WHERE cart_id = :cart_id AND is_active = 1"
     );
     
-    $stmt->execute([':user_id' => $userId]);
+    $stmt->execute([':cart_id' => $cart['id']]);
     $result = $stmt->fetch(PDO::FETCH_ASSOC);
     
     ResponseHandler::success([
@@ -315,8 +371,8 @@ function getCartSummary($conn, $userId, $baseUrl) {
 /*********************************
  * GET CART ITEM COUNT
  *********************************/
-function getCartItemCount($conn, $userId) {
-    $cart = getOrCreateUserCart($conn, $userId);
+function getCartItemCount($conn, $userId, $sessionId) {
+    $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
     if (!$cart) {
         ResponseHandler::success([
@@ -331,13 +387,13 @@ function getCartItemCount($conn, $userId) {
     
     $stmt = $conn->prepare(
         "SELECT 
-            COUNT(ci.id) as item_count, 
-            SUM(ci.quantity) as total_quantity
-         FROM cart_items ci
-         WHERE ci.user_id = :user_id AND ci.is_active = 1"
+            COUNT(id) as item_count, 
+            SUM(quantity) as total_quantity
+         FROM cart_items 
+         WHERE cart_id = :cart_id AND is_active = 1"
     );
     
-    $stmt->execute([':user_id' => $userId]);
+    $stmt->execute([':cart_id' => $cart['id']]);
     $result = $stmt->fetch(PDO::FETCH_ASSOC);
     
     ResponseHandler::success([
@@ -352,112 +408,50 @@ function getCartItemCount($conn, $userId) {
 }
 
 /*********************************
- * GET CART ITEMS BY USER ID
+ * GET CART ITEMS BY CART ID
  *********************************/
-function getCartItemsByUserId($conn, $userId, $baseUrl) {
+function getCartItemsByCartId($conn, $cartId, $baseUrl) {
     $stmt = $conn->prepare(
         "SELECT 
-            ci.id,
-            ci.user_id,
-            ci.cart_id,
-            ci.menu_item_id as item_id,
-            ci.quick_order_id,
-            ci.quick_order_item_id,
-            ci.quantity,
-            ci.special_instructions,
-            ci.selected_options,
-            ci.variant_id,
-            ci.variant_data,
-            ci.variant_name,
-            ci.add_ons_json,
-            ci.price as cart_item_price,
-            ci.created_at,
-            ci.updated_at,
-            
+            ci.*,
             -- Menu item fields
-            mi.name as item_name,
-            mi.description as item_description,
-            mi.price,
-            mi.image_url as item_image,
-            mi.category as item_category,
-            mi.item_type,
+            mi.name as menu_item_name,
+            mi.description as menu_item_description,
+            mi.image_url as menu_item_image,
+            mi.category as menu_item_category,
             mi.unit_type,
-            mi.unit_value,
-            mi.max_quantity as item_max_quantity,
-            mi.stock_quantity as item_stock_quantity,
-            mi.has_variants as item_has_variants,
-            mi.nutritional_info as item_nutritional_info,
-            mi.dietary_tags,
-            mi.allergens,
             
-            -- Quick order fields (if applicable)
-            qo.id as quick_order_id_ref,
+            -- Quick order fields
             qo.title as quick_order_title,
             qo.description as quick_order_description,
-            qo.price as quick_order_price,
             qo.image_url as quick_order_image,
             qo.category as quick_order_category,
-            qo.item_type as quick_order_item_type,
-            qo.preparation_time as quick_order_preparation_time,
-            qo.has_variants as quick_order_has_variants,
-            qo.variant_type as quick_order_variant_type,
-            qo.variants as quick_order_variants,
-            qo.add_ons as quick_order_add_ons,
-            qo.nutritional_info as quick_order_nutritional_info,
-            qo.serving_size,
-            qo.serving_unit,
-            qo.calories,
-            qo.allergens as qo_allergens,
-            qo.dietary_tags as qo_dietary_tags,
             
             -- Quick order item fields
-            qoi.id as qoi_id,
-            qoi.name as qoi_name,
-            qoi.description as qoi_description,
-            qoi.price as qoi_price,
-            qoi.image_url as qoi_image,
-            qoi.measurement_type as qoi_measurement_type,
-            qoi.unit as qoi_unit,
-            qoi.quantity as qoi_quantity,
-            qoi.custom_unit as qoi_custom_unit,
-            qoi.has_variants as qoi_has_variants,
-            qoi.variants_json as qoi_variants_json,
-            qoi.max_quantity as qoi_max_quantity,
-            qoi.stock_quantity as qoi_stock_quantity,
-            qoi.badge as qoi_badge,
-            qoi.price_per_unit as qoi_price_per_unit,
+            qoi.name as quick_order_item_name,
+            qoi.description as quick_order_item_description,
+            qoi.image_url as quick_order_item_image,
+            qoi.measurement_type,
+            qoi.unit,
+            qoi.quantity as item_quantity_value,
             
             -- Merchant fields
-            COALESCE(m.id, 0) as merchant_id,
-            COALESCE(m.name, 'Unknown Merchant') as merchant_name,
-            m.category as merchant_category,
+            m.id as merchant_id,
+            m.name as merchant_name,
             m.image_url as merchant_image,
             m.logo_url as merchant_logo,
-            COALESCE(m.rating, 0) as merchant_rating,
-            COALESCE(m.is_open, 1) as merchant_is_open,
-            COALESCE(m.delivery_fee, 2500.00) as merchant_delivery_fee,
-            COALESCE(m.min_order_amount, 5000.00) as merchant_min_order,
+            m.rating as merchant_rating,
+            m.is_open as merchant_is_open,
+            m.delivery_fee,
+            m.min_order_amount,
             m.free_delivery_threshold,
-            COALESCE(m.delivery_time, '30-45 min') as merchant_delivery_time,
-            COALESCE(m.preparation_time, '15-20 min') as merchant_prep_time,
+            m.delivery_time,
+            m.preparation_time as merchant_preparation_time,
             m.business_type,
             m.cuisine_type,
             m.address as merchant_address,
-            m.latitude as merchant_lat,
-            m.longitude as merchant_lng,
-            m.tags as merchant_tags,
-            m.payment_methods,
-            
-            -- Quick order merchant fields
-            qom.priority,
-            qom.custom_price,
-            qom.custom_delivery_time,
-            qom.is_active as quick_order_merchant_active,
-            
-            CASE 
-                WHEN m.category LIKE '%dropx%' OR m.name LIKE '%DropX%' THEN 1
-                ELSE 0 
-            END as is_dropx,
+            m.latitude,
+            m.longitude,
             
             -- Determine source type
             CASE 
@@ -470,14 +464,18 @@ function getCartItemsByUserId($conn, $userId, $baseUrl) {
         LEFT JOIN quick_orders qo ON ci.quick_order_id = qo.id
         LEFT JOIN quick_order_items qoi ON ci.quick_order_item_id = qoi.id
         LEFT JOIN merchants m ON ci.merchant_id = m.id
-        LEFT JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id AND qom.merchant_id = m.id
-        WHERE ci.user_id = :user_id
+        WHERE ci.cart_id = :cart_id
         AND ci.is_active = 1
         ORDER BY ci.created_at DESC"
     );
     
-    $stmt->execute([':user_id' => $userId]);
+    $stmt->execute([':cart_id' => $cartId]);
     $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Get add-ons for each item
+    foreach ($items as &$item) {
+        $item['add_ons'] = getCartItemAddOns($conn, $item['id']);
+    }
     
     return array_map(function($item) use ($baseUrl) {
         return formatCartItemData($item, $baseUrl);
@@ -485,42 +483,30 @@ function getCartItemsByUserId($conn, $userId, $baseUrl) {
 }
 
 /*********************************
- * GET CART ITEMS BY CART ID
+ * GET CART ITEM ADD-ONS
  *********************************/
-function getCartItemsByCartId($conn, $cartId, $baseUrl) {
+function getCartItemAddOns($conn, $cartItemId) {
     $stmt = $conn->prepare(
-        "SELECT 
-            ci.*,
-            mi.name as item_name,
-            mi.description as item_description,
-            mi.price,
-            mi.image_url as item_image,
-            qo.title as quick_order_title,
-            qo.description as quick_order_description,
-            qo.price as quick_order_price,
-            qo.image_url as quick_order_image,
-            qoi.name as qoi_name,
-            qoi.price as qoi_price,
-            qoi.image_url as qoi_image,
-            m.name as merchant_name,
-            m.image_url as merchant_image,
-            m.logo_url as merchant_logo
-         FROM cart_items ci
-         LEFT JOIN menu_items mi ON ci.menu_item_id = mi.id
-         LEFT JOIN quick_orders qo ON ci.quick_order_id = qo.id
-         LEFT JOIN quick_order_items qoi ON ci.quick_order_item_id = qoi.id
-         LEFT JOIN merchants m ON ci.merchant_id = m.id
-         WHERE ci.cart_id = :cart_id
-         AND ci.is_active = 1
-         ORDER BY ci.created_at DESC"
+        "SELECT * FROM cart_addons 
+         WHERE cart_item_id = :cart_item_id
+         ORDER BY created_at ASC"
     );
-    
+    $stmt->execute([':cart_item_id' => $cartItemId]);
+    return $stmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/*********************************
+ * GET CART PROMOTION
+ *********************************/
+function getCartPromotion($conn, $cartId) {
+    $stmt = $conn->prepare(
+        "SELECT cp.*, p.code, p.name, p.description, p.discount_type, p.discount_value
+         FROM cart_promotions cp
+         LEFT JOIN promotions p ON cp.promotion_id = p.id
+         WHERE cp.cart_id = :cart_id"
+    );
     $stmt->execute([':cart_id' => $cartId]);
-    $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    return array_map(function($item) use ($baseUrl) {
-        return formatCartItemData($item, $baseUrl);
-    }, $items);
+    return $stmt->fetch(PDO::FETCH_ASSOC);
 }
 
 /*********************************
@@ -540,8 +526,8 @@ function groupCartItemsByMerchant($items) {
                 'merchant_logo' => $item['merchant_logo'] ?? null,
                 'merchant_rating' => floatval($item['merchant_rating'] ?? 0),
                 'merchant_is_open' => boolval($item['merchant_is_open'] ?? true),
-                'delivery_fee' => floatval($item['merchant_delivery_fee'] ?? 2500.00),
-                'min_order' => floatval($item['merchant_min_order'] ?? 5000.00),
+                'delivery_fee' => floatval($item['delivery_fee'] ?? 0),
+                'min_order' => floatval($item['min_order_amount'] ?? 0),
                 'business_type' => $item['business_type'] ?? 'restaurant',
                 'cuisine_types' => $item['cuisine_types'] ?? [],
                 'items' => [],
@@ -561,296 +547,53 @@ function groupCartItemsByMerchant($items) {
 }
 
 /*********************************
- * GET OR CREATE USER CART
- *********************************/
-function getOrCreateUserCart($conn, $userId) {
-    $stmt = $conn->prepare(
-        "SELECT id, user_id, status, applied_promotion_id, applied_discount, created_at, updated_at 
-         FROM carts 
-         WHERE user_id = :user_id AND status = 'active'
-         ORDER BY created_at DESC LIMIT 1"
-    );
-    
-    $stmt->execute([':user_id' => $userId]);
-    $cart = $stmt->fetch(PDO::FETCH_ASSOC);
-    
-    if ($cart) {
-        return $cart;
-    }
-    
-    $insertStmt = $conn->prepare(
-        "INSERT INTO carts (user_id, status, created_at, updated_at)
-         VALUES (:user_id, 'active', NOW(), NOW())"
-    );
-    
-    try {
-        $insertStmt->execute([':user_id' => $userId]);
-        $cartId = $conn->lastInsertId();
-        
-        return [
-            'id' => $cartId,
-            'user_id' => $userId,
-            'status' => 'active',
-            'applied_promotion_id' => null,
-            'applied_discount' => null,
-            'created_at' => date('Y-m-d H:i:s'),
-            'updated_at' => date('Y-m-d H:i:s')
-        ];
-    } catch (Exception $e) {
-        error_log("Failed to create cart: " . $e->getMessage());
-        return false;
-    }
-}
-
-/*********************************
  * CALCULATE CART TOTALS
  *********************************/
-function calculateCartTotals($conn, $cartId, $userId) {
-    $stmt = $conn->prepare(
-        "SELECT 
-            SUM(CASE 
-                WHEN qo.id IS NOT NULL THEN COALESCE(qom.custom_price, qoi.price, qo.price, 0) * ci.quantity
-                ELSE COALESCE(mi.price, 0) * ci.quantity 
-            END) as subtotal,
-            COUNT(ci.id) as item_count,
-            SUM(ci.quantity) as total_quantity,
-            GROUP_CONCAT(DISTINCT COALESCE(ci.merchant_id, 0)) as merchant_ids
-        FROM cart_items ci
-        LEFT JOIN menu_items mi ON ci.menu_item_id = mi.id
-        LEFT JOIN quick_orders qo ON ci.quick_order_id = qo.id
-        LEFT JOIN quick_order_items qoi ON ci.quick_order_item_id = qoi.id
-        LEFT JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id AND qom.merchant_id = ci.merchant_id
-        WHERE ci.cart_id = :cart_id
-        AND ci.user_id = :user_id
-        AND ci.is_active = 1"
+function calculateCartTotals($conn, $cartId, $cartItems) {
+    $subtotal = 0;
+    $itemCount = 0;
+    $totalQuantity = 0;
+    $merchantIds = [];
+    
+    foreach ($cartItems as $item) {
+        $subtotal += $item['total'] ?? 0;
+        $itemCount++;
+        $totalQuantity += $item['quantity'] ?? 1;
+        if (!empty($item['merchant_id'])) {
+            $merchantIds[$item['merchant_id']] = true;
+        }
+    }
+    
+    // Get promotion discount
+    $promoStmt = $conn->prepare(
+        "SELECT discount_amount FROM cart_promotions WHERE cart_id = :cart_id"
     );
-    
-    $stmt->execute([':cart_id' => $cartId, ':user_id' => $userId]);
-    $result = $stmt->fetch(PDO::FETCH_ASSOC);
-    
-    $subtotal = floatval($result['subtotal'] ?? 0);
-    $itemCount = intval($result['item_count'] ?? 0);
-    $totalQuantity = intval($result['total_quantity'] ?? 0);
-    $merchantIds = array_filter(explode(',', $result['merchant_ids'] ?? ''));
-    
-    // Get applied promotion discount
-    $promoStmt = $conn->prepare("SELECT applied_discount FROM carts WHERE id = :cart_id");
     $promoStmt->execute([':cart_id' => $cartId]);
     $promoResult = $promoStmt->fetch(PDO::FETCH_ASSOC);
-    $promotionDiscount = floatval($promoResult['applied_discount'] ?? 0);
+    $promotionDiscount = floatval($promoResult['discount_amount'] ?? 0);
     
     $adjustedSubtotal = max(0, $subtotal - $promotionDiscount);
     
-    // Calculate delivery fees based on merchants
-    $deliveryFee = calculateDeliveryFee($conn, $userId, $merchantIds, $adjustedSubtotal);
-    
-    // Service fee (2% of adjusted subtotal, minimum 500 MWK)
-    $serviceFee = max(500.00, $adjustedSubtotal * 0.02);
-    
-    // Tax calculation (10% VAT)
-    $taxableAmount = $adjustedSubtotal + $deliveryFee + $serviceFee;
-    $taxAmount = $taxableAmount * 0.10;
-    $totalAmount = $taxableAmount + $taxAmount;
+    // Calculate delivery fee from merchants
+    $deliveryFee = 0;
+    foreach (array_keys($merchantIds) as $merchantId) {
+        $merchantStmt = $conn->prepare(
+            "SELECT delivery_fee FROM merchants WHERE id = :id"
+        );
+        $merchantStmt->execute([':id' => $merchantId]);
+        $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
+        $deliveryFee += floatval($merchant['delivery_fee'] ?? 0);
+    }
     
     return [
         'subtotal' => round($subtotal, 2),
         'discount_amount' => round($promotionDiscount, 2),
         'adjusted_subtotal' => round($adjustedSubtotal, 2),
         'delivery_fee' => round($deliveryFee, 2),
-        'service_fee' => round($serviceFee, 2),
-        'tax_amount' => round($taxAmount, 2),
-        'total_amount' => round($totalAmount, 2),
+        'total_amount' => round($adjustedSubtotal + $deliveryFee, 2),
         'item_count' => $itemCount,
         'total_quantity' => $totalQuantity,
         'merchant_count' => count($merchantIds)
-    ];
-}
-
-/*********************************
- * CALCULATE DELIVERY FEE
- *********************************/
-function calculateDeliveryFee($conn, $userId, $merchantIds, $subtotal) {
-    if (empty($merchantIds)) {
-        return 2500.00; // Default fee in MWK
-    }
-    
-    // Get user's default address for distance calculation
-    $addressStmt = $conn->prepare(
-        "SELECT latitude, longitude FROM addresses 
-         WHERE user_id = :user_id AND is_default = 1
-         LIMIT 1"
-    );
-    
-    $addressStmt->execute([':user_id' => $userId]);
-    $address = $addressStmt->fetch(PDO::FETCH_ASSOC);
-    
-    $totalDeliveryFee = 0;
-    $uniqueMerchants = array_unique(array_filter($merchantIds));
-    
-    foreach ($uniqueMerchants as $merchantId) {
-        if (empty($merchantId) || $merchantId == 0) {
-            $totalDeliveryFee += 2500.00;
-            continue;
-        }
-        
-        $merchantStmt = $conn->prepare(
-            "SELECT delivery_fee, min_order_amount, free_delivery_threshold, 
-                    latitude, longitude
-             FROM merchants WHERE id = :id"
-        );
-        $merchantStmt->execute([':id' => $merchantId]);
-        $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
-        
-        if ($merchant) {
-            $merchantFee = floatval($merchant['delivery_fee'] ?? 2500.00);
-            
-            // Check if free delivery threshold is met
-            if (!empty($merchant['free_delivery_threshold']) && $subtotal >= floatval($merchant['free_delivery_threshold'])) {
-                $merchantFee = 0;
-            }
-            
-            // Adjust fee based on distance if address is available
-            if ($address && !empty($merchant['latitude']) && !empty($merchant['longitude'])) {
-                $distance = calculateDistance(
-                    $merchant['latitude'], $merchant['longitude'],
-                    $address['latitude'], $address['longitude']
-                );
-                
-                // Add distance-based adjustment (extra 500 MWK per 5km beyond base)
-                if ($distance > 5) {
-                    $extraDistance = ceil(($distance - 5) / 5);
-                    $merchantFee += ($extraDistance * 500);
-                }
-            }
-            
-            $totalDeliveryFee += $merchantFee;
-        } else {
-            $totalDeliveryFee += 2500.00;
-        }
-    }
-    
-    return min($totalDeliveryFee, 15000.00); // Cap at 15,000 MWK maximum
-}
-
-/*********************************
- * GET APPLICABLE PROMOTIONS
- *********************************/
-function getApplicablePromotions($conn, $userId, $subtotal) {
-    $currentDate = date('Y-m-d H:i:s');
-    
-    $stmt = $conn->prepare(
-        "SELECT p.*, 
-                pm.merchant_id,
-                pqo.quick_order_id
-         FROM promotions p
-         LEFT JOIN promotion_merchants pm ON p.id = pm.promotion_id
-         LEFT JOIN promotion_quick_orders pqo ON p.id = pqo.promotion_id
-         WHERE p.is_active = 1
-         AND p.start_date <= :current_date
-         AND p.end_date >= :current_date
-         AND (p.usage_limit IS NULL OR p.times_used < p.usage_limit)
-         AND (p.min_order_amount IS NULL OR p.min_order_amount <= :subtotal)
-         ORDER BY p.discount_value DESC"
-    );
-    
-    $stmt->execute([':current_date' => $currentDate, ':subtotal' => $subtotal]);
-    $promotions = $stmt->fetchAll(PDO::FETCH_ASSOC);
-    
-    $applicablePromotions = [];
-    foreach ($promotions as $promotion) {
-        $usageStmt = $conn->prepare(
-            "SELECT COUNT(*) as usage_count
-             FROM promotion_usage
-             WHERE promotion_id = :promotion_id AND user_id = :user_id"
-        );
-        
-        $usageStmt->execute([':promotion_id' => $promotion['id'], ':user_id' => $userId]);
-        $usage = $usageStmt->fetch(PDO::FETCH_ASSOC);
-        $userUsageCount = intval($usage['usage_count'] ?? 0);
-        
-        if (!empty($promotion['per_user_limit']) && $userUsageCount >= $promotion['per_user_limit']) {
-            continue;
-        }
-        
-        $discountAmount = calculateDiscountAmount($promotion, $subtotal);
-        
-        $applicablePromotions[] = [
-            'id' => $promotion['id'],
-            'code' => $promotion['code'] ?? '',
-            'name' => $promotion['name'] ?? $promotion['title'] ?? '',
-            'description' => $promotion['description'] ?? '',
-            'discount_type' => $promotion['discount_type'] ?? 'percentage',
-            'discount_value' => floatval($promotion['discount_value'] ?? 0),
-            'discount_amount' => round($discountAmount, 2),
-            'min_order_amount' => floatval($promotion['min_order_amount'] ?? 0),
-            'max_discount_amount' => floatval($promotion['max_discount_amount'] ?? 0),
-            'usage_limit' => $promotion['usage_limit'] ?? null,
-            'per_user_limit' => $promotion['per_user_limit'] ?? null,
-            'user_usage_count' => $userUsageCount,
-            'applicable_to' => $promotion['applicable_to'] ?? 'all',
-            'merchant_id' => $promotion['merchant_id'] ?? null,
-            'quick_order_id' => $promotion['quick_order_id'] ?? null,
-            'start_date' => $promotion['start_date'] ?? null,
-            'end_date' => $promotion['end_date'] ?? null
-        ];
-    }
-    
-    return $applicablePromotions;
-}
-
-/*********************************
- * CALCULATE DISCOUNT AMOUNT
- *********************************/
-function calculateDiscountAmount($promotion, $subtotal) {
-    $discountType = $promotion['discount_type'] ?? 'percentage';
-    $discountValue = floatval($promotion['discount_value'] ?? 0);
-    $maxDiscount = floatval($promotion['max_discount_amount'] ?? 0);
-    
-    if ($discountType === 'percentage') {
-        $discountAmount = $subtotal * ($discountValue / 100);
-        if ($maxDiscount > 0 && $discountAmount > $maxDiscount) {
-            $discountAmount = $maxDiscount;
-        }
-    } elseif ($discountType === 'fixed') {
-        $discountAmount = min($discountValue, $subtotal);
-    } elseif ($discountType === 'free_delivery') {
-        $discountAmount = 0; // Will be calculated based on delivery fee
-    } else {
-        $discountAmount = 0;
-    }
-    
-    return $discountAmount;
-}
-
-/*********************************
- * GET APPLIED PROMOTION
- *********************************/
-function getAppliedPromotion($conn, $cartId) {
-    $stmt = $conn->prepare(
-        "SELECT c.applied_promotion_id, c.applied_discount, 
-                p.code, p.name, p.description, p.discount_type, p.discount_value,
-                p.max_discount_amount
-         FROM carts c
-         LEFT JOIN promotions p ON c.applied_promotion_id = p.id
-         WHERE c.id = :cart_id"
-    );
-    
-    $stmt->execute([':cart_id' => $cartId]);
-    $result = $stmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$result || empty($result['applied_promotion_id'])) {
-        return null;
-    }
-    
-    return [
-        'promotion_id' => $result['applied_promotion_id'],
-        'code' => $result['code'] ?? '',
-        'name' => $result['name'] ?? '',
-        'description' => $result['description'] ?? '',
-        'discount_type' => $result['discount_type'] ?? 'percentage',
-        'discount_value' => floatval($result['discount_value'] ?? 0),
-        'applied_discount' => floatval($result['applied_discount'] ?? 0),
-        'max_discount_amount' => floatval($result['max_discount_amount'] ?? 0)
     ];
 }
 
@@ -867,48 +610,33 @@ function handlePostRequest($path, $data) {
     }
 
     $userId = checkAuthentication($conn);
-    if (!$userId) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-
+    $sessionId = session_id();
     $action = $data['action'] ?? '';
     
     switch ($action) {
         case 'add_item':
-            addItemToCart($conn, $data, $userId, $baseUrl);
+            addItemToCart($conn, $data, $userId, $sessionId, $baseUrl);
             break;
         case 'add_quick_order':
-            addQuickOrderToCart($conn, $data, $userId, $baseUrl);
+            addQuickOrderToCart($conn, $data, $userId, $sessionId, $baseUrl);
             break;
-        case 'add_multiple':
-            addMultipleItemsToCart($conn, $data, $userId, $baseUrl);
+        case 'update_quantity':
+            updateCartItemQuantity($conn, $data, $userId, $sessionId, $baseUrl);
             break;
-        case 'apply_promo':
-            applyPromotionToCart($conn, $data, $userId);
-            break;
-        case 'remove_promo':
-            removePromotionFromCart($conn, $data, $userId);
+        case 'remove_item':
+            removeCartItem($conn, $data, $userId, $sessionId, $baseUrl);
             break;
         case 'clear_cart':
-            clearCart($conn, $data, $userId);
+            clearCart($conn, $data, $userId, $sessionId);
             break;
-        case 'validate_cart':
-            validateCart($conn, $data, $userId, $baseUrl);
+        case 'apply_promotion':
+            applyPromotionToCart($conn, $data, $userId, $sessionId);
             break;
-        case 'prepare_checkout':
-            prepareCheckout($conn, $data, $userId, $baseUrl);
+        case 'remove_promotion':
+            removePromotionFromCart($conn, $data, $userId, $sessionId);
             break;
-        case 'merge_cart':
-            mergeCart($conn, $data, $userId, $baseUrl);
-            break;
-        case 'estimate_delivery':
-            estimateDelivery($conn, $data, $userId);
-            break;
-        case 'check_availability':
-            checkItemAvailability($conn, $data, $userId);
-            break;
-        case 'debug_auth':
-            debugAuth($conn);
+        case 'save_for_later':
+            toggleSaveForLater($conn, $data, $userId, $sessionId);
             break;
         default:
             ResponseHandler::error('Invalid action: ' . $action, 400);
@@ -916,9 +644,9 @@ function handlePostRequest($path, $data) {
 }
 
 /*********************************
- * ADD ITEM TO CART - UPDATED (SINGLE MERCHANT)
+ * ADD ITEM TO CART (MENU ITEM)
  *********************************/
-function addItemToCart($conn, $data, $userId, $baseUrl) {
+function addItemToCart($conn, $data, $userId, $sessionId, $baseUrl) {
     $menuItemId = $data['menu_item_id'] ?? null;
     $quantity = intval($data['quantity'] ?? 1);
     $specialInstructions = trim($data['special_instructions'] ?? '');
@@ -933,20 +661,14 @@ function addItemToCart($conn, $data, $userId, $baseUrl) {
     }
     
     // Get item details with merchant info
-    $itemCheckStmt = $conn->prepare(
+    $itemStmt = $conn->prepare(
         "SELECT 
-            mi.id, mi.name, mi.description, mi.price, mi.image_url,
-            mi.is_available, mi.max_quantity, mi.stock_quantity,
-            mi.has_variants, mi.variants_json, mi.nutritional_info,
-            mi.unit_type, mi.unit_value, mi.preparation_time,
-            mi.category, mi.item_type, mi.dietary_tags, mi.allergens,
-            m.id as merchant_id, m.name as merchant_name,
-            m.image_url as merchant_image, m.logo_url as merchant_logo,
-            m.rating as merchant_rating, m.is_open as merchant_is_open,
-            m.delivery_fee, m.min_order_amount, m.free_delivery_threshold,
-            m.preparation_time as merchant_prep_time, m.business_type,
-            m.cuisine_type, m.address, m.latitude, m.longitude,
-            m.tags as merchant_tags, m.payment_methods
+            mi.*,
+            m.id as merchant_id,
+            m.name as merchant_name,
+            m.delivery_fee,
+            m.min_order_amount,
+            m.preparation_time as merchant_prep_time
          FROM menu_items mi
          LEFT JOIN merchants m ON mi.merchant_id = m.id
          WHERE mi.id = :item_id
@@ -954,75 +676,56 @@ function addItemToCart($conn, $data, $userId, $baseUrl) {
          AND m.is_active = 1"
     );
     
-    $itemCheckStmt->execute([':item_id' => $menuItemId]);
-    $item = $itemCheckStmt->fetch(PDO::FETCH_ASSOC);
+    $itemStmt->execute([':item_id' => $menuItemId]);
+    $item = $itemStmt->fetch(PDO::FETCH_ASSOC);
     
     if (!$item) {
-        ResponseHandler::error('Item not available or merchant not active', 404);
-    }
-    
-    if (empty($item['merchant_is_open'])) {
-        ResponseHandler::error('Merchant is currently closed', 400);
-    }
-    
-    if (!empty($item['max_quantity']) && $quantity > $item['max_quantity']) {
-        ResponseHandler::error("Maximum quantity allowed is {$item['max_quantity']}", 400);
-    }
-    
-    if ($item['stock_quantity'] !== null && $quantity > $item['stock_quantity']) {
-        ResponseHandler::error("Only {$item['stock_quantity']} items available in stock", 400);
+        ResponseHandler::error('Item not available', 404);
     }
     
     // Get or create cart
-    $cart = getOrCreateUserCart($conn, $userId);
+    $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
-    // ===== SINGLE MERCHANT VALIDATION =====
-    // Check if cart already has items from a different merchant
-    $existingMerchantStmt = $conn->prepare(
-        "SELECT DISTINCT merchant_id, merchant_name 
-         FROM cart_items 
-         WHERE user_id = :user_id 
-         AND is_active = 1
-         AND merchant_id IS NOT NULL
+    // Check for existing item from different merchant
+    $merchantCheck = $conn->prepare(
+        "SELECT DISTINCT merchant_id, m.name as merchant_name
+         FROM cart_items ci
+         LEFT JOIN merchants m ON ci.merchant_id = m.id
+         WHERE ci.cart_id = :cart_id 
+         AND ci.is_active = 1
+         AND ci.merchant_id IS NOT NULL
          LIMIT 1"
     );
-    $existingMerchantStmt->execute([':user_id' => $userId]);
-    $existingMerchant = $existingMerchantStmt->fetch(PDO::FETCH_ASSOC);
+    $merchantCheck->execute([':cart_id' => $cart['id']]);
+    $existingMerchant = $merchantCheck->fetch(PDO::FETCH_ASSOC);
     
     if ($existingMerchant && $existingMerchant['merchant_id'] != $item['merchant_id']) {
         ResponseHandler::error(
-            "Your cart already contains items from {$existingMerchant['merchant_name']}. " .
-            "Please complete or clear that order before adding items from a different merchant.",
+            "Your cart already contains items from a different merchant. Please complete or clear that order first.",
             400
         );
     }
     
-    // Check if item already exists
+    // Check if item already in cart
     $existingStmt = $conn->prepare(
-        "SELECT id, quantity, special_instructions, selected_options
-         FROM cart_items 
-         WHERE user_id = :user_id 
+        "SELECT id, quantity FROM cart_items 
+         WHERE cart_id = :cart_id 
          AND menu_item_id = :item_id
          AND is_active = 1"
     );
     
-    $existingStmt->execute([':user_id' => $userId, ':item_id' => $menuItemId]);
+    $existingStmt->execute([
+        ':cart_id' => $cart['id'],
+        ':item_id' => $menuItemId
+    ]);
     $existingItem = $existingStmt->fetch(PDO::FETCH_ASSOC);
     
     if ($existingItem) {
         $newQuantity = $existingItem['quantity'] + $quantity;
         
-        if (!empty($item['max_quantity']) && $newQuantity > $item['max_quantity']) {
-            ResponseHandler::error("Cannot add more than {$item['max_quantity']} of this item", 400);
-        }
-        
-        if ($item['stock_quantity'] !== null && $newQuantity > $item['stock_quantity']) {
-            ResponseHandler::error("Only {$item['stock_quantity']} items available in stock", 400);
-        }
-        
         $updateStmt = $conn->prepare(
             "UPDATE cart_items 
-             SET quantity = :quantity, 
+             SET quantity = :quantity,
                  special_instructions = :instructions,
                  selected_options = :selected_options,
                  updated_at = NOW()
@@ -1031,51 +734,67 @@ function addItemToCart($conn, $data, $userId, $baseUrl) {
         
         $updateStmt->execute([
             ':quantity' => $newQuantity,
-            ':instructions' => $specialInstructions ?: $existingItem['special_instructions'],
-            ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : $existingItem['selected_options'],
+            ':instructions' => $specialInstructions,
+            ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null,
             ':id' => $existingItem['id']
         ]);
         
-        $message = 'Item quantity updated in cart';
         $cartItemId = $existingItem['id'];
+        $message = 'Item quantity updated';
     } else {
         $insertStmt = $conn->prepare(
-            "INSERT INTO cart_items 
-                (user_id, cart_id, menu_item_id, quantity, merchant_id, merchant_name,
-                 merchant_delivery_fee, merchant_min_order, preparation_time,
-                 special_instructions, selected_options, price, is_active, created_at, updated_at)
-             VALUES 
-                (:user_id, :cart_id, :item_id, :quantity, :merchant_id, :merchant_name,
-                 :delivery_fee, :min_order, :prep_time,
-                 :instructions, :selected_options, :price, 1, NOW(), NOW())"
+            "INSERT INTO cart_items (
+                cart_id, user_id, menu_item_id, merchant_id, merchant_name,
+                name, description, price, image_url, quantity,
+                measurement_type, unit, quantity_value, custom_unit,
+                item_type, category, merchant_delivery_fee, merchant_min_order,
+                preparation_time, special_instructions, selected_options,
+                is_active, created_at, updated_at
+            ) VALUES (
+                :cart_id, :user_id, :menu_item_id, :merchant_id, :merchant_name,
+                :name, :description, :price, :image_url, :quantity,
+                :measurement_type, :unit, :quantity_value, :custom_unit,
+                :item_type, :category, :delivery_fee, :min_order,
+                :prep_time, :instructions, :selected_options,
+                1, NOW(), NOW()
+            )"
         );
         
         $insertStmt->execute([
-            ':user_id' => $userId,
             ':cart_id' => $cart['id'],
-            ':item_id' => $menuItemId,
-            ':quantity' => $quantity,
+            ':user_id' => $userId,
+            ':menu_item_id' => $menuItemId,
             ':merchant_id' => $item['merchant_id'],
             ':merchant_name' => $item['merchant_name'],
-            ':delivery_fee' => $item['delivery_fee'] ?? 2500.00,
-            ':min_order' => $item['min_order_amount'] ?? 5000.00,
-            ':prep_time' => $item['merchant_prep_time'] ?? '15-20 min',
+            ':name' => $item['name'],
+            ':description' => $item['description'],
+            ':price' => $item['price'],
+            ':image_url' => $item['image_url'],
+            ':quantity' => $quantity,
+            ':measurement_type' => $item['measurement_type'] ?? 'quantity',
+            ':unit' => $item['unit'] ?? null,
+            ':quantity_value' => $item['quantity_value'] ?? null,
+            ':custom_unit' => $item['custom_unit'] ?? null,
+            ':item_type' => $item['item_type'] ?? 'food',
+            ':category' => $item['category'] ?? '',
+            ':delivery_fee' => $item['delivery_fee'] ?? 0,
+            ':min_order' => $item['min_order_amount'] ?? 0,
+            ':prep_time' => $item['merchant_prep_time'] ?? null,
             ':instructions' => $specialInstructions,
-            ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null,
-            ':price' => $item['price'] ?? 0
+            ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null
         ]);
         
-        $message = 'Item added to cart';
         $cartItemId = $conn->lastInsertId();
+        $message = 'Item added to cart';
     }
     
     // Update cart timestamp
     $updateCartStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
     $updateCartStmt->execute([':cart_id' => $cart['id']]);
     
-    // Get updated cart data
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
-    $totals = calculateCartTotals($conn, $cart['id'], $userId);
+    // Get updated cart
+    $cartItems = getCartItemsByCartId($conn, $cart['id'], $baseUrl);
+    $totals = calculateCartTotals($conn, $cart['id'], $cartItems);
     
     ResponseHandler::success([
         'success' => true,
@@ -1083,27 +802,15 @@ function addItemToCart($conn, $data, $userId, $baseUrl) {
         'data' => [
             'cart_item_id' => $cartItemId,
             'cart_id' => $cart['id'],
-            'item' => [
-                'id' => $menuItemId,
-                'name' => $item['name'],
-                'quantity' => $quantity,
-                'price' => floatval($item['price'] ?? 0),
-                'total' => floatval(($item['price'] ?? 0) * $quantity)
-            ],
-            'cart_summary' => [
-                'item_count' => count($cartItems),
-                'total_quantity' => $totals['total_quantity'] ?? 0,
-                'subtotal' => $totals['subtotal'] ?? 0,
-                'total_amount' => $totals['total_amount'] ?? 0
-            ]
+            'cart_summary' => $totals
         ]
     ]);
 }
 
 /*********************************
- * ADD QUICK ORDER TO CART - FIXED
+ * ADD QUICK ORDER TO CART
  *********************************/
-function addQuickOrderToCart($conn, $data, $userId, $baseUrl) {
+function addQuickOrderToCart($conn, $data, $userId, $sessionId, $baseUrl) {
     $quickOrderId = $data['quick_order_id'] ?? null;
     $quickOrderItemId = $data['quick_order_item_id'] ?? null;
     $merchantId = $data['merchant_id'] ?? null;
@@ -1111,6 +818,7 @@ function addQuickOrderToCart($conn, $data, $userId, $baseUrl) {
     $selectedAddOns = $data['selected_add_ons'] ?? [];
     $specialInstructions = $data['special_instructions'] ?? '';
     $variantId = $data['variant_id'] ?? null;
+    $variantData = $data['variant_data'] ?? null;
     
     if (!$quickOrderId || !$merchantId) {
         ResponseHandler::error('Quick order ID and merchant ID are required', 400);
@@ -1120,30 +828,29 @@ function addQuickOrderToCart($conn, $data, $userId, $baseUrl) {
         ResponseHandler::error('Quantity must be at least 1', 400);
     }
     
-    // Get quick order details with merchant info and items
+    // Get quick order details
     $qoStmt = $conn->prepare(
         "SELECT 
-            qo.id, qo.title, qo.description, qo.price, qo.image_url,
-            qo.category, qo.item_type, qo.preparation_time,
-            qo.has_variants, qo.variant_type,
-            qo.nutritional_info, qo.serving_size, qo.serving_unit,
-            qo.calories, qo.allergens, qo.dietary_tags,
-            
-            qom.custom_price, qom.custom_delivery_time, qom.priority,
-            
-            qoi.id as item_id, qoi.name as item_name, qoi.description as item_description,
-            qoi.price as item_price, qoi.image_url as item_image,
-            qoi.measurement_type, qoi.unit, qoi.quantity as item_quantity,
-            qoi.custom_unit, qoi.has_variants as item_has_variants, qoi.variants_json,
-            qoi.stock_quantity as item_stock, qoi.max_quantity as item_max_qty,
-            qoi.badge as item_badge, qoi.price_per_unit,
-            
-            m.id as merchant_id, m.name as merchant_name, m.image_url as merchant_image,
-            m.logo_url as merchant_logo, m.rating as merchant_rating,
-            m.is_open as merchant_is_open, m.delivery_fee,
-            m.min_order_amount, m.free_delivery_threshold,
-            m.business_type, m.cuisine_type, m.address,
-            m.latitude, m.longitude, m.preparation_time as merchant_prep_time
+            qo.*,
+            qom.custom_price,
+            qom.custom_delivery_time,
+            qoi.id as item_id,
+            qoi.name as item_name,
+            qoi.description as item_description,
+            qoi.price as item_price,
+            qoi.image_url as item_image,
+            qoi.measurement_type,
+            qoi.unit,
+            qoi.quantity as item_quantity,
+            qoi.custom_unit,
+            qoi.has_variants,
+            qoi.variants_json,
+            qoi.max_quantity,
+            qoi.stock_quantity,
+            m.name as merchant_name,
+            m.delivery_fee,
+            m.min_order_amount,
+            m.preparation_time as merchant_prep_time
          FROM quick_orders qo
          INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
          LEFT JOIN quick_order_items qoi ON qo.id = qoi.quick_order_id
@@ -1159,180 +866,107 @@ function addQuickOrderToCart($conn, $data, $userId, $baseUrl) {
         ':merchant_id' => $merchantId
     ]);
     
-    $quickOrderItems = $qoStmt->fetchAll(PDO::FETCH_ASSOC);
+    $items = $qoStmt->fetchAll(PDO::FETCH_ASSOC);
     
-    if (empty($quickOrderItems)) {
-        ResponseHandler::error('Quick order not available for this merchant', 404);
+    if (empty($items)) {
+        ResponseHandler::error('Quick order not available', 404);
     }
     
-    // Get the main quick order data from first row
-    $quickOrder = $quickOrderItems[0];
+    // Get main quick order data from first row
+    $quickOrder = $items[0];
     
-    if (empty($quickOrder['merchant_is_open'])) {
-        ResponseHandler::error('Merchant is currently closed', 400);
-    }
-    
-    // Find the specific item if item_id is provided
+    // Find specific item if requested
     $selectedItem = null;
     if ($quickOrderItemId) {
-        foreach ($quickOrderItems as $item) {
+        foreach ($items as $item) {
             if ($item['item_id'] == $quickOrderItemId) {
                 $selectedItem = $item;
                 break;
             }
         }
-        
         if (!$selectedItem) {
             ResponseHandler::error('Quick order item not found', 404);
         }
     } else {
-        // Use the first item as default
-        $selectedItem = $quickOrderItems[0];
+        $selectedItem = $items[0];
         $quickOrderItemId = $selectedItem['item_id'];
     }
     
-    // Calculate final price
+    // Calculate price
     $basePrice = floatval($quickOrder['custom_price'] ?? $quickOrder['price'] ?? 0);
-    $itemPrice = floatval($selectedItem['item_price'] ?? $selectedItem['price'] ?? 0);
+    $itemPrice = floatval($selectedItem['item_price'] ?? 0);
     $finalPrice = $basePrice + $itemPrice;
     
-    // Handle variant if specified
-    $variantData = null;
+    // Handle variant
     $variantName = '';
-    $variantPrice = 0;
-    
     if ($variantId && !empty($selectedItem['variants_json'])) {
         $variants = json_decode($selectedItem['variants_json'], true) ?? [];
         foreach ($variants as $variant) {
             if (($variant['id'] ?? null) == $variantId) {
-                $variantData = $variant;
                 $variantName = ' (' . ($variant['name'] ?? '') . ')';
-                $variantPrice = floatval($variant['price'] ?? 0);
-                
-                if (isset($variant['is_available']) && !$variant['is_available']) {
-                    ResponseHandler::error('Selected variant is not available', 400);
-                }
-                
-                if (isset($variant['stock_quantity']) && $variant['stock_quantity'] > 0 && $quantity > $variant['stock_quantity']) {
-                    ResponseHandler::error("Only {$variant['stock_quantity']} of this variant available", 400);
+                $finalPrice += floatval($variant['price'] ?? 0);
+                if (!$variantData) {
+                    $variantData = $variant;
                 }
                 break;
             }
         }
     }
     
-    $finalPrice += $variantPrice;
-    
-    // Process add-ons
-    $addOnsTotal = 0;
-    $processedAddOns = [];
-    
-    if (!empty($selectedAddOns)) {
-        $addOnIds = array_column($selectedAddOns, 'id');
-        if (!empty($addOnIds)) {
-            $placeholders = implode(',', array_fill(0, count($addOnIds), '?'));
-            $addOnStmt = $conn->prepare(
-                "SELECT * FROM quick_order_addons 
-                 WHERE id IN ($placeholders) AND quick_order_id = ? AND is_available = 1"
-            );
-            
-            $params = array_merge($addOnIds, [$quickOrderId]);
-            $addOnStmt->execute($params);
-            $addOns = $addOnStmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            foreach ($addOns as $addOn) {
-                $addOnQty = 1;
-                foreach ($selectedAddOns as $selected) {
-                    if (($selected['id'] ?? null) == $addOn['id']) {
-                        $addOnQty = intval($selected['quantity'] ?? 1);
-                        break;
-                    }
-                }
-                
-                $addOnTotal = floatval($addOn['price'] ?? 0) * $addOnQty * $quantity;
-                $addOnsTotal += $addOnTotal;
-                
-                $processedAddOns[] = [
-                    'id' => $addOn['id'],
-                    'name' => $addOn['name'],
-                    'price' => floatval($addOn['price'] ?? 0),
-                    'category' => $addOn['category'],
-                    'quantity' => $addOnQty,
-                    'total' => $addOnTotal
-                ];
-            }
-        }
-    }
-    
     // Get or create cart
-    $cart = getOrCreateUserCart($conn, $userId);
+    $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
-    // ===== SINGLE MERCHANT VALIDATION =====
-    // Check if cart already has items from a different merchant
-    $existingMerchantStmt = $conn->prepare(
-        "SELECT DISTINCT merchant_id, merchant_name 
+    // Check for existing item from different merchant
+    $merchantCheck = $conn->prepare(
+        "SELECT DISTINCT merchant_id, merchant_name
          FROM cart_items 
-         WHERE user_id = :user_id 
+         WHERE cart_id = :cart_id 
          AND is_active = 1
          AND merchant_id IS NOT NULL
          LIMIT 1"
     );
-    $existingMerchantStmt->execute([':user_id' => $userId]);
-    $existingMerchant = $existingMerchantStmt->fetch(PDO::FETCH_ASSOC);
+    $merchantCheck->execute([':cart_id' => $cart['id']]);
+    $existingMerchant = $merchantCheck->fetch(PDO::FETCH_ASSOC);
     
     if ($existingMerchant && $existingMerchant['merchant_id'] != $merchantId) {
         ResponseHandler::error(
-            "Your cart already contains items from {$existingMerchant['merchant_name']}. " .
-            "Please complete or clear that order before adding items from a different merchant.",
+            "Your cart already contains items from a different merchant. Please complete or clear that order first.",
             400
         );
     }
     
-    // Check if already in cart (with same variant and add-ons)
-    $addOnsJson = !empty($processedAddOns) ? json_encode($processedAddOns) : null;
-    
+    // Check if item already in cart
     $existingStmt = $conn->prepare(
         "SELECT id, quantity FROM cart_items 
-         WHERE user_id = :user_id 
+         WHERE cart_id = :cart_id 
          AND quick_order_id = :quick_order_id
-         AND quick_order_item_id = :quick_order_item_id
+         AND quick_order_item_id = :item_id
          AND (variant_id = :variant_id OR (:variant_id IS NULL AND variant_id IS NULL))
-         AND (add_ons_json = :add_ons_json OR (add_ons_json IS NULL AND :add_ons_json IS NULL))
          AND is_active = 1"
     );
     
     $existingStmt->execute([
-        ':user_id' => $userId,
+        ':cart_id' => $cart['id'],
         ':quick_order_id' => $quickOrderId,
-        ':quick_order_item_id' => $quickOrderItemId,
-        ':variant_id' => $variantId,
-        ':add_ons_json' => $addOnsJson
+        ':item_id' => $quickOrderItemId,
+        ':variant_id' => $variantId
     ]);
-    
     $existingItem = $existingStmt->fetch(PDO::FETCH_ASSOC);
     
     if ($existingItem) {
         $newQuantity = $existingItem['quantity'] + $quantity;
         
-        // Check max quantity
-        $maxQty = $selectedItem['item_max_qty'] ?? $quickOrder['max_quantity'] ?? 99;
-        if ($newQuantity > $maxQty) {
-            ResponseHandler::error("Maximum quantity allowed is $maxQty", 400);
-        }
-        
-        // Check stock
-        if (!empty($selectedItem['item_stock']) && $newQuantity > $selectedItem['item_stock']) {
-            ResponseHandler::error("Only {$selectedItem['item_stock']} items available", 400);
-        }
-        
         $updateStmt = $conn->prepare(
             "UPDATE cart_items 
-             SET quantity = :quantity, updated_at = NOW()
+             SET quantity = :quantity,
+                 special_instructions = :instructions,
+                 updated_at = NOW()
              WHERE id = :id"
         );
         
         $updateStmt->execute([
             ':quantity' => $newQuantity,
+            ':instructions' => $specialInstructions,
             ':id' => $existingItem['id']
         ]);
         
@@ -1342,41 +976,60 @@ function addQuickOrderToCart($conn, $data, $userId, $baseUrl) {
         $itemName = $selectedItem['item_name'] . $variantName;
         
         $insertStmt = $conn->prepare(
-            "INSERT INTO cart_items 
-                (user_id, cart_id, quick_order_id, quick_order_item_id, merchant_id, merchant_name,
-                 merchant_delivery_fee, merchant_min_order, preparation_time,
-                 quantity, selected_options, variant_id, variant_data,
-                 variant_name, add_ons_json, special_instructions, price,
-                 is_active, created_at, updated_at)
-             VALUES 
-                (:user_id, :cart_id, :quick_order_id, :quick_order_item_id, :merchant_id, :merchant_name,
-                 :delivery_fee, :min_order, :prep_time,
-                 :quantity, :selected_options, :variant_id, :variant_data,
-                 :variant_name, :add_ons_json, :special_instructions, :price,
-                 1, NOW(), NOW())"
+            "INSERT INTO cart_items (
+                cart_id, user_id, quick_order_id, quick_order_item_id,
+                merchant_id, merchant_name, name, description, price,
+                image_url, quantity, measurement_type, unit, quantity_value,
+                custom_unit, item_type, category, merchant_delivery_fee,
+                merchant_min_order, preparation_time, variant_id, variant_data,
+                variant_name, has_variants, special_instructions,
+                is_active, created_at, updated_at
+            ) VALUES (
+                :cart_id, :user_id, :quick_order_id, :quick_order_item_id,
+                :merchant_id, :merchant_name, :name, :description, :price,
+                :image_url, :quantity, :measurement_type, :unit, :quantity_value,
+                :custom_unit, :item_type, :category, :delivery_fee,
+                :min_order, :prep_time, :variant_id, :variant_data,
+                :variant_name, :has_variants, :instructions,
+                1, NOW(), NOW()
+            )"
         );
         
         $insertStmt->execute([
-            ':user_id' => $userId,
             ':cart_id' => $cart['id'],
+            ':user_id' => $userId,
             ':quick_order_id' => $quickOrderId,
             ':quick_order_item_id' => $quickOrderItemId,
             ':merchant_id' => $merchantId,
-            ':merchant_name' => $quickOrder['merchant_name'] ?? 'Unknown Merchant',
-            ':delivery_fee' => $quickOrder['delivery_fee'] ?? 2500.00,
-            ':min_order' => $quickOrder['min_order_amount'] ?? 5000.00,
-            ':prep_time' => $quickOrder['preparation_time'] ?? $quickOrder['merchant_prep_time'] ?? '15-20 min',
+            ':merchant_name' => $quickOrder['merchant_name'],
+            ':name' => $itemName,
+            ':description' => $selectedItem['item_description'],
+            ':price' => $finalPrice,
+            ':image_url' => $selectedItem['item_image'],
             ':quantity' => $quantity,
-            ':selected_options' => json_encode(['add_ons' => $processedAddOns]),
+            ':measurement_type' => $selectedItem['measurement_type'] ?? 'quantity',
+            ':unit' => $selectedItem['unit'] ?? null,
+            ':quantity_value' => $selectedItem['item_quantity'] ?? null,
+            ':custom_unit' => $selectedItem['custom_unit'] ?? null,
+            ':item_type' => $quickOrder['item_type'] ?? 'quick_order',
+            ':category' => $quickOrder['category'] ?? '',
+            ':delivery_fee' => $quickOrder['delivery_fee'] ?? 0,
+            ':min_order' => $quickOrder['min_order_amount'] ?? 0,
+            ':prep_time' => $quickOrder['merchant_prep_time'] ?? null,
             ':variant_id' => $variantId,
             ':variant_data' => $variantData ? json_encode($variantData) : null,
             ':variant_name' => $variantName,
-            ':add_ons_json' => $addOnsJson,
-            ':special_instructions' => $specialInstructions,
-            ':price' => $finalPrice
+            ':has_variants' => $selectedItem['has_variants'] ? 1 : 0,
+            ':instructions' => $specialInstructions
         ]);
         
         $cartItemId = $conn->lastInsertId();
+        
+        // Add add-ons if any
+        if (!empty($selectedAddOns)) {
+            addCartItemAddOns($conn, $cartItemId, $selectedAddOns, $quantity);
+        }
+        
         $message = 'Quick order added to cart';
     }
     
@@ -1384,9 +1037,9 @@ function addQuickOrderToCart($conn, $data, $userId, $baseUrl) {
     $updateCartStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
     $updateCartStmt->execute([':cart_id' => $cart['id']]);
     
-    // Get updated cart data
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
-    $totals = calculateCartTotals($conn, $cart['id'], $userId);
+    // Get updated cart
+    $cartItems = getCartItemsByCartId($conn, $cart['id'], $baseUrl);
+    $totals = calculateCartTotals($conn, $cart['id'], $cartItems);
     
     ResponseHandler::success([
         'success' => true,
@@ -1394,502 +1047,169 @@ function addQuickOrderToCart($conn, $data, $userId, $baseUrl) {
         'data' => [
             'cart_item_id' => $cartItemId,
             'cart_id' => $cart['id'],
-            'quick_order' => [
-                'id' => $quickOrderId,
-                'item_id' => $quickOrderItemId,
-                'title' => $quickOrder['title'] ?? '',
-                'item_name' => $selectedItem['item_name'] ?? '',
-                'quantity' => $quantity,
-                'price' => floatval($finalPrice),
-                'total' => floatval($finalPrice * $quantity)
-            ],
-            'cart_summary' => [
-                'item_count' => count($cartItems),
-                'total_quantity' => $totals['total_quantity'] ?? 0,
-                'subtotal' => $totals['subtotal'] ?? 0,
-                'total_amount' => $totals['total_amount'] ?? 0
-            ]
+            'cart_summary' => $totals
         ]
     ]);
 }
 
 /*********************************
- * ADD MULTIPLE ITEMS TO CART
+ * ADD CART ITEM ADD-ONS
  *********************************/
-function addMultipleItemsToCart($conn, $data, $userId, $baseUrl) {
-    $items = $data['items'] ?? [];
-    
-    if (empty($items)) {
-        ResponseHandler::error('No items to add', 400);
-    }
-    
-    // First, check if all items are from the same merchant
-    $firstMerchantId = null;
-    $firstMerchantName = null;
-    
-    foreach ($items as $itemData) {
-        $menuItemId = $itemData['menu_item_id'] ?? null;
-        $quickOrderId = $itemData['quick_order_id'] ?? null;
-        $merchantId = $itemData['merchant_id'] ?? null;
+function addCartItemAddOns($conn, $cartItemId, $addOns, $quantity) {
+    foreach ($addOns as $addOn) {
+        $addOnId = $addOn['id'] ?? null;
+        $addOnName = $addOn['name'] ?? '';
+        $addOnPrice = floatval($addOn['price'] ?? 0);
+        $addOnQty = intval($addOn['quantity'] ?? 1);
+        $addOnCategory = $addOn['category'] ?? null;
         
-        if ($menuItemId) {
-            // Get merchant from menu item
-            $stmt = $conn->prepare(
-                "SELECT m.id, m.name FROM menu_items mi
-                 JOIN merchants m ON mi.merchant_id = m.id
-                 WHERE mi.id = :item_id"
-            );
-            $stmt->execute([':item_id' => $menuItemId]);
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            $currentMerchantId = $result['id'] ?? null;
-            $currentMerchantName = $result['name'] ?? 'Unknown';
-        } elseif ($quickOrderId && $merchantId) {
-            $currentMerchantId = $merchantId;
-            $currentMerchantName = 'Unknown';
-        } else {
-            ResponseHandler::error('Invalid item data', 400);
-        }
-        
-        if ($firstMerchantId === null) {
-            $firstMerchantId = $currentMerchantId;
-            $firstMerchantName = $currentMerchantName;
-        } elseif ($firstMerchantId != $currentMerchantId) {
-            ResponseHandler::error(
-                "Cannot add items from different merchants. " .
-                "First item is from {$firstMerchantName}, but found item from another merchant.",
-                400
-            );
-        }
-    }
-    
-    $cart = getOrCreateUserCart($conn, $userId);
-    
-    // ===== SINGLE MERCHANT VALIDATION =====
-    // Check if cart already has items from a different merchant
-    $existingMerchantStmt = $conn->prepare(
-        "SELECT DISTINCT merchant_id, merchant_name 
-         FROM cart_items 
-         WHERE user_id = :user_id 
-         AND is_active = 1
-         AND merchant_id IS NOT NULL
-         LIMIT 1"
-    );
-    $existingMerchantStmt->execute([':user_id' => $userId]);
-    $existingMerchant = $existingMerchantStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if ($existingMerchant && $existingMerchant['merchant_id'] != $firstMerchantId) {
-        ResponseHandler::error(
-            "Your cart already contains items from {$existingMerchant['merchant_name']}. " .
-            "Please complete or clear that order before adding items from a different merchant.",
-            400
+        $stmt = $conn->prepare(
+            "INSERT INTO cart_addons (
+                cart_item_id, addon_id, name, price, quantity, category, created_at
+            ) VALUES (
+                :cart_item_id, :addon_id, :name, :price, :quantity, :category, NOW()
+            )"
         );
+        
+        $stmt->execute([
+            ':cart_item_id' => $cartItemId,
+            ':addon_id' => $addOnId,
+            ':name' => $addOnName,
+            ':price' => $addOnPrice,
+            ':quantity' => $addOnQty * $quantity,
+            ':category' => $addOnCategory
+        ]);
+    }
+}
+
+/*********************************
+ * UPDATE CART ITEM QUANTITY
+ *********************************/
+function updateCartItemQuantity($conn, $data, $userId, $sessionId, $baseUrl) {
+    $cartItemId = $data['cart_item_id'] ?? null;
+    $quantity = intval($data['quantity'] ?? 0);
+    
+    if (!$cartItemId) {
+        ResponseHandler::error('Cart item ID is required', 400);
     }
     
-    $conn->beginTransaction();
+    if ($quantity < 0) {
+        ResponseHandler::error('Quantity cannot be negative', 400);
+    }
     
-    try {
-        $addedItems = [];
-        $failedItems = [];
+    // Get cart item
+    $itemStmt = $conn->prepare(
+        "SELECT ci.*, c.id as cart_id
+         FROM cart_items ci
+         JOIN carts c ON ci.cart_id = c.id
+         WHERE ci.id = :id"
+    );
+    $itemStmt->execute([':id' => $cartItemId]);
+    $item = $itemStmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$item) {
+        ResponseHandler::error('Cart item not found', 404);
+    }
+    
+    // Verify ownership
+    if ($item['user_id'] && $item['user_id'] != $userId) {
+        ResponseHandler::error('Unauthorized', 403);
+    }
+    
+    if ($quantity == 0) {
+        // Remove item
+        $deleteStmt = $conn->prepare(
+            "UPDATE cart_items SET is_active = 0, updated_at = NOW() WHERE id = :id"
+        );
+        $deleteStmt->execute([':id' => $cartItemId]);
         
-        foreach ($items as $itemData) {
-            $menuItemId = $itemData['menu_item_id'] ?? null;
-            $quickOrderId = $itemData['quick_order_id'] ?? null;
-            
-            if ($menuItemId) {
-                // Add menu item
-                $result = addSingleMenuItem($conn, $userId, $cart['id'], $itemData);
-                if ($result['success']) {
-                    $addedItems[] = $result['item'];
-                } else {
-                    $failedItems[] = $result['item'];
-                }
-            } elseif ($quickOrderId) {
-                // Add quick order - simplified version for bulk add
-                $result = addSingleQuickOrder($conn, $userId, $cart['id'], $itemData);
-                if ($result['success']) {
-                    $addedItems[] = $result['item'];
-                } else {
-                    $failedItems[] = $result['item'];
-                }
-            }
-        }
+        // Remove add-ons
+        $deleteAddOns = $conn->prepare("DELETE FROM cart_addons WHERE cart_item_id = :item_id");
+        $deleteAddOns->execute([':item_id' => $cartItemId]);
         
-        $conn->commit();
+        $message = 'Item removed from cart';
+    } else {
+        // Update quantity
+        $updateStmt = $conn->prepare(
+            "UPDATE cart_items SET quantity = :quantity, updated_at = NOW() WHERE id = :id"
+        );
+        $updateStmt->execute([
+            ':quantity' => $quantity,
+            ':id' => $cartItemId
+        ]);
         
-    } catch (Exception $e) {
-        $conn->rollBack();
-        ResponseHandler::error('Failed to add items: ' . $e->getMessage(), 500);
+        $message = 'Quantity updated';
     }
     
     // Update cart timestamp
     $updateCartStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
-    $updateCartStmt->execute([':cart_id' => $cart['id']]);
+    $updateCartStmt->execute([':cart_id' => $item['cart_id']]);
     
-    // Get updated cart data
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
-    $totals = calculateCartTotals($conn, $cart['id'], $userId);
-    
-    ResponseHandler::success([
-        'success' => true,
-        'message' => count($addedItems) . ' items added to cart',
-        'data' => [
-            'cart_id' => $cart['id'],
-            'added_count' => count($addedItems),
-            'failed_count' => count($failedItems),
-            'added_items' => $addedItems,
-            'failed_items' => $failedItems,
-            'cart_summary' => [
-                'item_count' => count($cartItems),
-                'total_quantity' => $totals['total_quantity'] ?? 0,
-                'subtotal' => $totals['subtotal'] ?? 0,
-                'total_amount' => $totals['total_amount'] ?? 0
-            ]
-        ]
-    ]);
-}
-
-/*********************************
- * ADD SINGLE MENU ITEM - HELPER
- *********************************/
-function addSingleMenuItem($conn, $userId, $cartId, $itemData) {
-    $menuItemId = $itemData['menu_item_id'];
-    $quantity = intval($itemData['quantity'] ?? 1);
-    
-    // Get merchant info
-    $merchantStmt = $conn->prepare(
-        "SELECT m.id, m.name, m.delivery_fee, m.min_order_amount, m.preparation_time,
-                mi.price
-         FROM menu_items mi
-         JOIN merchants m ON mi.merchant_id = m.id
-         WHERE mi.id = :item_id"
-    );
-    $merchantStmt->execute([':item_id' => $menuItemId]);
-    $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$merchant) {
-        return [
-            'success' => false,
-            'item' => [
-                'menu_item_id' => $menuItemId,
-                'error' => 'Item not found'
-            ]
-        ];
-    }
-    
-    // Check if exists
-    $checkStmt = $conn->prepare(
-        "SELECT id FROM cart_items 
-         WHERE user_id = :user_id 
-         AND menu_item_id = :item_id
-         AND is_active = 1"
-    );
-    
-    $checkStmt->execute([':user_id' => $userId, ':item_id' => $menuItemId]);
-    
-    if ($checkStmt->fetch()) {
-        // Update existing
-        $updateStmt = $conn->prepare(
-            "UPDATE cart_items 
-             SET quantity = quantity + :quantity, updated_at = NOW()
-             WHERE user_id = :user_id AND menu_item_id = :item_id AND is_active = 1"
-        );
-        $updateStmt->execute([
-            ':quantity' => $quantity,
-            ':user_id' => $userId,
-            ':item_id' => $menuItemId
-        ]);
-    } else {
-        // Insert new with merchant data
-        $insertStmt = $conn->prepare(
-            "INSERT INTO cart_items 
-                (user_id, cart_id, menu_item_id, quantity, merchant_id, merchant_name,
-                 merchant_delivery_fee, merchant_min_order, preparation_time, price,
-                 is_active, created_at, updated_at)
-             VALUES 
-                (:user_id, :cart_id, :item_id, :quantity, :merchant_id, :merchant_name,
-                 :delivery_fee, :min_order, :prep_time, :price, 1, NOW(), NOW())"
-        );
-        $insertStmt->execute([
-            ':user_id' => $userId,
-            ':cart_id' => $cartId,
-            ':item_id' => $menuItemId,
-            ':quantity' => $quantity,
-            ':merchant_id' => $merchant['id'] ?? null,
-            ':merchant_name' => $merchant['name'] ?? 'Unknown Merchant',
-            ':delivery_fee' => $merchant['delivery_fee'] ?? 2500.00,
-            ':min_order' => $merchant['min_order_amount'] ?? 5000.00,
-            ':prep_time' => $merchant['preparation_time'] ?? '15-20 min',
-            ':price' => $merchant['price'] ?? 0
-        ]);
-    }
-    
-    return [
-        'success' => true,
-        'item' => [
-            'menu_item_id' => $menuItemId,
-            'quantity' => $quantity
-        ]
-    ];
-}
-
-/*********************************
- * ADD SINGLE QUICK ORDER - HELPER
- *********************************/
-function addSingleQuickOrder($conn, $userId, $cartId, $itemData) {
-    $quickOrderId = $itemData['quick_order_id'];
-    $quickOrderItemId = $itemData['quick_order_item_id'] ?? null;
-    $merchantId = $itemData['merchant_id'];
-    $quantity = intval($itemData['quantity'] ?? 1);
-    
-    // Get quick order info
-    $qoStmt = $conn->prepare(
-        "SELECT qo.price, qo.title,
-                qom.custom_price,
-                m.name as merchant_name, m.delivery_fee, m.min_order_amount, m.preparation_time,
-                qoi.price as item_price, qoi.name as item_name
-         FROM quick_orders qo
-         INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-         LEFT JOIN quick_order_items qoi ON qo.id = qoi.quick_order_id
-         LEFT JOIN merchants m ON qom.merchant_id = m.id
-         WHERE qo.id = :quick_order_id
-         AND qom.merchant_id = :merchant_id
-         AND (qoi.id = :item_id OR :item_id IS NULL)
-         LIMIT 1"
-    );
-    
-    $qoStmt->execute([
-        ':quick_order_id' => $quickOrderId,
-        ':merchant_id' => $merchantId,
-        ':item_id' => $quickOrderItemId
-    ]);
-    
-    $quickOrder = $qoStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$quickOrder) {
-        return [
-            'success' => false,
-            'item' => [
-                'quick_order_id' => $quickOrderId,
-                'error' => 'Quick order not found'
-            ]
-        ];
-    }
-    
-    $price = floatval($quickOrder['custom_price'] ?? $quickOrder['price'] ?? 0);
-    if ($quickOrderItemId) {
-        $price += floatval($quickOrder['item_price'] ?? 0);
-    }
-    
-    // Check if exists
-    $checkStmt = $conn->prepare(
-        "SELECT id FROM cart_items 
-         WHERE user_id = :user_id 
-         AND quick_order_id = :quick_order_id
-         AND quick_order_item_id = :quick_order_item_id
-         AND is_active = 1"
-    );
-    
-    $checkStmt->execute([
-        ':user_id' => $userId,
-        ':quick_order_id' => $quickOrderId,
-        ':quick_order_item_id' => $quickOrderItemId
-    ]);
-    
-    if ($checkStmt->fetch()) {
-        // Update existing
-        $updateStmt = $conn->prepare(
-            "UPDATE cart_items 
-             SET quantity = quantity + :quantity, updated_at = NOW()
-             WHERE user_id = :user_id 
-             AND quick_order_id = :quick_order_id
-             AND quick_order_item_id = :quick_order_item_id
-             AND is_active = 1"
-        );
-        $updateStmt->execute([
-            ':quantity' => $quantity,
-            ':user_id' => $userId,
-            ':quick_order_id' => $quickOrderId,
-            ':quick_order_item_id' => $quickOrderItemId
-        ]);
-    } else {
-        // Insert new with merchant data
-        $itemName = $quickOrder['item_name'] ?? $quickOrder['title'] ?? 'Quick Order';
-        
-        $insertStmt = $conn->prepare(
-            "INSERT INTO cart_items 
-                (user_id, cart_id, quick_order_id, quick_order_item_id, merchant_id, merchant_name,
-                 merchant_delivery_fee, merchant_min_order, preparation_time,
-                 quantity, price, is_active, created_at, updated_at)
-             VALUES 
-                (:user_id, :cart_id, :quick_order_id, :quick_order_item_id, :merchant_id, :merchant_name,
-                 :delivery_fee, :min_order, :prep_time,
-                 :quantity, :price, 1, NOW(), NOW())"
-        );
-        $insertStmt->execute([
-            ':user_id' => $userId,
-            ':cart_id' => $cartId,
-            ':quick_order_id' => $quickOrderId,
-            ':quick_order_item_id' => $quickOrderItemId,
-            ':merchant_id' => $merchantId,
-            ':merchant_name' => $quickOrder['merchant_name'] ?? 'Unknown Merchant',
-            ':delivery_fee' => $quickOrder['delivery_fee'] ?? 2500.00,
-            ':min_order' => $quickOrder['min_order_amount'] ?? 5000.00,
-            ':prep_time' => $quickOrder['preparation_time'] ?? '15-20 min',
-            ':quantity' => $quantity,
-            ':price' => $price
-        ]);
-    }
-    
-    return [
-        'success' => true,
-        'item' => [
-            'quick_order_id' => $quickOrderId,
-            'merchant_id' => $merchantId,
-            'quantity' => $quantity
-        ]
-    ];
-}
-
-/*********************************
- * APPLY PROMOTION TO CART
- *********************************/
-function applyPromotionToCart($conn, $data, $userId) {
-    $promoCode = trim($data['promo_code'] ?? '');
-    
-    if (!$promoCode) {
-        ResponseHandler::error('Promotion code is required', 400);
-    }
-    
-    $cart = getOrCreateUserCart($conn, $userId);
-    $totals = calculateCartTotals($conn, $cart['id'], $userId);
-    
-    $currentDate = date('Y-m-d H:i:s');
-    
-    $promoStmt = $conn->prepare(
-        "SELECT p.* FROM promotions p
-         WHERE p.code = :code 
-         AND p.is_active = 1
-         AND p.start_date <= :current_date
-         AND p.end_date >= :current_date"
-    );
-    
-    $promoStmt->execute([':code' => $promoCode, ':current_date' => $currentDate]);
-    $promotion = $promoStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$promotion) {
-        ResponseHandler::error('Invalid or expired promotion code', 404);
-    }
-    
-    // Check usage limits
-    $usageStmt = $conn->prepare(
-        "SELECT COUNT(*) as usage_count
-         FROM promotion_usage
-         WHERE promotion_id = :promotion_id AND user_id = :user_id"
-    );
-    
-    $usageStmt->execute([':promotion_id' => $promotion['id'], ':user_id' => $userId]);
-    $usage = $usageStmt->fetch(PDO::FETCH_ASSOC);
-    $userUsageCount = intval($usage['usage_count'] ?? 0);
-    
-    if (!empty($promotion['per_user_limit']) && $userUsageCount >= $promotion['per_user_limit']) {
-        ResponseHandler::error('You have reached the usage limit for this promotion', 400);
-    }
-    
-    if (!empty($promotion['usage_limit']) && ($promotion['times_used'] ?? 0) >= $promotion['usage_limit']) {
-        ResponseHandler::error('This promotion has reached its global usage limit', 400);
-    }
-    
-    $subtotal = $totals['subtotal'] ?? 0;
-    if (!empty($promotion['min_order_amount']) && $subtotal < $promotion['min_order_amount']) {
-        $minAmount = number_format($promotion['min_order_amount'], 0);
-        ResponseHandler::error("Minimum order amount of MK $minAmount required for this promotion", 400);
-    }
-    
-    // Calculate discount
-    $discountAmount = calculateDiscountAmount($promotion, $subtotal);
-    
-    // For free delivery promotion
-    if (($promotion['discount_type'] ?? '') === 'free_delivery') {
-        $discountAmount = $totals['delivery_fee'] ?? 0;
-    }
-    
-    $discountAmount = round($discountAmount, 2);
-    
-    // Update cart
-    $updateStmt = $conn->prepare(
-        "UPDATE carts 
-         SET applied_promotion_id = :promotion_id,
-             applied_discount = :discount_amount,
-             updated_at = NOW()
-         WHERE id = :cart_id"
-    );
-    
-    $updateStmt->execute([
-        ':promotion_id' => $promotion['id'],
-        ':discount_amount' => $discountAmount,
-        ':cart_id' => $cart['id']
-    ]);
-    
-    // Record usage
-    $usageStmt = $conn->prepare(
-        "INSERT INTO promotion_usage (promotion_id, user_id, order_id, used_at)
-         VALUES (:promotion_id, :user_id, NULL, NOW())"
-    );
-    $usageStmt->execute([
-        ':promotion_id' => $promotion['id'],
-        ':user_id' => $userId
-    ]);
-    
-    // Update promotion times used
-    $updatePromoStmt = $conn->prepare(
-        "UPDATE promotions SET times_used = times_used + 1 WHERE id = :id"
-    );
-    $updatePromoStmt->execute([':id' => $promotion['id']]);
-    
-    $newTotals = calculateCartTotals($conn, $cart['id'], $userId);
+    // Get updated cart
+    $cartItems = getCartItemsByCartId($conn, $item['cart_id'], $baseUrl);
+    $totals = calculateCartTotals($conn, $item['cart_id'], $cartItems);
     
     ResponseHandler::success([
         'success' => true,
-        'message' => 'Promotion applied successfully',
+        'message' => $message,
         'data' => [
-            'promotion' => [
-                'id' => $promotion['id'],
-                'code' => $promotion['code'] ?? '',
-                'name' => $promotion['name'] ?? $promotion['title'] ?? '',
-                'description' => $promotion['description'] ?? '',
-                'discount_type' => $promotion['discount_type'] ?? 'percentage',
-                'discount_value' => floatval($promotion['discount_value'] ?? 0),
-                'discount_amount' => $discountAmount
-            ],
-            'cart_totals' => $newTotals,
-            'savings' => $discountAmount
+            'cart_summary' => $totals
         ]
     ]);
 }
 
 /*********************************
- * REMOVE PROMOTION FROM CART
+ * REMOVE CART ITEM
  *********************************/
-function removePromotionFromCart($conn, $data, $userId) {
-    $cart = getOrCreateUserCart($conn, $userId);
+function removeCartItem($conn, $data, $userId, $sessionId, $baseUrl) {
+    $cartItemId = $data['cart_item_id'] ?? null;
     
-    $updateStmt = $conn->prepare(
-        "UPDATE carts 
-         SET applied_promotion_id = NULL,
-             applied_discount = NULL,
-             updated_at = NOW()
-         WHERE id = :cart_id"
+    if (!$cartItemId) {
+        ResponseHandler::error('Cart item ID is required', 400);
+    }
+    
+    // Get cart item
+    $itemStmt = $conn->prepare(
+        "SELECT ci.*, c.id as cart_id
+         FROM cart_items ci
+         JOIN carts c ON ci.cart_id = c.id
+         WHERE ci.id = :id"
     );
+    $itemStmt->execute([':id' => $cartItemId]);
+    $item = $itemStmt->fetch(PDO::FETCH_ASSOC);
     
-    $updateStmt->execute([':cart_id' => $cart['id']]);
+    if (!$item) {
+        ResponseHandler::error('Cart item not found', 404);
+    }
     
-    $newTotals = calculateCartTotals($conn, $cart['id'], $userId);
+    // Verify ownership
+    if ($item['user_id'] && $item['user_id'] != $userId) {
+        ResponseHandler::error('Unauthorized', 403);
+    }
+    
+    // Soft delete item
+    $deleteStmt = $conn->prepare(
+        "UPDATE cart_items SET is_active = 0, updated_at = NOW() WHERE id = :id"
+    );
+    $deleteStmt->execute([':id' => $cartItemId]);
+    
+    // Remove add-ons
+    $deleteAddOns = $conn->prepare("DELETE FROM cart_addons WHERE cart_item_id = :item_id");
+    $deleteAddOns->execute([':item_id' => $cartItemId]);
+    
+    // Update cart timestamp
+    $updateCartStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
+    $updateCartStmt->execute([':cart_id' => $item['cart_id']]);
+    
+    // Get updated cart
+    $cartItems = getCartItemsByCartId($conn, $item['cart_id'], $baseUrl);
+    $totals = calculateCartTotals($conn, $item['cart_id'], $cartItems);
     
     ResponseHandler::success([
         'success' => true,
-        'message' => 'Promotion removed successfully',
+        'message' => 'Item removed from cart',
         'data' => [
-            'cart_totals' => $newTotals
+            'cart_summary' => $totals
         ]
     ]);
 }
@@ -1897,24 +1217,34 @@ function removePromotionFromCart($conn, $data, $userId) {
 /*********************************
  * CLEAR CART
  *********************************/
-function clearCart($conn, $data, $userId) {
-    $cart = getOrCreateUserCart($conn, $userId);
+function clearCart($conn, $data, $userId, $sessionId) {
+    $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
+    // Get all cart items
+    $itemsStmt = $conn->prepare("SELECT id FROM cart_items WHERE cart_id = :cart_id AND is_active = 1");
+    $itemsStmt->execute([':cart_id' => $cart['id']]);
+    $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    // Delete add-ons for each item
+    foreach ($items as $item) {
+        $deleteAddOns = $conn->prepare("DELETE FROM cart_addons WHERE cart_item_id = :item_id");
+        $deleteAddOns->execute([':item_id' => $item['id']]);
+    }
+    
+    // Soft delete all items
     $clearStmt = $conn->prepare(
-        "UPDATE cart_items 
-         SET is_active = 0, updated_at = NOW()
-         WHERE user_id = :user_id AND is_active = 1"
+        "UPDATE cart_items SET is_active = 0, updated_at = NOW() WHERE cart_id = :cart_id"
     );
-    
-    $clearStmt->execute([':user_id' => $userId]);
+    $clearStmt->execute([':cart_id' => $cart['id']]);
     $itemsCleared = $clearStmt->rowCount();
     
+    // Remove promotion
+    $deletePromo = $conn->prepare("DELETE FROM cart_promotions WHERE cart_id = :cart_id");
+    $deletePromo->execute([':cart_id' => $cart['id']]);
+    
+    // Update cart
     $updateCartStmt = $conn->prepare(
-        "UPDATE carts 
-         SET applied_promotion_id = NULL,
-             applied_discount = NULL,
-             updated_at = NOW()
-         WHERE id = :cart_id"
+        "UPDATE carts SET updated_at = NOW() WHERE id = :cart_id"
     );
     $updateCartStmt->execute([':cart_id' => $cart['id']]);
     
@@ -1929,831 +1259,156 @@ function clearCart($conn, $data, $userId) {
 }
 
 /*********************************
- * VALIDATE CART
+ * APPLY PROMOTION TO CART
  *********************************/
-function validateCart($conn, $data, $userId, $baseUrl) {
-    $cart = getOrCreateUserCart($conn, $userId);
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
+function applyPromotionToCart($conn, $data, $userId, $sessionId) {
+    $promotionId = $data['promotion_id'] ?? null;
+    $promoCode = $data['promo_code'] ?? null;
     
-    if (empty($cartItems)) {
-        ResponseHandler::error('Cart is empty', 400);
+    if (!$promotionId && !$promoCode) {
+        ResponseHandler::error('Promotion ID or code is required', 400);
     }
     
-    $issues = [];
-    $warnings = [];
-    $unavailableItems = [];
+    $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
-    foreach ($cartItems as $item) {
-        if (($item['source_type'] ?? '') === 'menu_item') {
-            $checkStmt = $conn->prepare(
-                "SELECT mi.is_available, mi.stock_quantity, mi.max_quantity,
-                        m.is_active, m.is_open
-                 FROM menu_items mi
-                 LEFT JOIN merchants m ON mi.merchant_id = m.id
-                 WHERE mi.id = :item_id"
-            );
-            
-            $checkStmt->execute([':item_id' => $item['item_id'] ?? 0]);
-            $status = $checkStmt->fetch(PDO::FETCH_ASSOC);
-            
-            if (!$status || empty($status['is_available'])) {
-                $issues[] = ($item['name'] ?? 'Item') . ' is no longer available';
-                $unavailableItems[] = $item;
-            } elseif (!empty($status['stock_quantity']) && ($item['quantity'] ?? 0) > $status['stock_quantity']) {
-                $issues[] = ($item['name'] ?? 'Item') . " only has {$status['stock_quantity']} items available";
-            } elseif (empty($status['is_active'])) {
-                $issues[] = ($item['merchant_name'] ?? 'Merchant') . ' is no longer active';
-            } elseif (empty($status['is_open'])) {
-                $warnings[] = ($item['merchant_name'] ?? 'Merchant') . ' is currently closed';
-            }
-        } else {
-            // Quick order validation
-            $checkStmt = $conn->prepare(
-                "SELECT qo.is_available, qoi.stock_quantity, qoi.max_quantity,
-                        qom.is_active, m.is_open
-                 FROM quick_orders qo
-                 INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-                 LEFT JOIN quick_order_items qoi ON qo.id = qoi.quick_order_id AND qoi.id = :item_id
-                 LEFT JOIN merchants m ON qom.merchant_id = m.id
-                 WHERE qo.id = :quick_order_id
-                 AND qom.merchant_id = :merchant_id"
-            );
-            
-            $checkStmt->execute([
-                ':quick_order_id' => $item['quick_order_id'] ?? 0,
-                ':merchant_id' => $item['merchant_id'] ?? 0,
-                ':item_id' => $item['quick_order_item_id'] ?? 0
-            ]);
-            $status = $checkStmt->fetch(PDO::FETCH_ASSOC);
-            
-            if (!$status || empty($status['is_available']) || empty($status['is_active'])) {
-                $issues[] = ($item['name'] ?? 'Item') . ' is no longer available';
-                $unavailableItems[] = $item;
-            } elseif (!empty($status['stock_quantity']) && ($item['quantity'] ?? 0) > $status['stock_quantity']) {
-                $issues[] = ($item['name'] ?? 'Item') . " only has {$status['stock_quantity']} available";
-            } elseif (empty($status['is_open'])) {
-                $warnings[] = ($item['merchant_name'] ?? 'Merchant') . ' is currently closed';
-            }
-        }
-    }
-    
-    // Check minimum order per merchant
-    $groupedItems = groupCartItemsByMerchant($cartItems);
-    foreach ($groupedItems as $group) {
-        $minOrder = floatval($group['min_order'] ?? 5000.00);
-        $subtotal = floatval($group['subtotal'] ?? 0);
-        
-        if ($subtotal < $minOrder) {
-            $warnings[] = ($group['merchant_name'] ?? 'Merchant') . ' requires minimum order of MK ' . 
-                         number_format($minOrder, 0);
-        }
-    }
-    
-    $response = [
-        'is_valid' => empty($issues),
-        'has_warnings' => !empty($warnings),
-        'issues' => $issues,
-        'warnings' => $warnings,
-        'item_count' => count($cartItems),
-        'unavailable_items' => $unavailableItems
-    ];
-    
-    if (empty($issues)) {
-        ResponseHandler::success([
-            'success' => true,
-            'message' => 'Cart is valid',
-            'data' => $response
-        ]);
+    // Get promotion
+    if ($promotionId) {
+        $promoStmt = $conn->prepare("SELECT * FROM promotions WHERE id = :id AND is_active = 1");
+        $promoStmt->execute([':id' => $promotionId]);
     } else {
-        ResponseHandler::error('Cart validation failed', 400, $response);
-    }
-}
-
-/*********************************
- * PREPARE CHECKOUT
- *********************************/
-function prepareCheckout($conn, $data, $userId, $baseUrl) {
-    $deliveryAddressId = $data['delivery_address_id'] ?? null;
-    $specialInstructions = trim($data['special_instructions'] ?? '');
-    $tipAmount = floatval($data['tip_amount'] ?? 0);
-    $paymentMethod = $data['payment_method'] ?? 'cash';
-    $scheduledTime = $data['scheduled_time'] ?? null;
-    
-    $cart = getOrCreateUserCart($conn, $userId);
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
-    
-    if (empty($cartItems)) {
-        ResponseHandler::error('Cannot checkout empty cart', 400);
+        $promoStmt = $conn->prepare("SELECT * FROM promotions WHERE code = :code AND is_active = 1");
+        $promoStmt->execute([':code' => $promoCode]);
     }
     
-    // Get delivery address
-    $address = getDeliveryAddress($conn, $userId, $deliveryAddressId);
-    if (!$address) {
-        ResponseHandler::error('Please select a delivery address', 400);
+    $promotion = $promoStmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$promotion) {
+        ResponseHandler::error('Invalid promotion', 404);
     }
     
-    // Validate cart
-    $validation = validateCartItems($conn, $cartItems);
-    if (!$validation['is_valid']) {
-        ResponseHandler::error('Cart validation failed', 400, ['issues' => $validation['issues']]);
-    }
-    
-    // Calculate totals
-    $totals = calculateCartTotals($conn, $cart['id'], $userId);
-    $finalTotal = ($totals['total_amount'] ?? 0) + $tipAmount;
-    
-    // Group items by merchant for delivery estimates
-    $groupedItems = groupCartItemsByMerchant($cartItems);
-    $deliveryEstimates = calculateDeliveryEstimates($groupedItems, $scheduledTime);
-    
-    // Check if user has sufficient balance for selected payment method
-    if ($paymentMethod === 'wallet') {
-        $balanceStmt = $conn->prepare("SELECT wallet_balance FROM users WHERE id = :user_id");
-        $balanceStmt->execute([':user_id' => $userId]);
-        $balance = $balanceStmt->fetch(PDO::FETCH_ASSOC);
-        
-        if (!$balance || ($balance['wallet_balance'] ?? 0) < $finalTotal) {
-            ResponseHandler::error('Insufficient wallet balance', 400);
-        }
-    }
-    
-    $checkoutData = [
-        'checkout_id' => uniqid('chk_'),
-        'cart_id' => $cart['id'],
-        'user_id' => $userId,
-        'address' => formatAddressData($address),
-        'payment_method' => $paymentMethod,
-        'tip_amount' => round($tipAmount, 2),
-        'scheduled_time' => $scheduledTime,
-        'special_instructions' => $specialInstructions,
-        'summary' => [
-            'items_subtotal' => $totals['subtotal'] ?? 0,
-            'discount_amount' => $totals['discount_amount'] ?? 0,
-            'adjusted_subtotal' => $totals['adjusted_subtotal'] ?? 0,
-            'delivery_fee' => $totals['delivery_fee'] ?? 0,
-            'service_fee' => $totals['service_fee'] ?? 0,
-            'tax_amount' => $totals['tax_amount'] ?? 0,
-            'tip_amount' => round($tipAmount, 2),
-            'total_amount' => round($finalTotal, 2)
-        ],
-        'items' => $cartItems,
-        'grouped_by_merchant' => $groupedItems,
-        'delivery_estimates' => $deliveryEstimates,
-        'item_count' => $totals['item_count'] ?? 0,
-        'total_quantity' => $totals['total_quantity'] ?? 0,
-        'merchant_count' => count($groupedItems),
-        'promotion' => getAppliedPromotion($conn, $cart['id'])
-    ];
-    
-    // Store checkout data in session
-    $checkoutSessionKey = 'checkout_' . $cart['id'];
-    $_SESSION[$checkoutSessionKey] = $checkoutData;
-    
-    ResponseHandler::success([
-        'success' => true,
-        'message' => 'Checkout prepared successfully',
-        'data' => $checkoutData
-    ]);
-}
-
-/*********************************
- * GET DELIVERY ADDRESS
- *********************************/
-function getDeliveryAddress($conn, $userId, $addressId = null) {
-    if ($addressId) {
-        $stmt = $conn->prepare(
-            "SELECT * FROM addresses 
-             WHERE id = :address_id AND user_id = :user_id"
-        );
-        $stmt->execute([':address_id' => $addressId, ':user_id' => $userId]);
-        $address = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        if ($address) {
-            return $address;
-        }
-    }
-    
-    $defaultStmt = $conn->prepare(
-        "SELECT * FROM addresses 
-         WHERE user_id = :user_id AND is_default = 1
-         LIMIT 1"
+    // Check if promotion already applied
+    $checkStmt = $conn->prepare(
+        "SELECT id FROM cart_promotions WHERE cart_id = :cart_id AND promotion_id = :promotion_id"
     );
-    $defaultStmt->execute([':user_id' => $userId]);
-    
-    return $defaultStmt->fetch(PDO::FETCH_ASSOC);
-}
-
-/*********************************
- * CALCULATE DELIVERY ESTIMATES
- *********************************/
-function calculateDeliveryEstimates($groupedItems, $scheduledTime = null) {
-    $estimates = [];
-    $totalPrepTime = 0;
-    $totalDeliveryTime = 0;
-    
-    foreach ($groupedItems as $group) {
-        $prepTimeStr = $group['merchant_prep_time'] ?? '15';
-        $merchantPrepTime = intval(preg_replace('/[^0-9]/', '', $prepTimeStr)) ?: 15;
-        $itemCount = $group['item_count'] ?? 1;
-        
-        // Base preparation time + additional time per item
-        $prepTime = $merchantPrepTime + ($itemCount * 2);
-        $totalPrepTime = max($totalPrepTime, $prepTime);
-        
-        // Delivery time (assume 15-30 mins for delivery)
-        $deliveryTime = 20;
-        $totalDeliveryTime = max($totalDeliveryTime, $deliveryTime);
-        
-        $estimates[] = [
-            'merchant_id' => $group['merchant_id'] ?? 0,
-            'merchant_name' => $group['merchant_name'] ?? 'Unknown',
-            'preparation_time' => $prepTime,
-            'delivery_time' => $deliveryTime,
-            'total_time' => $prepTime + $deliveryTime,
-            'ready_by' => date('H:i', strtotime("+{$prepTime} minutes")),
-            'delivered_by' => date('H:i', strtotime("+" . ($prepTime + $deliveryTime) . " minutes"))
-        ];
-    }
-    
-    return [
-        'per_merchant' => $estimates,
-        'total_estimated_time' => $totalPrepTime + $totalDeliveryTime,
-        'estimated_delivery' => date('H:i', strtotime("+" . ($totalPrepTime + $totalDeliveryTime) . " minutes")),
-        'estimated_pickup' => date('H:i', strtotime("+{$totalPrepTime} minutes"))
-    ];
-}
-
-/*********************************
- * ESTIMATE DELIVERY
- *********************************/
-function estimateDelivery($conn, $data, $userId) {
-    $merchantIds = $data['merchant_ids'] ?? [];
-    $latitude = $data['latitude'] ?? null;
-    $longitude = $data['longitude'] ?? null;
-    
-    if (empty($merchantIds)) {
-        ResponseHandler::error('Merchant IDs are required', 400);
-    }
-    
-    $estimates = [];
-    $totalPrepTime = 0;
-    
-    foreach ($merchantIds as $merchantId) {
-        $stmt = $conn->prepare(
-            "SELECT name, preparation_time, latitude, longitude 
-             FROM merchants WHERE id = :id"
-        );
-        $stmt->execute([':id' => $merchantId]);
-        $merchant = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        if ($merchant) {
-            $prepTimeStr = $merchant['preparation_time'] ?? '15';
-            $prepTime = intval(preg_replace('/[^0-9]/', '', $prepTimeStr)) ?: 15;
-            $totalPrepTime = max($totalPrepTime, $prepTime);
-            
-            // Calculate delivery time based on distance
-            $deliveryTime = 20; // Base delivery time
-            if ($latitude && $longitude && !empty($merchant['latitude']) && !empty($merchant['longitude'])) {
-                $distance = calculateDistance(
-                    $merchant['latitude'], $merchant['longitude'],
-                    $latitude, $longitude
-                );
-                $deliveryTime = max(15, min(45, ceil($distance * 3))); // 3 mins per km
-            }
-            
-            $estimates[] = [
-                'merchant_id' => $merchantId,
-                'merchant_name' => $merchant['name'] ?? 'Unknown',
-                'preparation_time' => $prepTime,
-                'delivery_time' => $deliveryTime,
-                'total_time' => $prepTime + $deliveryTime
-            ];
-        }
-    }
-    
-    ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'estimates' => $estimates,
-            'total_estimated_time' => $totalPrepTime + 20,
-            'estimated_delivery' => date('H:i', strtotime("+" . ($totalPrepTime + 20) . " minutes"))
-        ]
+    $checkStmt->execute([
+        ':cart_id' => $cart['id'],
+        ':promotion_id' => $promotion['id']
     ]);
-}
-
-/*********************************
- * CHECK ITEM AVAILABILITY - COMPLETED
- *********************************/
-function checkItemAvailability($conn, $data, $userId) {
-    $items = $data['items'] ?? [];
     
-    if (empty($items)) {
-        ResponseHandler::error('Items to check are required', 400);
+    if ($checkStmt->fetch()) {
+        ResponseHandler::error('Promotion already applied to this cart', 400);
     }
     
-    $availability = [];
+    // Calculate discount amount
+    $cartItems = getCartItemsByCartId($conn, $cart['id'], '');
+    $subtotal = 0;
+    foreach ($cartItems as $item) {
+        $subtotal += $item['total'] ?? 0;
+    }
     
-    foreach ($items as $item) {
-        $menuItemId = $item['menu_item_id'] ?? null;
-        $quickOrderId = $item['quick_order_id'] ?? null;
-        $quickOrderItemId = $item['quick_order_item_id'] ?? null;
-        $merchantId = $item['merchant_id'] ?? null;
-        $quantity = intval($item['quantity'] ?? 1);
-        
-        if ($menuItemId) {
-            $stmt = $conn->prepare(
-                "SELECT mi.name, mi.is_available, mi.stock_quantity, mi.max_quantity,
-                        m.is_open as merchant_open, m.is_active as merchant_active
-                 FROM menu_items mi
-                 LEFT JOIN merchants m ON mi.merchant_id = m.id
-                 WHERE mi.id = :item_id"
-            );
-            $stmt->execute([':item_id' => $menuItemId]);
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if ($result) {
-                $isAvailable = ($result['is_available'] ?? false) && 
-                               ($result['merchant_open'] ?? false) && 
-                               ($result['merchant_active'] ?? false);
-                $stockIssue = !empty($result['stock_quantity']) && $quantity > $result['stock_quantity'];
-                $maxIssue = !empty($result['max_quantity']) && $quantity > $result['max_quantity'];
-                
-                $availability[] = [
-                    'item_id' => $menuItemId,
-                    'name' => $result['name'] ?? 'Unknown',
-                    'type' => 'menu_item',
-                    'is_available' => $isAvailable && !$stockIssue && !$maxIssue,
-                    'available_quantity' => $result['stock_quantity'] ?? 0,
-                    'max_quantity' => $result['max_quantity'] ?? 99,
-                    'requested_quantity' => $quantity,
-                    'issues' => [
-                        'not_available' => empty($result['is_available']),
-                        'merchant_closed' => empty($result['merchant_open']),
-                        'merchant_inactive' => empty($result['merchant_active']),
-                        'insufficient_stock' => $stockIssue,
-                        'exceeds_max' => $maxIssue
-                    ]
-                ];
-            } else {
-                $availability[] = [
-                    'item_id' => $menuItemId,
-                    'name' => 'Unknown Item',
-                    'type' => 'menu_item',
-                    'is_available' => false,
-                    'available_quantity' => 0,
-                    'max_quantity' => 0,
-                    'requested_quantity' => $quantity,
-                    'issues' => [
-                        'not_found' => true
-                    ]
-                ];
-            }
-        } elseif ($quickOrderId && $merchantId) {
-            $stmt = $conn->prepare(
-                "SELECT qo.title, qo.is_available as qo_available,
-                        qoi.stock_quantity, qoi.max_quantity, qoi.name as item_name,
-                        m.is_open as merchant_open, m.is_active as merchant_active,
-                        qom.is_active as merchant_relation_active
-                 FROM quick_orders qo
-                 INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-                 LEFT JOIN quick_order_items qoi ON qo.id = qoi.quick_order_id AND qoi.id = :item_id
-                 LEFT JOIN merchants m ON qom.merchant_id = m.id
-                 WHERE qo.id = :quick_order_id
-                 AND qom.merchant_id = :merchant_id"
-            );
-            $stmt->execute([
-                ':quick_order_id' => $quickOrderId,
-                ':merchant_id' => $merchantId,
-                ':item_id' => $quickOrderItemId
-            ]);
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if ($result) {
-                $itemName = $result['item_name'] ?? $result['title'] ?? 'Quick Order';
-                $isAvailable = ($result['qo_available'] ?? false) && 
-                               ($result['merchant_open'] ?? false) && 
-                               ($result['merchant_active'] ?? false) &&
-                               ($result['merchant_relation_active'] ?? false);
-                $stockIssue = !empty($result['stock_quantity']) && $quantity > $result['stock_quantity'];
-                $maxIssue = !empty($result['max_quantity']) && $quantity > $result['max_quantity'];
-                
-                $availability[] = [
-                    'item_id' => $quickOrderId,
-                    'item_detail_id' => $quickOrderItemId,
-                    'name' => $itemName,
-                    'type' => 'quick_order',
-                    'is_available' => $isAvailable && !$stockIssue && !$maxIssue,
-                    'available_quantity' => $result['stock_quantity'] ?? 0,
-                    'max_quantity' => $result['max_quantity'] ?? 99,
-                    'requested_quantity' => $quantity,
-                    'issues' => [
-                        'not_available' => empty($result['qo_available']),
-                        'merchant_closed' => empty($result['merchant_open']),
-                        'merchant_inactive' => empty($result['merchant_active']),
-                        'merchant_relation_inactive' => empty($result['merchant_relation_active']),
-                        'insufficient_stock' => $stockIssue,
-                        'exceeds_max' => $maxIssue
-                    ]
-                ];
-            } else {
-                $availability[] = [
-                    'item_id' => $quickOrderId,
-                    'item_detail_id' => $quickOrderItemId,
-                    'name' => 'Unknown Quick Order',
-                    'type' => 'quick_order',
-                    'is_available' => false,
-                    'available_quantity' => 0,
-                    'max_quantity' => 0,
-                    'requested_quantity' => $quantity,
-                    'issues' => [
-                        'not_found' => true
-                    ]
-                ];
-            }
-        } else {
-            $availability[] = [
-                'item_id' => $menuItemId ?? $quickOrderId,
-                'name' => 'Invalid Item',
-                'type' => 'unknown',
-                'is_available' => false,
-                'available_quantity' => 0,
-                'max_quantity' => 0,
-                'requested_quantity' => $quantity,
-                'issues' => [
-                    'invalid_request' => true
-                ]
-            ];
+    $discountAmount = 0;
+    if ($promotion['discount_type'] === 'percentage') {
+        $discountAmount = $subtotal * ($promotion['discount_value'] / 100);
+        if (!empty($promotion['max_discount_amount']) && $discountAmount > $promotion['max_discount_amount']) {
+            $discountAmount = $promotion['max_discount_amount'];
         }
+    } elseif ($promotion['discount_type'] === 'fixed') {
+        $discountAmount = min($promotion['discount_value'], $subtotal);
     }
     
-    $allAvailable = true;
-    foreach ($availability as $item) {
-        if (!$item['is_available']) {
-            $allAvailable = false;
-            break;
-        }
-    }
-    
-    ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'availability' => $availability,
-            'all_available' => $allAvailable,
-            'total_items_checked' => count($availability)
-        ]
-    ]);
-}
-
-/*********************************
- * MERGE CART
- *********************************/
-function mergeCart($conn, $data, $userId, $baseUrl) {
-    $guestItems = $data['guest_items'] ?? [];
-    
-    if (empty($guestItems)) {
-        ResponseHandler::error('No guest items to merge', 400);
-    }
-    
-    // First, check if all guest items are from the same merchant
-    $firstMerchantId = null;
-    $firstMerchantName = null;
-    
-    foreach ($guestItems as $guestItem) {
-        $menuItemId = $guestItem['menu_item_id'] ?? null;
-        $quickOrderId = $guestItem['quick_order_id'] ?? null;
-        $merchantId = $guestItem['merchant_id'] ?? null;
-        
-        if ($menuItemId) {
-            // Get merchant from menu item
-            $stmt = $conn->prepare(
-                "SELECT m.id, m.name FROM menu_items mi
-                 JOIN merchants m ON mi.merchant_id = m.id
-                 WHERE mi.id = :item_id"
-            );
-            $stmt->execute([':item_id' => $menuItemId]);
-            $result = $stmt->fetch(PDO::FETCH_ASSOC);
-            $currentMerchantId = $result['id'] ?? null;
-            $currentMerchantName = $result['name'] ?? 'Unknown';
-        } elseif ($quickOrderId && $merchantId) {
-            $currentMerchantId = $merchantId;
-            $currentMerchantName = 'Unknown';
-        } else {
-            ResponseHandler::error('Invalid guest item data', 400);
-        }
-        
-        if ($firstMerchantId === null) {
-            $firstMerchantId = $currentMerchantId;
-            $firstMerchantName = $currentMerchantName;
-        } elseif ($firstMerchantId != $currentMerchantId) {
-            ResponseHandler::error(
-                "Cannot merge items from different merchants. " .
-                "First item is from {$firstMerchantName}, but found item from another merchant.",
-                400
-            );
-        }
-    }
-    
-    $cart = getOrCreateUserCart($conn, $userId);
-    
-    // ===== SINGLE MERCHANT VALIDATION =====
-    // Check if cart already has items from a different merchant
-    $existingMerchantStmt = $conn->prepare(
-        "SELECT DISTINCT merchant_id, merchant_name 
-         FROM cart_items 
-         WHERE user_id = :user_id 
-         AND is_active = 1
-         AND merchant_id IS NOT NULL
-         LIMIT 1"
+    // Apply promotion
+    $insertStmt = $conn->prepare(
+        "INSERT INTO cart_promotions (cart_id, promotion_id, discount_amount, applied_at)
+         VALUES (:cart_id, :promotion_id, :discount_amount, NOW())"
     );
-    $existingMerchantStmt->execute([':user_id' => $userId]);
-    $existingMerchant = $existingMerchantStmt->fetch(PDO::FETCH_ASSOC);
     
-    if ($existingMerchant && $existingMerchant['merchant_id'] != $firstMerchantId) {
-        ResponseHandler::error(
-            "Your cart already contains items from {$existingMerchant['merchant_name']}. " .
-            "Please complete or clear that order before merging items from a different merchant.",
-            400
-        );
-    }
+    $insertStmt->execute([
+        ':cart_id' => $cart['id'],
+        ':promotion_id' => $promotion['id'],
+        ':discount_amount' => $discountAmount
+    ]);
     
-    $mergedCount = 0;
-    $skippedCount = 0;
-    $mergedItems = [];
-    
-    $conn->beginTransaction();
-    
-    try {
-        foreach ($guestItems as $guestItem) {
-            $menuItemId = $guestItem['menu_item_id'] ?? null;
-            $quickOrderId = $guestItem['quick_order_id'] ?? null;
-            $merchantId = $guestItem['merchant_id'] ?? null;
-            $quantity = intval($guestItem['quantity'] ?? 1);
-            
-            if ($menuItemId) {
-                // Check if menu item exists
-                $checkStmt = $conn->prepare(
-                    "SELECT id FROM menu_items WHERE id = :item_id AND is_available = 1"
-                );
-                $checkStmt->execute([':item_id' => $menuItemId]);
-                
-                if ($checkStmt->fetch()) {
-                    // Get merchant info
-                    $merchantStmt = $conn->prepare(
-                        "SELECT m.id, m.name, m.delivery_fee, m.min_order_amount, m.preparation_time,
-                                mi.price
-                         FROM menu_items mi
-                         JOIN merchants m ON mi.merchant_id = m.id
-                         WHERE mi.id = :item_id"
-                    );
-                    $merchantStmt->execute([':item_id' => $menuItemId]);
-                    $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
-                    
-                    // Check if already in cart
-                    $existingStmt = $conn->prepare(
-                        "SELECT id FROM cart_items 
-                         WHERE user_id = :user_id AND menu_item_id = :item_id AND is_active = 1"
-                    );
-                    $existingStmt->execute([':user_id' => $userId, ':item_id' => $menuItemId]);
-                    
-                    if ($existingStmt->fetch()) {
-                        // Update existing
-                        $updateStmt = $conn->prepare(
-                            "UPDATE cart_items 
-                             SET quantity = quantity + :quantity, updated_at = NOW()
-                             WHERE user_id = :user_id AND menu_item_id = :item_id AND is_active = 1"
-                        );
-                        $updateStmt->execute([
-                            ':quantity' => $quantity,
-                            ':user_id' => $userId,
-                            ':item_id' => $menuItemId
-                        ]);
-                    } else {
-                        // Insert new with merchant data
-                        $insertStmt = $conn->prepare(
-                            "INSERT INTO cart_items 
-                                (user_id, cart_id, menu_item_id, quantity, merchant_id, merchant_name,
-                                 merchant_delivery_fee, merchant_min_order, preparation_time, price,
-                                 is_active, created_at, updated_at)
-                             VALUES 
-                                (:user_id, :cart_id, :item_id, :quantity, :merchant_id, :merchant_name,
-                                 :delivery_fee, :min_order, :prep_time, :price, 1, NOW(), NOW())"
-                        );
-                        $insertStmt->execute([
-                            ':user_id' => $userId,
-                            ':cart_id' => $cart['id'],
-                            ':item_id' => $menuItemId,
-                            ':quantity' => $quantity,
-                            ':merchant_id' => $merchant['id'] ?? null,
-                            ':merchant_name' => $merchant['name'] ?? 'Unknown Merchant',
-                            ':delivery_fee' => $merchant['delivery_fee'] ?? 2500.00,
-                            ':min_order' => $merchant['min_order_amount'] ?? 5000.00,
-                            ':prep_time' => $merchant['preparation_time'] ?? '15-20 min',
-                            ':price' => $merchant['price'] ?? 0
-                        ]);
-                    }
-                    
-                    $mergedCount++;
-                    $mergedItems[] = [
-                        'type' => 'menu_item',
-                        'id' => $menuItemId,
-                        'quantity' => $quantity
-                    ];
-                } else {
-                    $skippedCount++;
-                }
-            } elseif ($quickOrderId && $merchantId) {
-                // Check if quick order exists for this merchant
-                $checkStmt = $conn->prepare(
-                    "SELECT qo.id FROM quick_orders qo
-                     INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-                     WHERE qo.id = :quick_order_id AND qom.merchant_id = :merchant_id AND qom.is_active = 1"
-                );
-                $checkStmt->execute([
-                    ':quick_order_id' => $quickOrderId,
-                    ':merchant_id' => $merchantId
-                ]);
-                
-                if ($checkStmt->fetch()) {
-                    // Get merchant info
-                    $merchantStmt = $conn->prepare(
-                        "SELECT id, name, delivery_fee, min_order_amount, preparation_time
-                         FROM merchants WHERE id = :merchant_id"
-                    );
-                    $merchantStmt->execute([':merchant_id' => $merchantId]);
-                    $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
-                    
-                    // Check if already in cart
-                    $existingStmt = $conn->prepare(
-                        "SELECT id FROM cart_items 
-                         WHERE user_id = :user_id AND quick_order_id = :quick_order_id 
-                         AND merchant_id = :merchant_id AND is_active = 1"
-                    );
-                    $existingStmt->execute([
-                        ':user_id' => $userId,
-                        ':quick_order_id' => $quickOrderId,
-                        ':merchant_id' => $merchantId
-                    ]);
-                    
-                    if ($existingStmt->fetch()) {
-                        // Update existing
-                        $updateStmt = $conn->prepare(
-                            "UPDATE cart_items 
-                             SET quantity = quantity + :quantity, updated_at = NOW()
-                             WHERE user_id = :user_id AND quick_order_id = :quick_order_id 
-                             AND merchant_id = :merchant_id AND is_active = 1"
-                        );
-                        $updateStmt->execute([
-                            ':quantity' => $quantity,
-                            ':user_id' => $userId,
-                            ':quick_order_id' => $quickOrderId,
-                            ':merchant_id' => $merchantId
-                        ]);
-                    } else {
-                        // Insert new with merchant data
-                        $insertStmt = $conn->prepare(
-                            "INSERT INTO cart_items 
-                                (user_id, cart_id, quick_order_id, merchant_id, merchant_name,
-                                 merchant_delivery_fee, merchant_min_order, preparation_time,
-                                 quantity, is_active, created_at, updated_at)
-                             VALUES 
-                                (:user_id, :cart_id, :quick_order_id, :merchant_id, :merchant_name,
-                                 :delivery_fee, :min_order, :prep_time,
-                                 :quantity, 1, NOW(), NOW())"
-                        );
-                        $insertStmt->execute([
-                            ':user_id' => $userId,
-                            ':cart_id' => $cart['id'],
-                            ':quick_order_id' => $quickOrderId,
-                            ':merchant_id' => $merchantId,
-                            ':merchant_name' => $merchant['name'] ?? 'Unknown Merchant',
-                            ':delivery_fee' => $merchant['delivery_fee'] ?? 2500.00,
-                            ':min_order' => $merchant['min_order_amount'] ?? 5000.00,
-                            ':prep_time' => $merchant['preparation_time'] ?? '15-20 min',
-                            ':quantity' => $quantity
-                        ]);
-                    }
-                    
-                    $mergedCount++;
-                    $mergedItems[] = [
-                        'type' => 'quick_order',
-                        'id' => $quickOrderId,
-                        'merchant_id' => $merchantId,
-                        'quantity' => $quantity
-                    ];
-                } else {
-                    $skippedCount++;
-                }
-            } else {
-                $skippedCount++;
-            }
-        }
-        
-        $conn->commit();
-        
-    } catch (Exception $e) {
-        $conn->rollBack();
-        ResponseHandler::error('Failed to merge cart: ' . $e->getMessage(), 500);
-    }
-    
-    // Update cart timestamp
+    // Update cart
     $updateCartStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
     $updateCartStmt->execute([':cart_id' => $cart['id']]);
     
-    // Get updated cart data
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
-    $totals = calculateCartTotals($conn, $cart['id'], $userId);
-    
     ResponseHandler::success([
         'success' => true,
-        'message' => 'Cart merged successfully',
+        'message' => 'Promotion applied successfully',
         'data' => [
-            'merged_count' => $mergedCount,
-            'skipped_count' => $skippedCount,
-            'merged_items' => $mergedItems,
-            'cart_summary' => [
-                'item_count' => count($cartItems),
-                'total_quantity' => $totals['total_quantity'] ?? 0,
-                'subtotal' => $totals['subtotal'] ?? 0
+            'promotion' => [
+                'id' => $promotion['id'],
+                'code' => $promotion['code'],
+                'name' => $promotion['name'],
+                'discount_type' => $promotion['discount_type'],
+                'discount_value' => floatval($promotion['discount_value']),
+                'discount_amount' => $discountAmount
             ]
         ]
     ]);
 }
 
 /*********************************
- * VALIDATE CART ITEMS - HELPER
+ * REMOVE PROMOTION FROM CART
  *********************************/
-function validateCartItems($conn, $cartItems) {
-    $issues = [];
-    $isValid = true;
+function removePromotionFromCart($conn, $data, $userId, $sessionId) {
+    $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
-    foreach ($cartItems as $item) {
-        if (($item['source_type'] ?? '') === 'menu_item') {
-            $stmt = $conn->prepare(
-                "SELECT mi.is_available, mi.stock_quantity,
-                        m.is_active, m.is_open
-                 FROM menu_items mi
-                 LEFT JOIN merchants m ON mi.merchant_id = m.id
-                 WHERE mi.id = :item_id"
-            );
-            $stmt->execute([':item_id' => $item['item_id'] ?? 0]);
-            $status = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if (!$status) {
-                $issues[] = "Item " . ($item['name'] ?? 'Unknown') . " not found";
-                $isValid = false;
-            } else {
-                if (empty($status['is_available'])) {
-                    $issues[] = ($item['name'] ?? 'Item') . ' is no longer available';
-                    $isValid = false;
-                }
-                if (!empty($status['stock_quantity']) && ($item['quantity'] ?? 0) > $status['stock_quantity']) {
-                    $issues[] = ($item['name'] ?? 'Item') . " only has {$status['stock_quantity']} items available";
-                    $isValid = false;
-                }
-                if (empty($status['is_active'])) {
-                    $issues[] = ($item['merchant_name'] ?? 'Merchant') . ' is no longer active';
-                    $isValid = false;
-                }
-            }
-        } else {
-            // Quick order validation
-            $stmt = $conn->prepare(
-                "SELECT qo.is_available, qoi.stock_quantity,
-                        qom.is_active, m.is_open
-                 FROM quick_orders qo
-                 INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-                 LEFT JOIN quick_order_items qoi ON qo.id = qoi.quick_order_id AND qoi.id = :item_id
-                 LEFT JOIN merchants m ON qom.merchant_id = m.id
-                 WHERE qo.id = :quick_order_id AND qom.merchant_id = :merchant_id"
-            );
-            $stmt->execute([
-                ':quick_order_id' => $item['quick_order_id'] ?? 0,
-                ':merchant_id' => $item['merchant_id'] ?? 0,
-                ':item_id' => $item['quick_order_item_id'] ?? 0
-            ]);
-            $status = $stmt->fetch(PDO::FETCH_ASSOC);
-            
-            if (!$status) {
-                $issues[] = "Quick order " . ($item['name'] ?? 'Unknown') . " not found";
-                $isValid = false;
-            } else {
-                if (empty($status['is_available']) || empty($status['is_active'])) {
-                    $issues[] = ($item['name'] ?? 'Item') . ' is no longer available';
-                    $isValid = false;
-                }
-                if (!empty($status['stock_quantity']) && ($item['quantity'] ?? 0) > $status['stock_quantity']) {
-                    $issues[] = ($item['name'] ?? 'Item') . " only has {$status['stock_quantity']} available";
-                    $isValid = false;
-                }
-                if (empty($status['is_open'])) {
-                    $issues[] = ($item['merchant_name'] ?? 'Merchant') . ' is currently closed';
-                    $isValid = false;
-                }
-            }
-        }
+    $deleteStmt = $conn->prepare("DELETE FROM cart_promotions WHERE cart_id = :cart_id");
+    $deleteStmt->execute([':cart_id' => $cart['id']]);
+    
+    $updateCartStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
+    $updateCartStmt->execute([':cart_id' => $cart['id']]);
+    
+    ResponseHandler::success([
+        'success' => true,
+        'message' => 'Promotion removed successfully'
+    ]);
+}
+
+/*********************************
+ * TOGGLE SAVE FOR LATER
+ *********************************/
+function toggleSaveForLater($conn, $data, $userId, $sessionId) {
+    $cartItemId = $data['cart_item_id'] ?? null;
+    $save = $data['save'] ?? true;
+    
+    if (!$cartItemId) {
+        ResponseHandler::error('Cart item ID is required', 400);
     }
     
-    return ['is_valid' => $isValid, 'issues' => $issues];
+    // Get cart item
+    $itemStmt = $conn->prepare(
+        "SELECT ci.* FROM cart_items ci
+         JOIN carts c ON ci.cart_id = c.id
+         WHERE ci.id = :id"
+    );
+    $itemStmt->execute([':id' => $cartItemId]);
+    $item = $itemStmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$item) {
+        ResponseHandler::error('Cart item not found', 404);
+    }
+    
+    // Verify ownership
+    if ($item['user_id'] && $item['user_id'] != $userId) {
+        ResponseHandler::error('Unauthorized', 403);
+    }
+    
+    $updateStmt = $conn->prepare(
+        "UPDATE cart_items SET is_saved_for_later = :save, updated_at = NOW() WHERE id = :id"
+    );
+    $updateStmt->execute([
+        ':save' => $save ? 1 : 0,
+        ':id' => $cartItemId
+    ]);
+    
+    $message = $save ? 'Item saved for later' : 'Item moved back to cart';
+    
+    ResponseHandler::success([
+        'success' => true,
+        'message' => $message
+    ]);
 }
 
 /*********************************
@@ -2769,134 +1424,16 @@ function handlePutRequest($path, $data) {
     }
     
     $userId = checkAuthentication($conn);
-    if (!$userId) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
+    $sessionId = session_id();
     $action = $data['action'] ?? '';
-    if ($action === 'update_item') {
-        updateCartItem($conn, $data, $userId, $baseUrl);
-    } else {
-        ResponseHandler::error('Invalid action for PUT request', 400);
+    
+    switch ($action) {
+        case 'update_item':
+            updateCartItemQuantity($conn, $data, $userId, $sessionId, $baseUrl);
+            break;
+        default:
+            ResponseHandler::error('Invalid action for PUT request', 400);
     }
-}
-
-/*********************************
- * UPDATE CART ITEM
- *********************************/
-function updateCartItem($conn, $data, $userId, $baseUrl) {
-    $cartItemId = $data['cart_item_id'] ?? null;
-    $quantity = isset($data['quantity']) ? intval($data['quantity']) : null;
-    $specialInstructions = isset($data['special_instructions']) ? trim($data['special_instructions']) : null;
-    $selectedOptions = isset($data['selected_options']) ? $data['selected_options'] : null;
-    
-    if (!$cartItemId) {
-        ResponseHandler::error('Cart item ID is required', 400);
-    }
-    
-    if ($quantity === null && $specialInstructions === null && $selectedOptions === null) {
-        ResponseHandler::error('No update data provided', 400);
-    }
-    
-    if ($quantity === 0) {
-        // Remove item if quantity is 0
-        removeCartItem($conn, $userId, $cartItemId, $baseUrl);
-        return;
-    }
-    
-    // Verify item belongs to user
-    $verifyStmt = $conn->prepare(
-        "SELECT ci.id, ci.quantity, ci.menu_item_id, ci.quick_order_id, ci.quick_order_item_id,
-                mi.max_quantity as menu_max_qty, mi.stock_quantity as menu_stock,
-                qoi.max_quantity as qoi_max_qty, qoi.stock_quantity as qoi_stock
-         FROM cart_items ci
-         LEFT JOIN menu_items mi ON ci.menu_item_id = mi.id
-         LEFT JOIN quick_order_items qoi ON ci.quick_order_item_id = qoi.id
-         WHERE ci.id = :cart_item_id
-         AND ci.user_id = :user_id
-         AND ci.is_active = 1"
-    );
-    
-    $verifyStmt->execute([':cart_item_id' => $cartItemId, ':user_id' => $userId]);
-    $cartItem = $verifyStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$cartItem) {
-        ResponseHandler::error('Cart item not found', 404);
-    }
-    
-    // Validate quantity if being updated
-    if ($quantity !== null) {
-        if ($quantity < 1) {
-            ResponseHandler::error('Quantity must be at least 1', 400);
-        }
-        
-        // Check max quantity
-        $maxQty = $cartItem['menu_max_qty'] ?? $cartItem['qoi_max_qty'] ?? 99;
-        if ($quantity > $maxQty) {
-            ResponseHandler::error("Maximum quantity allowed is $maxQty", 400);
-        }
-        
-        // Check stock
-        $stock = $cartItem['menu_stock'] ?? $cartItem['qoi_stock'] ?? null;
-        if ($stock !== null && $quantity > $stock) {
-            ResponseHandler::error("Only $stock items available in stock", 400);
-        }
-    }
-    
-    // Build update query
-    $updates = [];
-    $params = [':id' => $cartItemId];
-    
-    if ($quantity !== null) {
-        $updates[] = 'quantity = :quantity';
-        $params[':quantity'] = $quantity;
-    }
-    
-    if ($specialInstructions !== null) {
-        $updates[] = 'special_instructions = :instructions';
-        $params[':instructions'] = $specialInstructions;
-    }
-    
-    if ($selectedOptions !== null) {
-        $updates[] = 'selected_options = :selected_options';
-        $params[':selected_options'] = json_encode($selectedOptions);
-    }
-    
-    if (empty($updates)) {
-        ResponseHandler::error('No valid updates provided', 400);
-    }
-    
-    $updates[] = 'updated_at = NOW()';
-    $updateSql = "UPDATE cart_items SET " . implode(', ', $updates) . " WHERE id = :id";
-    $updateStmt = $conn->prepare($updateSql);
-    $updateStmt->execute($params);
-    
-    // Get cart id
-    $cartStmt = $conn->prepare("SELECT cart_id FROM cart_items WHERE id = :id");
-    $cartStmt->execute([':id' => $cartItemId]);
-    $cartId = $cartStmt->fetch(PDO::FETCH_ASSOC)['cart_id'] ?? null;
-    
-    if ($cartId) {
-        $cartUpdateStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
-        $cartUpdateStmt->execute([':cart_id' => $cartId]);
-    }
-    
-    // Get updated cart data
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
-    $totals = calculateCartTotals($conn, $cartId, $userId);
-    
-    ResponseHandler::success([
-        'success' => true,
-        'message' => 'Cart item updated successfully',
-        'data' => [
-            'cart_item_id' => $cartItemId,
-            'cart_summary' => [
-                'item_count' => count($cartItems),
-                'total_quantity' => $totals['total_quantity'] ?? 0,
-                'subtotal' => $totals['subtotal'] ?? 0
-            ]
-        ]
-    ]);
 }
 
 /*********************************
@@ -2912,257 +1449,69 @@ function handleDeleteRequest($path, $data) {
     }
     
     $userId = checkAuthentication($conn);
-    if (!$userId) {
-        ResponseHandler::error('Authentication required', 401);
-    }
-    
+    $sessionId = session_id();
     $action = $data['action'] ?? '';
-    if ($action === 'remove_item') {
-        $cartItemId = $data['cart_item_id'] ?? null;
-        if ($cartItemId) {
-            removeCartItem($conn, $userId, $cartItemId, $baseUrl);
-        } else {
-            ResponseHandler::error('Cart item ID is required', 400);
-        }
-    } elseif ($action === 'remove_multiple') {
-        $cartItemIds = $data['cart_item_ids'] ?? [];
-        if (!empty($cartItemIds)) {
-            removeMultipleCartItems($conn, $userId, $cartItemIds, $baseUrl);
-        } else {
-            ResponseHandler::error('Cart item IDs are required', 400);
-        }
-    } else {
-        ResponseHandler::error('Invalid action for DELETE request', 400);
+    
+    switch ($action) {
+        case 'remove_item':
+            removeCartItem($conn, $data, $userId, $sessionId, $baseUrl);
+            break;
+        case 'clear_cart':
+            clearCart($conn, $data, $userId, $sessionId);
+            break;
+        default:
+            ResponseHandler::error('Invalid action for DELETE request', 400);
     }
 }
 
 /*********************************
- * REMOVE CART ITEM
+ * FORMAT CART ITEM DATA
  *********************************/
-function removeCartItem($conn, $userId, $cartItemId, $baseUrl) {
-    $verifyStmt = $conn->prepare(
-        "SELECT ci.id, ci.cart_id, ci.menu_item_id, ci.quick_order_id,
-                mi.name as item_name, qo.title as quick_order_title
-         FROM cart_items ci
-         LEFT JOIN menu_items mi ON ci.menu_item_id = mi.id
-         LEFT JOIN quick_orders qo ON ci.quick_order_id = qo.id
-         WHERE ci.id = :cart_item_id
-         AND ci.user_id = :user_id
-         AND ci.is_active = 1"
-    );
-    
-    $verifyStmt->execute([':cart_item_id' => $cartItemId, ':user_id' => $userId]);
-    $cartItem = $verifyStmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$cartItem) {
-        ResponseHandler::error('Cart item not found', 404);
-    }
-    
-    $itemName = $cartItem['item_name'] ?? $cartItem['quick_order_title'] ?? 'Item';
-    
-    $deleteStmt = $conn->prepare(
-        "UPDATE cart_items 
-         SET is_active = 0, updated_at = NOW()
-         WHERE id = :cart_item_id"
-    );
-    
-    $deleteStmt->execute([':cart_item_id' => $cartItemId]);
-    
-    if (!empty($cartItem['cart_id'])) {
-        $cartUpdateStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
-        $cartUpdateStmt->execute([':cart_id' => $cartItem['cart_id']]);
-    }
-    
-    // Get updated cart data
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
-    $totals = calculateCartTotals($conn, $cartItem['cart_id'] ?? null, $userId);
-    
-    ResponseHandler::success([
-        'success' => true,
-        'message' => "$itemName removed from cart",
-        'data' => [
-            'cart_item_id' => $cartItemId,
-            'item_name' => $itemName,
-            'cart_summary' => [
-                'item_count' => count($cartItems),
-                'total_quantity' => $totals['total_quantity'] ?? 0,
-                'subtotal' => $totals['subtotal'] ?? 0
-            ]
-        ]
-    ]);
-}
-
-/*********************************
- * REMOVE MULTIPLE CART ITEMS
- *********************************/
-function removeMultipleCartItems($conn, $userId, $cartItemIds, $baseUrl) {
-    if (empty($cartItemIds)) {
-        ResponseHandler::error('No items to remove', 400);
-    }
-    
-    $placeholders = implode(',', array_fill(0, count($cartItemIds), '?'));
-    
-    $verifyStmt = $conn->prepare(
-        "SELECT COUNT(*) as count
-         FROM cart_items
-         WHERE id IN ($placeholders)
-         AND user_id = ?
-         AND is_active = 1"
-    );
-    
-    $params = array_merge($cartItemIds, [$userId]);
-    $verifyStmt->execute($params);
-    $count = $verifyStmt->fetch(PDO::FETCH_ASSOC)['count'];
-    
-    if ($count != count($cartItemIds)) {
-        ResponseHandler::error('One or more items not found', 404);
-    }
-    
-    $deleteStmt = $conn->prepare(
-        "UPDATE cart_items 
-         SET is_active = 0, updated_at = NOW()
-         WHERE id IN ($placeholders)
-         AND user_id = ?"
-    );
-    
-    $deleteStmt->execute($params);
-    $removedCount = $deleteStmt->rowCount();
-    
-    // Get cart id (assuming all items belong to same cart)
-    $cartStmt = $conn->prepare(
-        "SELECT DISTINCT cart_id FROM cart_items WHERE id IN ($placeholders)"
-    );
-    $cartStmt->execute($cartItemIds);
-    $cartId = $cartStmt->fetch(PDO::FETCH_ASSOC)['cart_id'] ?? null;
-    
-    if ($cartId) {
-        $cartUpdateStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
-        $cartUpdateStmt->execute([':cart_id' => $cartId]);
-    }
-    
-    // Get updated cart data
-    $cartItems = getCartItemsByUserId($conn, $userId, $baseUrl);
-    $totals = calculateCartTotals($conn, $cartId, $userId);
-    
-    ResponseHandler::success([
-        'success' => true,
-        'message' => "$removedCount items removed from cart",
-        'data' => [
-            'removed_count' => $removedCount,
-            'cart_summary' => [
-                'item_count' => count($cartItems),
-                'total_quantity' => $totals['total_quantity'] ?? 0,
-                'subtotal' => $totals['subtotal'] ?? 0
-            ]
-        ]
-    ]);
-}
-
-/*********************************
- * DEBUG AUTH ENDPOINT
- *********************************/
-function debugAuth($conn) {
-    $headers = getallheaders();
-    
-    ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'session_id' => session_id(),
-            'session_user_id' => $_SESSION['user_id'] ?? null,
-            'session_status' => session_status(),
-            'session_name' => session_name(),
-            'all_headers' => $headers,
-            'all_cookies' => $_COOKIE,
-            'session_data' => $_SESSION
-        ]
-    ]);
-}
-
-/*********************************
- * HELPER FUNCTIONS - FORMATTING
- *********************************/
-
 function formatCartItemData($item, $baseUrl) {
     // Format images
-    $itemImage = formatImageUrl($item['item_image'] ?? $item['quick_order_image'] ?? $item['qoi_image'] ?? '', $baseUrl);
-    $merchantImage = formatImageUrl($item['merchant_image'] ?? '', $baseUrl, 'merchants');
-    $merchantLogo = formatImageUrl($item['merchant_logo'] ?? '', $baseUrl, 'merchants/logos');
+    $imageUrl = '';
+    if (!empty($item['image_url'])) {
+        if (strpos($item['image_url'], 'http') === 0) {
+            $imageUrl = $item['image_url'];
+        } else {
+            $imageUrl = rtrim($baseUrl, '/') . '/uploads/' . ltrim($item['image_url'], '/');
+        }
+    } elseif (!empty($item['menu_item_image'])) {
+        $imageUrl = rtrim($baseUrl, '/') . '/uploads/menu_items/' . ltrim($item['menu_item_image'], '/');
+    } elseif (!empty($item['quick_order_image'])) {
+        $imageUrl = rtrim($baseUrl, '/') . '/uploads/quick_orders/' . ltrim($item['quick_order_image'], '/');
+    } elseif (!empty($item['quick_order_item_image'])) {
+        $imageUrl = rtrim($baseUrl, '/') . '/uploads/quick_order_items/' . ltrim($item['quick_order_item_image'], '/');
+    }
     
-    // Determine price based on source
-    $price = floatval($item['cart_item_price'] ?? $item['price'] ?? $item['quick_order_price'] ?? $item['qoi_price'] ?? 0);
+    $merchantImage = '';
+    if (!empty($item['merchant_image'])) {
+        if (strpos($item['merchant_image'], 'http') === 0) {
+            $merchantImage = $item['merchant_image'];
+        } else {
+            $merchantImage = rtrim($baseUrl, '/') . '/uploads/merchants/' . ltrim($item['merchant_image'], '/');
+        }
+    }
     
+    $price = floatval($item['price'] ?? 0);
     $quantity = intval($item['quantity'] ?? 1);
     $total = $price * $quantity;
     
-    // Parse nutritional info
-    $nutritionalInfo = null;
-    $nutritionData = $item['item_nutritional_info'] ?? $item['quick_order_nutritional_info'] ?? null;
-    if ($nutritionData) {
-        if (is_string($nutritionData)) {
-            $nutritionalInfo = json_decode($nutritionData, true);
-        } else {
-            $nutritionalInfo = $nutritionData;
+    // Calculate add-ons total
+    $addOnsTotal = 0;
+    if (!empty($item['add_ons'])) {
+        foreach ($item['add_ons'] as $addOn) {
+            $addOnsTotal += floatval($addOn['price'] ?? 0) * intval($addOn['quantity'] ?? 1);
         }
     }
     
-    // Parse dietary tags
-    $dietaryTags = [];
-    if (!empty($item['dietary_tags'])) {
-        if (is_string($item['dietary_tags'])) {
-            $dietaryTags = json_decode($item['dietary_tags'], true);
+    // Determine item name based on source
+    $itemName = $item['name'] ?? '';
+    if (empty($itemName)) {
+        if ($item['source_type'] === 'menu_item') {
+            $itemName = $item['menu_item_name'] ?? '';
         } else {
-            $dietaryTags = $item['dietary_tags'];
-        }
-    } elseif (!empty($item['qo_dietary_tags'])) {
-        if (is_string($item['qo_dietary_tags'])) {
-            $dietaryTags = json_decode($item['qo_dietary_tags'], true);
-        } else {
-            $dietaryTags = $item['qo_dietary_tags'];
-        }
-    }
-    
-    // Parse allergens
-    $allergens = [];
-    if (!empty($item['allergens'])) {
-        if (is_string($item['allergens'])) {
-            $allergens = json_decode($item['allergens'], true);
-        } else {
-            $allergens = $item['allergens'];
-        }
-    } elseif (!empty($item['qo_allergens'])) {
-        if (is_string($item['qo_allergens'])) {
-            $allergens = json_decode($item['qo_allergens'], true);
-        } else {
-            $allergens = $item['qo_allergens'];
-        }
-    }
-    
-    // Parse merchant tags and cuisine types
-    $merchantTags = [];
-    if (!empty($item['merchant_tags'])) {
-        if (is_string($item['merchant_tags'])) {
-            $merchantTags = json_decode($item['merchant_tags'], true);
-        } else {
-            $merchantTags = $item['merchant_tags'];
-        }
-    }
-    
-    $cuisineTypes = [];
-    if (!empty($item['cuisine_type'])) {
-        if (is_string($item['cuisine_type'])) {
-            $cuisineTypes = json_decode($item['cuisine_type'], true);
-        } else {
-            $cuisineTypes = $item['cuisine_type'];
-        }
-    }
-    
-    // Parse payment methods
-    $paymentMethods = [];
-    if (!empty($item['payment_methods'])) {
-        if (is_string($item['payment_methods'])) {
-            $paymentMethods = json_decode($item['payment_methods'], true);
-        } else {
-            $paymentMethods = $item['payment_methods'];
+            $itemName = $item['quick_order_item_name'] ?? $item['quick_order_title'] ?? '';
         }
     }
     
@@ -3173,16 +1522,6 @@ function formatCartItemData($item, $baseUrl) {
             $selectedOptions = json_decode($item['selected_options'], true);
         } else {
             $selectedOptions = $item['selected_options'];
-        }
-    }
-    
-    // Parse add-ons
-    $addOns = [];
-    if (!empty($item['add_ons_json'])) {
-        if (is_string($item['add_ons_json'])) {
-            $addOns = json_decode($item['add_ons_json'], true);
-        } else {
-            $addOns = $item['add_ons_json'];
         }
     }
     
@@ -3197,161 +1536,88 @@ function formatCartItemData($item, $baseUrl) {
     }
     
     return [
-        'id' => $item['id'] ?? null,
-        'cart_id' => $item['cart_id'] ?? null,
-        'user_id' => $item['user_id'] ?? null,
-        
-        // Item identification
-        'item_id' => $item['item_id'] ?? null,
-        'quick_order_id' => $item['quick_order_id'] ?? $item['quick_order_id_ref'] ?? null,
-        'quick_order_item_id' => $item['quick_order_item_id'] ?? $item['qoi_id'] ?? null,
+        'id' => intval($item['id'] ?? 0),
+        'cart_id' => intval($item['cart_id'] ?? 0),
         'source_type' => $item['source_type'] ?? 'menu_item',
         
         // Basic info
-        'name' => $item['item_name'] ?? $item['quick_order_title'] ?? $item['qoi_name'] ?? '',
-        'description' => $item['item_description'] ?? $item['quick_order_description'] ?? $item['qoi_description'] ?? '',
+        'name' => $itemName,
+        'description' => $item['description'] ?? $item['menu_item_description'] ?? $item['quick_order_item_description'] ?? '',
         'price' => $price,
         'quantity' => $quantity,
         'total' => $total,
+        'add_ons_total' => $addOnsTotal,
+        'grand_total' => $total + $addOnsTotal,
         'formatted_price' => 'MK ' . number_format($price, 2),
-        'formatted_total' => 'MK ' . number_format($total, 2),
+        'formatted_total' => 'MK ' . number_format($total + $addOnsTotal, 2),
         
         // Images
-        'image_url' => $itemImage,
-        'gallery_images' => isset($item['gallery_images']) ? json_decode($item['gallery_images'], true) : [],
+        'image_url' => $imageUrl,
         
         // Category & Type
-        'category' => $item['item_category'] ?? $item['quick_order_category'] ?? '',
-        'item_type' => $item['item_type'] ?? $item['quick_order_item_type'] ?? 'food',
+        'category' => $item['category'] ?? $item['menu_item_category'] ?? $item['quick_order_category'] ?? '',
+        'item_type' => $item['item_type'] ?? 'food',
         
         // Unit info
-        'unit_type' => $item['unit_type'] ?? $item['qoi_measurement_type'] ?? 'piece',
-        'unit' => $item['unit'] ?? $item['qoi_unit'] ?? null,
-        'unit_value' => floatval($item['unit_value'] ?? $item['qoi_quantity'] ?? 1),
-        'custom_unit' => $item['custom_unit'] ?? $item['qoi_custom_unit'] ?? null,
-        'serving_size' => $item['serving_size'] ?? null,
-        'serving_unit' => $item['serving_unit'] ?? null,
-        
-        // Availability
-        'max_quantity' => intval($item['item_max_quantity'] ?? $item['qoi_max_quantity'] ?? 99),
-        'stock_quantity' => $item['item_stock_quantity'] ?? $item['qoi_stock_quantity'] ?? null,
-        'in_stock' => ($item['item_stock_quantity'] ?? $item['qoi_stock_quantity'] ?? 1) > 0,
+        'measurement_type' => $item['measurement_type'] ?? 'quantity',
+        'unit' => $item['unit'] ?? null,
+        'quantity_value' => $item['quantity_value'] ?? $item['item_quantity_value'] ?? null,
+        'custom_unit' => $item['custom_unit'] ?? null,
         
         // Variants
-        'has_variants' => boolval($item['item_has_variants'] ?? $item['quick_order_has_variants'] ?? $item['qoi_has_variants'] ?? false),
-        'variant_type' => $item['variant_type'] ?? $item['quick_order_variant_type'] ?? null,
+        'has_variants' => boolval($item['has_variants'] ?? false),
         'variant_id' => $item['variant_id'] ?? null,
         'variant_data' => $variantData,
         'variant_name' => $item['variant_name'] ?? '',
         'selected_options' => $selectedOptions,
-        'add_ons' => $addOns,
         
-        // Nutritional info
-        'nutritional_info' => $nutritionalInfo,
-        'calories' => $item['calories'] ?? null,
-        'allergens' => $allergens,
-        'dietary_tags' => $dietaryTags,
-        
-        // Preparation
-        'preparation_time' => $item['preparation_time'] ?? $item['quick_order_preparation_time'] ?? $item['merchant_prep_time'] ?? '15-20 min',
-        'merchant_prep_time' => $item['merchant_prep_time'] ?? null,
+        // Add-ons
+        'add_ons' => array_map(function($addOn) {
+            return [
+                'id' => intval($addOn['id'] ?? 0),
+                'addon_id' => intval($addOn['addon_id'] ?? 0),
+                'name' => $addOn['name'] ?? '',
+                'price' => floatval($addOn['price'] ?? 0),
+                'quantity' => intval($addOn['quantity'] ?? 1),
+                'category' => $addOn['category'] ?? null,
+                'total' => floatval($addOn['price'] ?? 0) * intval($addOn['quantity'] ?? 1)
+            ];
+        }, $item['add_ons'] ?? []),
         
         // Special instructions
         'special_instructions' => $item['special_instructions'] ?? '',
         
         // Merchant info
-        'merchant_id' => $item['merchant_id'] ?? 0,
+        'merchant_id' => intval($item['merchant_id'] ?? 0),
         'merchant_name' => $item['merchant_name'] ?? 'Unknown Merchant',
-        'merchant_category' => $item['merchant_category'] ?? '',
         'merchant_image' => $merchantImage,
-        'merchant_logo' => $merchantLogo,
         'merchant_rating' => floatval($item['merchant_rating'] ?? 0),
         'merchant_is_open' => boolval($item['merchant_is_open'] ?? true),
         'business_type' => $item['business_type'] ?? 'restaurant',
-        'cuisine_types' => $cuisineTypes,
+        'cuisine_types' => !empty($item['cuisine_type']) ? (is_string($item['cuisine_type']) ? json_decode($item['cuisine_type'], true) : $item['cuisine_type']) : [],
         'merchant_address' => $item['merchant_address'] ?? '',
-        'merchant_lat' => floatval($item['merchant_lat'] ?? 0),
-        'merchant_lng' => floatval($item['merchant_lng'] ?? 0),
-        'merchant_tags' => $merchantTags,
-        'payment_methods' => $paymentMethods,
+        'latitude' => floatval($item['latitude'] ?? 0),
+        'longitude' => floatval($item['longitude'] ?? 0),
         
         // Delivery info
-        'delivery_fee' => floatval($item['merchant_delivery_fee'] ?? 2500.00),
-        'formatted_delivery_fee' => 'MK ' . number_format(floatval($item['merchant_delivery_fee'] ?? 2500.00), 0),
-        'min_order' => floatval($item['merchant_min_order'] ?? 5000.00),
+        'delivery_fee' => floatval($item['merchant_delivery_fee'] ?? $item['delivery_fee'] ?? 0),
+        'min_order' => floatval($item['merchant_min_order'] ?? $item['min_order_amount'] ?? 0),
         'free_delivery_threshold' => floatval($item['free_delivery_threshold'] ?? 0),
-        'delivery_time' => $item['merchant_delivery_time'] ?? '30-45 min',
+        'delivery_time' => $item['delivery_time'] ?? '30-45 min',
+        'preparation_time' => $item['preparation_time'] ?? $item['merchant_preparation_time'] ?? '15-20 min',
         
         // Quick order specific
-        'priority' => intval($item['priority'] ?? 0),
+        'quick_order_id' => $item['quick_order_id'] ? intval($item['quick_order_id']) : null,
+        'quick_order_item_id' => $item['quick_order_item_id'] ? intval($item['quick_order_item_id']) : null,
         'custom_price' => isset($item['custom_price']) ? floatval($item['custom_price']) : null,
-        'custom_delivery_time' => $item['custom_delivery_time'] ?? null,
-        
-        // Badges and extras
-        'badge' => $item['qoi_badge'] ?? $item['badge'] ?? null,
-        'price_per_unit' => isset($item['qoi_price_per_unit']) ? floatval($item['qoi_price_per_unit']) : null,
         
         // Flags
-        'is_dropx' => boolval($item['is_dropx'] ?? false),
-        'is_popular' => boolval($item['is_popular'] ?? false),
-        'is_available' => boolval($item['is_available'] ?? true),
-        'quick_order_merchant_active' => boolval($item['quick_order_merchant_active'] ?? true),
+        'is_saved_for_later' => boolval($item['is_saved_for_later'] ?? false),
+        'is_active' => boolval($item['is_active'] ?? true),
         
         // Timestamps
         'created_at' => $item['created_at'] ?? '',
         'updated_at' => $item['updated_at'] ?? ''
     ];
-}
-
-function formatAddressData($address) {
-    return [
-        'id' => $address['id'] ?? null,
-        'label' => $address['label'] ?? '',
-        'full_name' => $address['full_name'] ?? '',
-        'phone' => $address['phone'] ?? '',
-        'address_line1' => $address['address_line1'] ?? '',
-        'address_line2' => $address['address_line2'] ?? '',
-        'city' => $address['city'] ?? '',
-        'state' => $address['state'] ?? '',
-        'postal_code' => $address['postal_code'] ?? '',
-        'neighborhood' => $address['neighborhood'] ?? '',
-        'landmark' => $address['landmark'] ?? '',
-        'latitude' => floatval($address['latitude'] ?? 0),
-        'longitude' => floatval($address['longitude'] ?? 0),
-        'delivery_instructions' => $address['delivery_instructions'] ?? '',
-        'is_default' => boolval($address['is_default'] ?? false),
-        'formatted_address' => trim(($address['address_line1'] ?? '') . ' ' . ($address['address_line2'] ?? '') . ', ' . ($address['city'] ?? ''))
-    ];
-}
-
-function formatImageUrl($imagePath, $baseUrl, $type = 'menu_items') {
-    if (empty($imagePath)) {
-        return $baseUrl . '/uploads/default.jpg';
-    }
-    
-    if (strpos($imagePath, 'http') === 0) {
-        return $imagePath;
-    }
-    
-    return rtrim($baseUrl, '/') . '/uploads/' . $type . '/' . ltrim($imagePath, '/');
-}
-
-function calculateDistance($lat1, $lon1, $lat2, $lon2) {
-    if (empty($lat1) || empty($lon1) || empty($lat2) || empty($lon2)) {
-        return 5.0; // Default distance in km
-    }
-    
-    $earthRadius = 6371; // km
-    
-    $dLat = deg2rad($lat2 - $lat1);
-    $dLon = deg2rad($lon2 - $lon1);
-    
-    $a = sin($dLat/2) * sin($dLat/2) +
-         cos(deg2rad($lat1)) * cos(deg2rad($lat2)) *
-         sin($dLon/2) * sin($dLon/2);
-    
-    $c = 2 * atan2(sqrt($a), sqrt(1-$a));
-    
-    return round($earthRadius * $c, 1);
 }
 ?>
