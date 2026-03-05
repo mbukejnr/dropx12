@@ -309,7 +309,7 @@ function handlePutRequest($userId) {
 }
 
 /*********************************
- * GET ORDERS HANDLER
+ * GET ORDERS HANDLER (Enhanced with Add-ons)
  *********************************/
 function handleGetOrders($conn, $input, $userId) {
     try {
@@ -387,7 +387,23 @@ function handleGetOrders($conn, $input, $userId) {
                         WHERE order_id = o.id 
                         ORDER BY created_at DESC 
                         LIMIT 1
-                    ) as current_status
+                    ) as current_status,
+                    (
+                        SELECT GROUP_CONCAT(
+                            CONCAT(
+                                oi.id, '||', 
+                                oi.item_name, '||', 
+                                oi.quantity, '||', 
+                                oi.price, '||',
+                                oi.total, '||',
+                                COALESCE(oi.variant_id, 0), '||',
+                                COALESCE(oi.add_ons_json, '')
+                            )
+                            ORDER BY oi.id SEPARATOR ';;'
+                        )
+                        FROM order_items oi 
+                        WHERE oi.order_id = o.id
+                    ) as items_preview
                 FROM orders o
                 LEFT JOIN merchants m ON o.merchant_id = m.id
                 $whereClause
@@ -414,6 +430,38 @@ function handleGetOrders($conn, $input, $userId) {
 
         $formattedOrders = [];
         foreach ($orders as $order) {
+            // Parse items preview to show add-ons count
+            $itemsPreview = [];
+            $addOnsCount = 0;
+            
+            if (!empty($order['items_preview'])) {
+                $itemStrings = explode(';;', $order['items_preview']);
+                foreach ($itemStrings as $index => $itemString) {
+                    if ($index >= 3) break; // Limit preview to 3 items
+                    
+                    $parts = explode('||', $itemString);
+                    if (count($parts) >= 5) {
+                        $previewItem = [
+                            'name' => $parts[1],
+                            'quantity' => (int)$parts[2],
+                            'price' => (float)$parts[3]
+                        ];
+                        
+                        // Check for add-ons
+                        if (isset($parts[6]) && !empty($parts[6])) {
+                            $addOns = json_decode($parts[6], true);
+                            if (!empty($addOns)) {
+                                $addOnsCount += count($addOns);
+                                $previewItem['has_addons'] = true;
+                                $previewItem['addons_count'] = count($addOns);
+                            }
+                        }
+                        
+                        $itemsPreview[] = $previewItem;
+                    }
+                }
+            }
+
             $formattedOrders[] = [
                 'id' => (int)$order['id'],
                 'order_number' => $order['order_number'],
@@ -429,6 +477,9 @@ function handleGetOrders($conn, $input, $userId) {
                 'discount_amount' => (float)($order['discount_amount'] ?? 0),
                 'item_count' => (int)$order['item_count'],
                 'total_items' => (int)$order['total_items'],
+                'addons_count' => $addOnsCount,
+                'has_addons' => $addOnsCount > 0,
+                'items_preview' => $itemsPreview,
                 'created_at' => $order['created_at'],
                 'payment_method' => $order['payment_method'] ?? 'cash',
                 'payment_status' => $order['payment_status'] ?? 'pending',
@@ -461,7 +512,7 @@ function handleGetOrders($conn, $input, $userId) {
 }
 
 /*********************************
- * CREATE ORDER FROM CART
+ * CREATE ORDER FROM CART (Enhanced Add-ons)
  *********************************/
 function createOrderFromCart($conn, $data, $userId) {
     try {
@@ -481,7 +532,7 @@ function createOrderFromCart($conn, $data, $userId) {
             ResponseHandler::error('Delivery address is required', 400);
         }
 
-        // Get cart items
+        // Get cart items with complete add-ons information
         $cartStmt = $conn->prepare(
             "SELECT 
                 ci.*,
@@ -493,7 +544,8 @@ function createOrderFromCart($conn, $data, $userId) {
                 m.is_active,
                 m.preparation_time as merchant_prep_time,
                 qo.title as quick_order_title,
-                qo.id as quick_order_id
+                qo.id as quick_order_id,
+                qo.image_url as quick_order_image
              FROM cart_items ci
              LEFT JOIN merchants m ON ci.merchant_id = m.id
              LEFT JOIN quick_orders qo ON ci.quick_order_id = qo.id
@@ -527,24 +579,77 @@ function createOrderFromCart($conn, $data, $userId) {
             ResponseHandler::error("$merchantName is currently not available", 400);
         }
 
-        // Calculate totals
+        // Calculate totals with enhanced add-ons tracking
         $subtotal = 0;
         $deliveryFee = floatval($cartItems[0]['delivery_fee'] ?? 0);
+        $itemsWithAddOns = [];
         
         foreach ($cartItems as $item) {
             $price = floatval($item['price'] ?? 0);
             $quantity = intval($item['quantity'] ?? 1);
             
-            // Add add-ons total
-            $addOnsTotal = 0;
+            // Get detailed add-ons for this item
             $addOnsStmt = $conn->prepare(
-                "SELECT SUM(price * quantity) as total FROM cart_addons WHERE cart_item_id = :item_id"
+                "SELECT ca.*, qoa.category, qoa.is_per_item, qoa.max_quantity
+                 FROM cart_addons ca
+                 LEFT JOIN quick_order_addons qoa ON ca.addon_id = qoa.id
+                 WHERE ca.cart_item_id = :item_id"
             );
             $addOnsStmt->execute([':item_id' => $item['id']]);
-            $addOnsResult = $addOnsStmt->fetch(PDO::FETCH_ASSOC);
-            $addOnsTotal = floatval($addOnsResult['total'] ?? 0);
+            $addOns = $addOnsStmt->fetchAll(PDO::FETCH_ASSOC);
             
-            $subtotal += ($price * $quantity) + $addOnsTotal;
+            // Calculate add-ons total and prepare detailed add-ons data
+            $addOnsTotal = 0;
+            $addOnsData = [];
+            foreach ($addOns as $addOn) {
+                $addOnPrice = floatval($addOn['price'] ?? 0);
+                $addOnQty = intval($addOn['quantity'] ?? 1);
+                $addOnTotal = $addOnPrice * $addOnQty;
+                $addOnsTotal += $addOnTotal;
+                
+                $addOnsData[] = [
+                    'id' => $addOn['addon_id'],
+                    'name' => $addOn['name'],
+                    'price' => $addOnPrice,
+                    'quantity' => $addOnQty,
+                    'total' => $addOnTotal,
+                    'category' => $addOn['category'] ?? 'addons',
+                    'is_per_item' => (bool)($addOn['is_per_item'] ?? true),
+                    'max_quantity' => (int)($addOn['max_quantity'] ?? 1)
+                ];
+            }
+            
+            $itemTotal = ($price * $quantity) + $addOnsTotal;
+            $subtotal += $itemTotal;
+            
+            // Parse variant data if exists
+            $variantData = null;
+            if (!empty($item['variant_data'])) {
+                if (is_string($item['variant_data'])) {
+                    $variantData = json_decode($item['variant_data'], true);
+                } else {
+                    $variantData = $item['variant_data'];
+                }
+            }
+            
+            // Parse selected options
+            $selectedOptions = null;
+            if (!empty($item['selected_options'])) {
+                if (is_string($item['selected_options'])) {
+                    $selectedOptions = json_decode($item['selected_options'], true);
+                } else {
+                    $selectedOptions = $item['selected_options'];
+                }
+            }
+            
+            $itemsWithAddOns[] = [
+                'cart_item' => $item,
+                'add_ons' => $addOnsData,
+                'add_ons_total' => $addOnsTotal,
+                'item_total' => $itemTotal,
+                'variant_data' => $variantData,
+                'selected_options' => $selectedOptions
+            ];
         }
 
         // Check minimum order
@@ -600,82 +705,43 @@ function createOrderFromCart($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items
+        // Create order items with enhanced add-ons
         $itemSql = "INSERT INTO order_items (
             order_id, quick_order_id, quick_order_item_id,
             item_name, description, quantity, price, total,
             variant_id, variant_data, selected_options,
-            add_ons_json, special_instructions, created_at
+            add_ons_json, special_instructions, image_url, created_at
         ) VALUES (
             :order_id, :quick_order_id, :quick_order_item_id,
             :item_name, :description, :quantity, :price, :total,
             :variant_id, :variant_data, :selected_options,
-            :add_ons_json, :special_instructions, NOW()
+            :add_ons_json, :special_instructions, :image_url, NOW()
         )";
 
         $itemStmt = $conn->prepare($itemSql);
 
-        foreach ($cartItems as $item) {
-            // Get add-ons for this item
-            $addOnsStmt = $conn->prepare(
-                "SELECT * FROM cart_addons WHERE cart_item_id = :item_id"
-            );
-            $addOnsStmt->execute([':item_id' => $item['id']]);
-            $addOns = $addOnsStmt->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($itemsWithAddOns as $itemData) {
+            $item = $itemData['cart_item'];
+            $addOnsData = $itemData['add_ons'];
             
-            $price = floatval($item['price'] ?? 0);
-            $quantity = intval($item['quantity'] ?? 1);
+            // Get image URL
+            $imageUrl = $item['image_url'] ?? $item['quick_order_image'] ?? null;
             
-            // Calculate add-ons total and format for storage
-            $addOnsData = [];
-            foreach ($addOns as $addOn) {
-                $addOnsData[] = [
-                    'id' => $addOn['addon_id'],
-                    'name' => $addOn['name'],
-                    'price' => floatval($addOn['price']),
-                    'quantity' => intval($addOn['quantity'])
-                ];
-            }
-            
-            $itemTotal = $price * $quantity;
-            foreach ($addOnsData as $addOn) {
-                $itemTotal += $addOn['price'] * $addOn['quantity'];
-            }
-            
-            // Parse variant data if exists
-            $variantData = null;
-            if (!empty($item['variant_data'])) {
-                if (is_string($item['variant_data'])) {
-                    $variantData = json_decode($item['variant_data'], true);
-                } else {
-                    $variantData = $item['variant_data'];
-                }
-            }
-            
-            // Parse selected options
-            $selectedOptions = null;
-            if (!empty($item['selected_options'])) {
-                if (is_string($item['selected_options'])) {
-                    $selectedOptions = json_decode($item['selected_options'], true);
-                } else {
-                    $selectedOptions = $item['selected_options'];
-                }
-            }
-
             $itemStmt->execute([
                 ':order_id' => $orderId,
                 ':quick_order_id' => $item['quick_order_id'] ?? null,
                 ':quick_order_item_id' => $item['quick_order_item_id'] ?? null,
                 ':item_name' => $item['name'] ?? $item['quick_order_title'] ?? 'Item',
                 ':description' => $item['description'] ?? '',
-                ':quantity' => $quantity,
-                ':price' => $price,
-                ':total' => $itemTotal,
+                ':quantity' => intval($item['quantity'] ?? 1),
+                ':price' => floatval($item['price'] ?? 0),
+                ':total' => $itemData['item_total'],
                 ':variant_id' => $item['variant_id'] ?? null,
-                ':variant_data' => $variantData ? json_encode($variantData) : null,
-                ':selected_options' => $selectedOptions ? json_encode($selectedOptions) : null,
+                ':variant_data' => $itemData['variant_data'] ? json_encode($itemData['variant_data']) : null,
+                ':selected_options' => $itemData['selected_options'] ? json_encode($itemData['selected_options']) : null,
                 ':add_ons_json' => !empty($addOnsData) ? json_encode($addOnsData) : null,
-                ':special_instructions' => $item['special_instructions'] ?? ''
+                ':special_instructions' => $item['special_instructions'] ?? '',
+                ':image_url' => formatImageUrl($imageUrl, 'menu_items')
             ]);
         }
 
@@ -734,13 +800,8 @@ function createOrderFromCart($conn, $data, $userId) {
 
         $conn->commit();
 
-        ob_clean();
-        ResponseHandler::success([
-            'order_id' => (int)$orderId,
-            'order_number' => $orderNumber,
-            'message' => 'Order placed successfully',
-            'total_amount' => $totalAmount
-        ], 'Order created successfully', 201);
+        // Get created order details to return
+        getOrderDetails($conn, $orderId, $userId);
 
     } catch (Exception $e) {
         if ($conn->inTransaction()) {
@@ -752,7 +813,7 @@ function createOrderFromCart($conn, $data, $userId) {
 }
 
 /*********************************
- * CREATE QUICK ORDER FROM ITEMS
+ * CREATE QUICK ORDER FROM ITEMS (Enhanced Add-ons)
  *********************************/
 function createQuickOrderFromItems($conn, $data, $userId) {
     try {
@@ -776,7 +837,7 @@ function createQuickOrderFromItems($conn, $data, $userId) {
         // Check merchant
         $merchantStmt = $conn->prepare(
             "SELECT id, name, delivery_fee, min_order_amount, is_open, is_active, 
-                    preparation_time_minutes
+                    preparation_time_minutes, image_url
              FROM merchants WHERE id = :id"
         );
         $merchantStmt->execute([':id' => $merchantId]);
@@ -792,25 +853,28 @@ function createQuickOrderFromItems($conn, $data, $userId) {
             ResponseHandler::error("{$merchant['name']} is currently closed", 400);
         }
 
-        // Calculate subtotal and validate items
+        // Calculate subtotal and validate items with enhanced add-ons
         $subtotal = 0;
         $validatedItems = [];
+        $allAddOns = [];
 
         foreach ($items as $item) {
             $quickOrderItemId = $item['quick_order_item_id'] ?? null;
             $quantity = intval($item['quantity'] ?? 1);
             $variantId = $item['variant_id'] ?? null;
             $selectedAddOns = $item['selected_add_ons'] ?? [];
+            $itemSpecialInstructions = $item['special_instructions'] ?? '';
 
             if (!$quickOrderItemId) {
                 ob_clean();
                 ResponseHandler::error('Quick order item ID is required for all items', 400);
             }
 
-            // Get item details
+            // Get item details with add-ons
             $itemStmt = $conn->prepare(
                 "SELECT qoi.*, qo.title as quick_order_title, qo.id as quick_order_id,
-                        qo.has_variants
+                        qo.has_variants, qo.image_url as quick_order_image,
+                        qo.description as quick_order_description
                  FROM quick_order_items qoi
                  JOIN quick_orders qo ON qoi.quick_order_id = qo.id
                  WHERE qoi.id = :id AND qoi.is_available = 1"
@@ -827,51 +891,93 @@ function createQuickOrderFromItems($conn, $data, $userId) {
             $itemTotal = $price * $quantity;
 
             // Handle variant pricing
+            $selectedVariant = null;
             if ($variantId && !empty($dbItem['variants_json'])) {
                 $variants = json_decode($dbItem['variants_json'], true) ?? [];
                 foreach ($variants as $variant) {
                     if (($variant['id'] ?? null) == $variantId) {
                         $price = floatval($variant['price'] ?? $price);
                         $itemTotal = $price * $quantity;
+                        $selectedVariant = $variant;
                         break;
                     }
                 }
             }
 
-            // Calculate add-ons total
+            // Get available add-ons for this quick order
+            $addOnsListStmt = $conn->prepare(
+                "SELECT * FROM quick_order_addons 
+                 WHERE quick_order_id = :quick_order_id 
+                 AND is_available = 1
+                 ORDER BY category, price"
+            );
+            $addOnsListStmt->execute([':quick_order_id' => $dbItem['quick_order_id']]);
+            $availableAddOns = $addOnsListStmt->fetchAll(PDO::FETCH_ASSOC);
+            
+            // Create lookup for available add-ons
+            $availableAddOnsMap = [];
+            foreach ($availableAddOns as $addOn) {
+                $availableAddOnsMap[$addOn['id']] = $addOn;
+            }
+
+            // Calculate add-ons total and validate
             $addOnsTotal = 0;
             $addOnsData = [];
             if (!empty($selectedAddOns)) {
-                $addOnIds = array_column($selectedAddOns, 'id');
-                if (!empty($addOnIds)) {
-                    $placeholders = implode(',', array_fill(0, count($addOnIds), '?'));
-                    $addOnStmt = $conn->prepare(
-                        "SELECT * FROM quick_order_addons 
-                         WHERE id IN ($placeholders) AND quick_order_id = ? AND is_available = 1"
-                    );
+                foreach ($selectedAddOns as $selected) {
+                    $addOnId = $selected['id'] ?? null;
+                    $addOnQty = intval($selected['quantity'] ?? 1);
                     
-                    $params = array_merge($addOnIds, [$dbItem['quick_order_id']]);
-                    $addOnStmt->execute($params);
-                    $availableAddOns = $addOnStmt->fetchAll(PDO::FETCH_ASSOC);
+                    if (!$addOnId || !isset($availableAddOnsMap[$addOnId])) {
+                        continue; // Skip invalid add-ons
+                    }
                     
-                    foreach ($availableAddOns as $addOn) {
-                        $addOnQty = 1;
-                        foreach ($selectedAddOns as $selected) {
-                            if ($selected['id'] == $addOn['id']) {
-                                $addOnQty = intval($selected['quantity'] ?? 1);
-                                break;
-                            }
+                    $addOn = $availableAddOnsMap[$addOnId];
+                    
+                    // Check max quantity
+                    if ($addOnQty > ($addOn['max_quantity'] ?? 1)) {
+                        ob_clean();
+                        ResponseHandler::error("Maximum quantity for {$addOn['name']} is {$addOn['max_quantity']}", 400);
+                    }
+                    
+                    $addOnPrice = floatval($addOn['price']);
+                    
+                    // If add-on is per item, multiply by item quantity
+                    $finalQty = ($addOn['is_per_item'] ?? true) ? $addOnQty * $quantity : $addOnQty;
+                    $addOnTotal = $addOnPrice * $finalQty;
+                    $addOnsTotal += $addOnTotal;
+                    
+                    $addOnsData[] = [
+                        'id' => $addOn['id'],
+                        'name' => $addOn['name'],
+                        'price' => $addOnPrice,
+                        'quantity' => $finalQty,
+                        'original_quantity' => $addOnQty,
+                        'per_item_quantity' => $addOnQty,
+                        'total' => $addOnTotal,
+                        'category' => $addOn['category'] ?? 'addons',
+                        'is_per_item' => (bool)($addOn['is_per_item'] ?? true),
+                        'max_quantity' => (int)($addOn['max_quantity'] ?? 1),
+                        'is_required' => (bool)($addOn['is_required'] ?? false)
+                    ];
+                    
+                    $allAddOns[] = $addOnsData;
+                }
+            }
+
+            // Check required add-ons
+            foreach ($availableAddOns as $addOn) {
+                if (($addOn['is_required'] ?? false)) {
+                    $found = false;
+                    foreach ($addOnsData as $selectedAddOn) {
+                        if ($selectedAddOn['id'] == $addOn['id']) {
+                            $found = true;
+                            break;
                         }
-                        $addOnTotal = floatval($addOn['price']) * $addOnQty * $quantity;
-                        $addOnsTotal += $addOnTotal;
-                        
-                        $addOnsData[] = [
-                            'id' => $addOn['id'],
-                            'name' => $addOn['name'],
-                            'price' => floatval($addOn['price']),
-                            'quantity' => $addOnQty * $quantity,
-                            'category' => $addOn['category']
-                        ];
+                    }
+                    if (!$found) {
+                        ob_clean();
+                        ResponseHandler::error("{$addOn['name']} is required for {$dbItem['name']}", 400);
                     }
                 }
             }
@@ -882,6 +988,8 @@ function createQuickOrderFromItems($conn, $data, $userId) {
                 'quick_order_id' => $dbItem['quick_order_id'],
                 'quick_order_item_id' => $quickOrderItemId,
                 'quick_order_title' => $dbItem['quick_order_title'],
+                'quick_order_image' => $dbItem['quick_order_image'],
+                'quick_order_description' => $dbItem['quick_order_description'],
                 'item_name' => $dbItem['name'],
                 'description' => $dbItem['description'],
                 'price' => $price,
@@ -890,8 +998,10 @@ function createQuickOrderFromItems($conn, $data, $userId) {
                 'add_ons_total' => $addOnsTotal,
                 'add_ons_data' => $addOnsData,
                 'variant_id' => $variantId,
-                'variant_data' => $variantId ? $variant : null,
-                'has_variants' => $dbItem['has_variants']
+                'variant_data' => $selectedVariant,
+                'has_variants' => $dbItem['has_variants'],
+                'special_instructions' => $itemSpecialInstructions,
+                'image_url' => $dbItem['image_url'] ?? null
             ];
         }
 
@@ -940,32 +1050,39 @@ function createQuickOrderFromItems($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items
+        // Create order items with enhanced add-ons
         $itemSql = "INSERT INTO order_items (
             order_id, quick_order_id, quick_order_item_id,
             item_name, description, quantity, price, total,
-            variant_id, variant_data, add_ons_json, created_at
+            variant_id, variant_data, add_ons_json, 
+            special_instructions, image_url, created_at
         ) VALUES (
             :order_id, :quick_order_id, :quick_order_item_id,
             :item_name, :description, :quantity, :price, :total,
-            :variant_id, :variant_data, :add_ons_json, NOW()
+            :variant_id, :variant_data, :add_ons_json,
+            :special_instructions, :image_url, NOW()
         )";
 
         $itemStmt = $conn->prepare($itemSql);
 
         foreach ($validatedItems as $item) {
+            // Use item-specific image or fallback to quick order image
+            $imageUrl = $item['image_url'] ?? $item['quick_order_image'] ?? null;
+            
             $itemStmt->execute([
                 ':order_id' => $orderId,
                 ':quick_order_id' => $item['quick_order_id'],
                 ':quick_order_item_id' => $item['quick_order_item_id'],
                 ':item_name' => $item['item_name'],
-                ':description' => $item['description'],
+                ':description' => $item['description'] ?? '',
                 ':quantity' => $item['quantity'],
                 ':price' => $item['price'],
                 ':total' => $item['item_total'] + $item['add_ons_total'],
                 ':variant_id' => $item['variant_id'] ?? null,
                 ':variant_data' => $item['variant_data'] ? json_encode($item['variant_data']) : null,
-                ':add_ons_json' => !empty($item['add_ons_data']) ? json_encode($item['add_ons_data']) : null
+                ':add_ons_json' => !empty($item['add_ons_data']) ? json_encode($item['add_ons_data']) : null,
+                ':special_instructions' => $item['special_instructions'] ?? '',
+                ':image_url' => formatImageUrl($imageUrl, 'quick_orders')
             ]);
         }
 
@@ -1004,13 +1121,8 @@ function createQuickOrderFromItems($conn, $data, $userId) {
 
         $conn->commit();
 
-        ob_clean();
-        ResponseHandler::success([
-            'order_id' => (int)$orderId,
-            'order_number' => $orderNumber,
-            'message' => 'Order placed successfully',
-            'total_amount' => $totalAmount
-        ], 'Order created successfully', 201);
+        // Get created order details to return
+        getOrderDetails($conn, $orderId, $userId);
 
     } catch (Exception $e) {
         if ($conn->inTransaction()) {
@@ -1066,7 +1178,7 @@ function createOrder($conn, $data, $userId) {
 
         $merchantStmt = $conn->prepare(
             "SELECT id, name, delivery_fee, is_open, minimum_order, 
-                    preparation_time_minutes, address
+                    preparation_time_minutes, address, image_url
              FROM merchants 
              WHERE id = ? AND is_active = 1"
         );
@@ -1087,6 +1199,7 @@ function createOrder($conn, $data, $userId) {
         }
 
         $subtotal = 0;
+        $itemsWithDetails = [];
         foreach ($items as $item) {
             if (!isset($item['name']) || !isset($item['quantity']) || !isset($item['price'])) {
                 ob_clean();
@@ -1100,7 +1213,39 @@ function createOrder($conn, $data, $userId) {
                 return;
             }
             
-            $subtotal += $item['price'] * $item['quantity'];
+            // Handle add-ons if present
+            $addOnsTotal = 0;
+            $addOnsData = [];
+            if (!empty($item['add_ons'])) {
+                foreach ($item['add_ons'] as $addOn) {
+                    $addOnPrice = floatval($addOn['price'] ?? 0);
+                    $addOnQty = intval($addOn['quantity'] ?? 1);
+                    $addOnTotal = $addOnPrice * $addOnQty;
+                    $addOnsTotal += $addOnTotal;
+                    
+                    $addOnsData[] = [
+                        'id' => $addOn['id'] ?? null,
+                        'name' => $addOn['name'] ?? 'Add-on',
+                        'price' => $addOnPrice,
+                        'quantity' => $addOnQty,
+                        'total' => $addOnTotal
+                    ];
+                }
+            }
+            
+            $itemTotal = ($item['price'] * $item['quantity']) + $addOnsTotal;
+            $subtotal += $itemTotal;
+            
+            $itemsWithDetails[] = [
+                'name' => $item['name'],
+                'quantity' => $item['quantity'],
+                'price' => $item['price'],
+                'item_total' => $itemTotal,
+                'add_ons' => $addOnsData,
+                'add_ons_total' => $addOnsTotal,
+                'special_instructions' => $item['special_instructions'] ?? '',
+                'image_url' => $item['image_url'] ?? null
+            ];
         }
 
         if ($subtotal < $merchant['minimum_order']) {
@@ -1151,20 +1296,24 @@ function createOrder($conn, $data, $userId) {
         $orderId = $conn->lastInsertId();
 
         $itemSql = "INSERT INTO order_items (
-            order_id, item_name, quantity, price, total, created_at
+            order_id, item_name, quantity, price, total,
+            add_ons_json, special_instructions, image_url, created_at
         ) VALUES (
-            :order_id, :item_name, :quantity, :price, :total, NOW()
+            :order_id, :item_name, :quantity, :price, :total,
+            :add_ons_json, :special_instructions, :image_url, NOW()
         )";
 
         $itemStmt = $conn->prepare($itemSql);
-        foreach ($items as $item) {
-            $itemTotal = $item['price'] * $item['quantity'];
+        foreach ($itemsWithDetails as $item) {
             $itemStmt->execute([
                 ':order_id' => $orderId,
                 ':item_name' => $item['name'],
                 ':quantity' => $item['quantity'],
                 ':price' => $item['price'],
-                ':total' => $itemTotal
+                ':total' => $item['item_total'],
+                ':add_ons_json' => !empty($item['add_ons']) ? json_encode($item['add_ons']) : null,
+                ':special_instructions' => $item['special_instructions'],
+                ':image_url' => formatImageUrl($item['image_url'] ?? null, 'menu_items')
             ]);
         }
 
@@ -1201,12 +1350,8 @@ function createOrder($conn, $data, $userId) {
 
         $conn->commit();
 
-        ob_clean();
-        ResponseHandler::success([
-            'order_id' => (int)$orderId,
-            'order_number' => $orderNumber,
-            'message' => 'Order created successfully'
-        ], 'Order created successfully', 201);
+        // Get created order details to return
+        getOrderDetails($conn, $orderId, $userId);
 
     } catch (Exception $e) {
         if ($conn->inTransaction()) {
@@ -1313,7 +1458,7 @@ function cancelOrder($conn, $data, $userId) {
 }
 
 /*********************************
- * REORDER
+ * REORDER (Enhanced with Add-ons)
  *********************************/
 function reorder($conn, $data, $userId) {
     try {
@@ -1325,7 +1470,7 @@ function reorder($conn, $data, $userId) {
             return;
         }
 
-        // Get original order details with items
+        // Get original order details with items and add-ons
         $orderSql = "SELECT 
                         o.merchant_id,
                         o.delivery_address,
@@ -1338,7 +1483,9 @@ function reorder($conn, $data, $userId) {
                         oi.price,
                         oi.variant_id,
                         oi.variant_data,
-                        oi.add_ons_json
+                        oi.add_ons_json,
+                        oi.special_instructions as item_instructions,
+                        oi.image_url
                     FROM orders o
                     JOIN order_items oi ON o.id = oi.order_id
                     WHERE o.id = :order_id AND o.user_id = :user_id";
@@ -1359,7 +1506,7 @@ function reorder($conn, $data, $userId) {
 
         // Check if merchant is still active
         $merchantStmt = $conn->prepare(
-            "SELECT id, is_open, is_active FROM merchants WHERE id = ?"
+            "SELECT id, is_open, is_active, name FROM merchants WHERE id = ?"
         );
         $merchantStmt->execute([$items[0]['merchant_id']]);
         $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
@@ -1372,17 +1519,18 @@ function reorder($conn, $data, $userId) {
 
         if (!$merchant['is_open']) {
             ob_clean();
-            ResponseHandler::error('Merchant is currently closed', 400);
+            ResponseHandler::error("{$merchant['name']} is currently closed", 400);
             return;
         }
 
-        // Prepare reorder data
+        // Prepare reorder data with add-ons
         $reorderItems = [];
         foreach ($items as $item) {
             $reorderItem = [
                 'quick_order_item_id' => $item['quick_order_item_id'],
                 'quantity' => (int)$item['quantity'],
-                'price' => (float)$item['price']
+                'price' => (float)$item['price'],
+                'special_instructions' => $item['item_instructions'] ?? ''
             ];
             
             if ($item['quick_order_id']) {
@@ -1396,8 +1544,16 @@ function reorder($conn, $data, $userId) {
                 }
             }
             
+            // Include add-ons from original order
             if ($item['add_ons_json']) {
-                $reorderItem['selected_add_ons'] = json_decode($item['add_ons_json'], true);
+                $addOns = json_decode($item['add_ons_json'], true);
+                // Convert to format expected by createQuickOrderFromItems
+                $reorderItem['selected_add_ons'] = array_map(function($addOn) {
+                    return [
+                        'id' => $addOn['id'],
+                        'quantity' => $addOn['original_quantity'] ?? $addOn['quantity'] ?? 1
+                    ];
+                }, $addOns);
             }
             
             $reorderItems[] = $reorderItem;
@@ -1542,7 +1698,7 @@ function rateOrder($conn, $data, $userId) {
 }
 
 /*********************************
- * TRACK ORDER
+ * TRACK ORDER (Enhanced with Add-ons)
  *********************************/
 function trackOrder($conn, $orderId, $userId) {
     try {
@@ -1555,9 +1711,12 @@ function trackOrder($conn, $orderId, $userId) {
                 o.created_at,
                 o.updated_at,
                 o.merchant_id,
+                o.total_amount,
+                o.delivery_address,
                 m.name as merchant_name,
                 m.phone as merchant_phone,
-                m.address as merchant_address
+                m.address as merchant_address,
+                m.image_url as merchant_image
              FROM orders o
              LEFT JOIN merchants m ON o.merchant_id = m.id
              WHERE o.id = :order_id AND o.user_id = :user_id"
@@ -1605,19 +1764,64 @@ function trackOrder($conn, $orderId, $userId) {
         $historyStmt->execute([':order_id' => $orderId]);
         $history = $historyStmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Get items
+        // Get items with add-ons
         $itemsStmt = $conn->prepare(
             "SELECT 
+                id,
                 item_name,
+                description,
                 quantity,
                 price,
-                total
+                total,
+                add_ons_json,
+                variant_data,
+                image_url,
+                special_instructions
              FROM order_items
-             WHERE order_id = :order_id"
+             WHERE order_id = :order_id
+             ORDER BY id ASC"
         );
         
         $itemsStmt->execute([':order_id' => $orderId]);
         $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Format items with add-ons
+        $formattedItems = [];
+        $totalAddOnsCount = 0;
+        
+        foreach ($items as $item) {
+            $addOns = null;
+            $addOnsTotal = 0;
+            
+            if (!empty($item['add_ons_json'])) {
+                $addOns = json_decode($item['add_ons_json'], true);
+                foreach ($addOns as $addOn) {
+                    $addOnsTotal += ($addOn['price'] * $addOn['quantity']);
+                }
+                $totalAddOnsCount += count($addOns);
+            }
+            
+            $variantData = null;
+            if (!empty($item['variant_data'])) {
+                $variantData = json_decode($item['variant_data'], true);
+            }
+            
+            $formattedItems[] = [
+                'id' => (int)$item['id'],
+                'name' => $item['item_name'],
+                'description' => $item['description'] ?? '',
+                'quantity' => (int)$item['quantity'],
+                'price' => (float)$item['price'],
+                'total' => (float)$item['total'],
+                'add_ons' => $addOns,
+                'add_ons_total' => $addOnsTotal,
+                'has_addons' => !empty($addOns),
+                'addons_count' => $addOns ? count($addOns) : 0,
+                'variant' => $variantData,
+                'image_url' => $item['image_url'] ?? '',
+                'special_instructions' => $item['special_instructions'] ?? ''
+            ];
+        }
 
         // Estimate delivery time based on status
         $estimatedDelivery = null;
@@ -1656,14 +1860,21 @@ function trackOrder($conn, $orderId, $userId) {
                 'status_progress' => $progress,
                 'created_at' => $order['created_at'],
                 'estimated_delivery' => $estimatedDelivery,
-                'merchant_name' => $order['merchant_name'],
-                'merchant_phone' => $order['merchant_phone'],
-                'merchant_address' => $order['merchant_address']
+                'total_amount' => (float)$order['total_amount'],
+                'delivery_address' => $order['delivery_address'],
+                'merchant' => [
+                    'name' => $order['merchant_name'],
+                    'phone' => $order['merchant_phone'],
+                    'address' => $order['merchant_address'],
+                    'image' => formatImageUrl($order['merchant_image'], 'merchants')
+                ]
             ],
             'tracking' => $tracking,
             'status_history' => $history,
-            'items' => $items,
-            'total_items' => count($items)
+            'items' => $formattedItems,
+            'total_items' => count($items),
+            'total_addons' => $totalAddOnsCount,
+            'has_addons' => $totalAddOnsCount > 0
         ]);
 
     } catch (Exception $e) {
@@ -1673,7 +1884,7 @@ function trackOrder($conn, $orderId, $userId) {
 }
 
 /*********************************
- * GET LATEST ACTIVE ORDER
+ * GET LATEST ACTIVE ORDER (Enhanced with Add-ons)
  *********************************/
 function getLatestActiveOrder($conn, $userId) {
     try {
@@ -1687,6 +1898,7 @@ function getLatestActiveOrder($conn, $userId) {
                     o.status,
                     o.total_amount,
                     o.created_at,
+                    o.updated_at,
                     o.merchant_id,
                     o.delivery_address,
                     o.special_instructions,
@@ -1696,7 +1908,21 @@ function getLatestActiveOrder($conn, $userId) {
                         SELECT COUNT(*) 
                         FROM order_items oi 
                         WHERE oi.order_id = o.id
-                    ) as item_count
+                    ) as item_count,
+                    (
+                        SELECT GROUP_CONCAT(
+                            CONCAT(
+                                oi.id, '||', 
+                                oi.item_name, '||', 
+                                oi.quantity, '||', 
+                                oi.price, '||',
+                                COALESCE(oi.add_ons_json, '')
+                            )
+                            ORDER BY oi.id SEPARATOR ';;'
+                        )
+                        FROM order_items oi 
+                        WHERE oi.order_id = o.id
+                    ) as items_preview
                 FROM orders o
                 LEFT JOIN merchants m ON o.merchant_id = m.id
                 WHERE o.user_id = ? 
@@ -1725,6 +1951,32 @@ function getLatestActiveOrder($conn, $userId) {
         $trackingStmt->execute([':order_id' => $order['id']]);
         $tracking = $trackingStmt->fetch(PDO::FETCH_ASSOC);
 
+        // Parse items preview to count add-ons
+        $addOnsCount = 0;
+        $itemsPreview = [];
+        
+        if (!empty($order['items_preview'])) {
+            $itemStrings = explode(';;', $order['items_preview']);
+            foreach ($itemStrings as $index => $itemString) {
+                if ($index >= 3) break; // Limit preview
+                
+                $parts = explode('||', $itemString);
+                if (count($parts) >= 4) {
+                    $hasAddOns = !empty($parts[4]);
+                    if ($hasAddOns) {
+                        $addOns = json_decode($parts[4], true);
+                        $addOnsCount += count($addOns);
+                    }
+                    
+                    $itemsPreview[] = [
+                        'name' => $parts[1],
+                        'quantity' => (int)$parts[2],
+                        'has_addons' => $hasAddOns
+                    ];
+                }
+            }
+        }
+
         $statusProgress = [
             'pending' => 20,
             'confirmed' => 40,
@@ -1744,11 +1996,15 @@ function getLatestActiveOrder($conn, $userId) {
                 'merchant_image' => formatImageUrl($order['merchant_image'], 'merchants'),
                 'total_amount' => floatval($order['total_amount']),
                 'item_count' => intval($order['item_count'] ?? 0),
+                'addons_count' => $addOnsCount,
+                'has_addons' => $addOnsCount > 0,
+                'items_preview' => $itemsPreview,
                 'delivery_address' => $order['delivery_address'],
                 'special_instructions' => $order['special_instructions'] ?? '',
                 'created_at' => $order['created_at'],
+                'updated_at' => $order['updated_at'],
                 'tracking_status' => $tracking['status'] ?? $order['status'],
-                'last_update' => $tracking['created_at'] ?? $order['created_at']
+                'last_update' => $tracking['created_at'] ?? $order['updated_at'] ?? $order['created_at']
             ]
         ]);
         
@@ -1916,7 +2172,7 @@ function updateDeliveryAddress($conn, $data, $userId) {
 }
 
 /*********************************
- * GET ORDER DETAILS
+ * GET ORDER DETAILS (Enhanced with Add-ons)
  *********************************/
 function getOrderDetails($conn, $orderId, $userId) {
     global $baseUrl;
@@ -1941,10 +2197,14 @@ function getOrderDetails($conn, $orderId, $userId) {
                     o.merchant_id,
                     u.full_name as customer_name,
                     u.phone as customer_phone,
+                    u.email as customer_email,
                     m.name as merchant_name,
                     m.address as merchant_address,
                     m.phone as merchant_phone,
+                    m.email as merchant_email,
                     m.image_url as merchant_image,
+                    m.latitude as merchant_lat,
+                    m.longitude as merchant_lng,
                     (
                         SELECT GROUP_CONCAT(
                             CONCAT(
@@ -1954,7 +2214,10 @@ function getOrderDetails($conn, $orderId, $userId) {
                                 oi.price, '||',
                                 oi.total, '||',
                                 COALESCE(oi.variant_id, 0), '||',
-                                COALESCE(oi.add_ons_json, '')
+                                COALESCE(oi.add_ons_json, ''), '||',
+                                COALESCE(oi.variant_data, ''), '||',
+                                COALESCE(oi.image_url, ''), '||',
+                                COALESCE(oi.special_instructions, '')
                             )
                             ORDER BY oi.id SEPARATOR ';;'
                         )
@@ -1982,6 +2245,7 @@ function getOrderDetails($conn, $orderId, $userId) {
 
         $items = [];
         $itemCount = 0;
+        $totalAddOnsCount = 0;
         
         if (!empty($order['items_data'])) {
             $itemStrings = explode(';;', $order['items_data']);
@@ -2000,8 +2264,33 @@ function getOrderDetails($conn, $orderId, $userId) {
                         $item['variant_id'] = (int)$parts[5];
                     }
                     
+                    // Add-ons at position 6
                     if (isset($parts[6]) && !empty($parts[6])) {
-                        $item['add_ons'] = json_decode($parts[6], true);
+                        $addOns = json_decode($parts[6], true);
+                        $item['add_ons'] = $addOns;
+                        
+                        // Calculate add-ons total
+                        $addOnsTotal = 0;
+                        foreach ($addOns as $addOn) {
+                            $addOnsTotal += ($addOn['price'] * $addOn['quantity']);
+                        }
+                        $item['add_ons_total'] = $addOnsTotal;
+                        $totalAddOnsCount += count($addOns);
+                    }
+                    
+                    // Variant data at position 7
+                    if (isset($parts[7]) && !empty($parts[7])) {
+                        $item['variant_data'] = json_decode($parts[7], true);
+                    }
+                    
+                    // Image URL at position 8
+                    if (isset($parts[8]) && !empty($parts[8])) {
+                        $item['image_url'] = $parts[8];
+                    }
+                    
+                    // Special instructions at position 9
+                    if (isset($parts[9]) && !empty($parts[9])) {
+                        $item['special_instructions'] = $parts[9];
                     }
                     
                     $items[] = $item;
@@ -2028,6 +2317,18 @@ function getOrderDetails($conn, $orderId, $userId) {
         $trackingStmt->execute([':order_id' => $orderId]);
         $tracking = $trackingStmt->fetchAll(PDO::FETCH_ASSOC);
 
+        // Get rating if exists
+        $ratingStmt = $conn->prepare(
+            "SELECT rating, review, created_at 
+             FROM order_ratings 
+             WHERE order_id = :order_id AND user_id = :user_id"
+        );
+        $ratingStmt->execute([
+            ':order_id' => $orderId,
+            ':user_id' => $userId
+        ]);
+        $userRating = $ratingStmt->fetch(PDO::FETCH_ASSOC);
+
         $statusProgress = [
             'pending' => 20,
             'confirmed' => 40,
@@ -2042,8 +2343,11 @@ function getOrderDetails($conn, $orderId, $userId) {
             'order_number' => $order['order_number'],
             'status' => $order['status'],
             'status_progress' => $statusProgress[$order['status']] ?? 20,
-            'customer_name' => $order['customer_name'] ?? '',
-            'customer_phone' => $order['customer_phone'] ?? '',
+            'customer' => [
+                'name' => $order['customer_name'] ?? '',
+                'phone' => $order['customer_phone'] ?? '',
+                'email' => $order['customer_email'] ?? ''
+            ],
             'delivery_address' => $order['delivery_address'],
             'total_amount' => (float)$order['total_amount'],
             'delivery_fee' => (float)$order['delivery_fee'],
@@ -2052,6 +2356,8 @@ function getOrderDetails($conn, $orderId, $userId) {
             'discount_amount' => (float)($order['discount_amount'] ?? 0),
             'items' => $items,
             'item_count' => $itemCount,
+            'addons_count' => $totalAddOnsCount,
+            'has_addons' => $totalAddOnsCount > 0,
             'created_at' => $order['created_at'],
             'updated_at' => $order['updated_at'],
             'payment_method' => $order['payment_method'] ?? 'cash',
@@ -2061,15 +2367,21 @@ function getOrderDetails($conn, $orderId, $userId) {
                 'name' => $order['merchant_name'] ?? 'DropX Store',
                 'address' => $order['merchant_address'] ?? '',
                 'phone' => $order['merchant_phone'] ?? '',
-                'image' => formatImageUrl($order['merchant_image'], 'merchants')
+                'email' => $order['merchant_email'] ?? '',
+                'image' => formatImageUrl($order['merchant_image'], 'merchants'),
+                'location' => [
+                    'lat' => $order['merchant_lat'] ? (float)$order['merchant_lat'] : null,
+                    'lng' => $order['merchant_lng'] ? (float)$order['merchant_lng'] : null
+                ]
             ],
             'special_instructions' => $order['special_instructions'] ?? '',
             'cancellation_reason' => $order['cancellation_reason'] ?? '',
             'status_history' => $statusHistory,
             'tracking' => $tracking,
+            'user_rating' => $userRating,
             'can_cancel' => in_array($order['status'], ['pending', 'confirmed']),
             'can_reorder' => true,
-            'can_rate' => $order['status'] === 'delivered'
+            'can_rate' => $order['status'] === 'delivered' && !$userRating
         ];
 
         ob_clean();
@@ -2082,7 +2394,7 @@ function getOrderDetails($conn, $orderId, $userId) {
 }
 
 /*********************************
- * GET ORDERS LIST (Legacy)
+ * GET ORDERS LIST (Legacy - Enhanced with Add-ons)
  *********************************/
 function getOrdersList($conn, $userId) {
     try {
@@ -2121,7 +2433,25 @@ function getOrdersList($conn, $userId) {
                     o.created_at,
                     o.merchant_id,
                     m.name as merchant_name,
-                    m.image_url as merchant_image
+                    m.image_url as merchant_image,
+                    (
+                        SELECT COUNT(*) 
+                        FROM order_items oi 
+                        WHERE oi.order_id = o.id
+                    ) as item_count,
+                    (
+                        SELECT GROUP_CONCAT(
+                            CONCAT(
+                                oi.item_name, '||',
+                                oi.quantity, '||',
+                                COALESCE(oi.add_ons_json, '')
+                            )
+                            ORDER BY oi.id SEPARATOR ';;'
+                        )
+                        FROM order_items oi 
+                        WHERE oi.order_id = o.id
+                        LIMIT 2
+                    ) as items_preview
                 FROM orders o
                 LEFT JOIN merchants m ON o.merchant_id = m.id
                 $whereClause
@@ -2142,6 +2472,28 @@ function getOrdersList($conn, $userId) {
 
         $formattedOrders = [];
         foreach ($orders as $order) {
+            // Check for add-ons in preview
+            $hasAddOns = false;
+            $itemsPreview = [];
+            
+            if (!empty($order['items_preview'])) {
+                $itemStrings = explode(';;', $order['items_preview']);
+                foreach ($itemStrings as $itemString) {
+                    $parts = explode('||', $itemString);
+                    if (count($parts) >= 2) {
+                        $itemHasAddOns = !empty($parts[2]);
+                        if ($itemHasAddOns) {
+                            $hasAddOns = true;
+                        }
+                        $itemsPreview[] = [
+                            'name' => $parts[0],
+                            'quantity' => (int)$parts[1],
+                            'has_addons' => $itemHasAddOns
+                        ];
+                    }
+                }
+            }
+            
             $formattedOrders[] = [
                 'id' => (int)$order['id'],
                 'order_number' => $order['order_number'],
@@ -2149,7 +2501,10 @@ function getOrdersList($conn, $userId) {
                 'total_amount' => (float)$order['total_amount'],
                 'created_at' => $order['created_at'],
                 'merchant_name' => $order['merchant_name'] ?? 'DropX Store',
-                'merchant_image' => formatImageUrl($order['merchant_image'], 'merchants')
+                'merchant_image' => formatImageUrl($order['merchant_image'], 'merchants'),
+                'item_count' => (int)$order['item_count'],
+                'has_addons' => $hasAddOns,
+                'items_preview' => $itemsPreview
             ];
         }
 
