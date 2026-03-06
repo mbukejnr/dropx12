@@ -345,7 +345,7 @@ function getOrderDetails($conn, $orderId, $userId) {
                         u.phone as customer_phone,
                         u.email as customer_email,
                         
-                        -- Merchant details - WITH PROPER ALIASES
+                        -- Merchant details
                         m.id as merchant_id,
                         m.name as merchant_name,
                         m.address as merchant_address,
@@ -355,12 +355,12 @@ function getOrderDetails($conn, $orderId, $userId) {
                         m.latitude as merchant_lat,
                         m.longitude as merchant_lng,
                         m.delivery_fee as merchant_delivery_fee,
-                        m.preparation_time_minutes,
+                        m.preparation_time,
                         m.cuisine_type,
                         
-                        -- Driver details (if assigned)
+                        -- Driver details - with correct column names (rating and image removed)
                         d.id as driver_id,
-                        d.full_name as driver_name,
+                        d.name as driver_name,
                         d.phone as driver_phone,
                         d.vehicle_type,
                         d.vehicle_number
@@ -443,7 +443,6 @@ function getOrderDetails($conn, $orderId, $userId) {
         $formattedItems = [];
         $totalItemsCount = 0;
         $totalAddOnsCount = 0;
-        $subtotalWithAddOns = 0;
 
         foreach ($dbItems as $dbItem) {
             // Parse add-ons JSON
@@ -545,7 +544,7 @@ function getOrderDetails($conn, $orderId, $userId) {
         // Estimate delivery time
         $estimatedDelivery = null;
         if (!in_array($order['status'], ['delivered', 'cancelled', 'rejected'])) {
-            $prepTime = intval($order['preparation_time_minutes'] ?? 30);
+            $prepTime = intval($order['preparation_time'] ?? 30);
             $createdAt = new DateTime($order['created_at']);
             $estimatedDelivery = $createdAt->modify("+{$prepTime} minutes")->format('Y-m-d H:i:s');
         }
@@ -592,7 +591,7 @@ function getOrderDetails($conn, $orderId, $userId) {
                 ]
             ],
             
-            // Driver information (if assigned)
+            // Driver information (if assigned) - UPDATED with correct column names
             'driver' => ($order['driver_id']) ? [
                 'id' => intval($order['driver_id']),
                 'name' => $order['driver_name'] ?? '',
@@ -645,6 +644,8 @@ function getOrderDetails($conn, $orderId, $userId) {
         ResponseHandler::error('Failed to get order details: ' . $e->getMessage(), 500);
     }
 }
+
+                      
 
 /*********************************
  * GET ORDERS HANDLER (Enhanced with Add-ons)
