@@ -1177,7 +1177,7 @@ function createQuickOrderFromItems($conn, $data, $userId) {
         // Check merchant
         $merchantStmt = $conn->prepare(
             "SELECT id, name, delivery_fee, min_order_amount, is_open, is_active, 
-                    preparation_time_minutes, image_url
+                    preparation_time, image_url
              FROM merchants WHERE id = :id"
         );
         $merchantStmt->execute([':id' => $merchantId]);
@@ -1510,7 +1510,7 @@ function createOrder($conn, $data, $userId) {
 
         $merchantStmt = $conn->prepare(
             "SELECT id, name, delivery_fee, is_open, minimum_order, 
-                    preparation_time_minutes, address, image_url
+                    preparation_time, address, image_url
              FROM merchants 
              WHERE id = ? AND is_active = 1"
         );
