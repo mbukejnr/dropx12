@@ -165,7 +165,6 @@ try {
     ob_clean();
     ResponseHandler::error('Server error occurred. Please contact support.', 500, 'SERVER_ERROR');
 }
-
 /*********************************
  * HANDLE GET TRACKABLE ORDERS
  * Matches your orders.php getOrderDetails structure
@@ -175,6 +174,7 @@ function handleGetTrackableOrders($conn, $userId) {
         error_log("Fetching trackable orders for user: " . $userId);
         
         // Get orders that are trackable - matches your orders.php schema
+        // REMOVED the non-existent column 'o.dropx_pickup_status'
         $sql = "SELECT 
                     o.id,
                     o.order_number,
@@ -285,7 +285,6 @@ function handleGetTrackableOrders($conn, $userId) {
         ResponseHandler::error('Failed to fetch trackable orders: ' . $e->getMessage(), 500);
     }
 }
-
 /*********************************
  * HANDLE TRACK ORDER
  * Matches your orders.php getOrderDetails structure
