@@ -1529,16 +1529,24 @@ function getAdsPhotos($conn, $baseUrl) {
     $ads = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
     // Format for display - just ad_id, merchant_id, and photo_url
-    $formattedAds = [];
-    foreach ($ads as $ad) {
-        if ($ad['photo']) {
-            $formattedAds[] = [
-                'ad_id' => $ad['ad_id'],
-                'merchant_id' => $ad['merchant_id'],
-                'image' => rtrim($baseUrl, '/') . $ad['photo']
-            ];
+$formattedAds = [];
+foreach ($ads as $ad) {
+    if ($ad['photo']) {
+        // Make sure the photo path includes the full directory
+        $photoPath = $ad['photo'];
+        
+        // If it doesn't start with /uploads/, add it
+        if (strpos($photoPath, '/uploads/') !== 0) {
+            $photoPath = '/uploads/ads/' . ltrim($photoPath, '/');
         }
+        
+        $formattedAds[] = [
+            'ad_id' => $ad['ad_id'],
+            'merchant_id' => $ad['merchant_id'],
+            'image' => rtrim($baseUrl, '/') . $photoPath
+        ];
     }
+}
 
     // Get total count for pagination
     $countStmt = $conn->query(
