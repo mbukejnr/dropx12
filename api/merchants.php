@@ -185,6 +185,13 @@ try {
         exit();
     }
     
+    // Handle /merchants.php/ads (get ads photos for home page)
+    if ($method === 'GET' && preg_match('#/merchants\.php/ads$#', $path)) {
+        error_log("Matched ads endpoint");
+        getAdsPhotos($conn, $baseUrl);
+        exit();
+    }
+    
     // Handle /merchants.php (merchants list)
     if ($method === 'GET' && preg_match('#/merchants\.php$#', $path)) {
         error_log("Matched merchants list endpoint");
@@ -1488,6 +1495,65 @@ function getMultipleMerchants($conn, $data, $baseUrl) {
 
     ResponseHandler::success([
         'merchants' => $formattedMerchants
+    ]);
+}
+
+/*********************************
+ * GET ADS PHOTOS FOR HOME PAGE
+ *********************************/
+function getAdsPhotos($conn, $baseUrl) {
+    $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
+    $limit = isset($_GET['limit']) ? max(1, intval($_GET['limit'])) : 30;
+    $offset = ($page - 1) * $limit;
+
+    // Get all active ads with photos
+    $stmt = $conn->prepare(
+        "SELECT 
+            a.id as ad_id,
+            a.user_id as merchant_id,
+            COALESCE(
+                (SELECT photo_path FROM ad_photos WHERE ad_id = a.id AND is_primary = 1 LIMIT 1),
+                (SELECT photo_path FROM ad_photos WHERE ad_id = a.id ORDER BY sort_order ASC LIMIT 1)
+            ) as photo
+         FROM customer_ads a
+         WHERE a.status = 'active' 
+            AND a.expiry_date > NOW()
+            AND EXISTS (SELECT 1 FROM ad_photos WHERE ad_id = a.id)
+         ORDER BY a.created_at DESC
+         LIMIT :limit OFFSET :offset"
+    );
+    
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $ads = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Format for display - just ad_id, merchant_id, and photo_url
+    $formattedAds = [];
+    foreach ($ads as $ad) {
+        if ($ad['photo']) {
+            $formattedAds[] = [
+                'ad_id' => $ad['ad_id'],
+                'merchant_id' => $ad['merchant_id'],
+                'image' => rtrim($baseUrl, '/') . $ad['photo']
+            ];
+        }
+    }
+
+    // Get total count for pagination
+    $countStmt = $conn->query(
+        "SELECT COUNT(*) as total 
+         FROM customer_ads a
+         WHERE a.status = 'active' 
+            AND a.expiry_date > NOW()
+            AND EXISTS (SELECT 1 FROM ad_photos WHERE ad_id = a.id)"
+    );
+    $total = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
+
+    ResponseHandler::success([
+        'ads' => $formattedAds,
+        'page' => $page,
+        'total_pages' => ceil($total / $limit)
     ]);
 }
 
