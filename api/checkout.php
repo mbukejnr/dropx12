@@ -112,7 +112,7 @@ function getActiveCart($conn, $userId) {
 
 /*********************************
  * GET CART ITEMS WITH MERCHANT
- * No bank columns needed - payments go to Dropx, not merchants
+ * Using your actual cart_items table structure
  *********************************/
 function getCartItemsWithMerchant($conn, $cartId) {
     $stmt = $conn->prepare(
@@ -120,17 +120,18 @@ function getCartItemsWithMerchant($conn, $cartId) {
             ci.id,
             ci.menu_item_id,
             ci.quantity,
-            mi.name as item_name,
-            mi.price,
-            mi.merchant_id,
-            m.id as merchant_id,
-            m.name as merchant_name,
-            m.delivery_fee as merchant_delivery_fee,
-            m.min_order_amount as merchant_minimum,
-            m.preparation_time_minutes
+            ci.name as item_name,
+            ci.price,
+            ci.merchant_id,
+            ci.merchant_name,
+            ci.merchant_delivery_fee,
+            ci.merchant_min_order as merchant_minimum,
+            ci.preparation_time,
+            ci.variant_data,
+            ci.add_ons,
+            ci.selected_options,
+            ci.special_instructions
          FROM cart_items ci
-         JOIN menu_items mi ON ci.menu_item_id = mi.id
-         JOIN merchants m ON mi.merchant_id = m.id
          WHERE ci.cart_id = :cart_id AND ci.is_active = 1"
     );
     $stmt->execute([':cart_id' => $cartId]);
@@ -150,7 +151,7 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
     $merchantName = $items[0]['merchant_name'];
     $deliveryFee = floatval($items[0]['merchant_delivery_fee'] ?? 1500.00);
     $minimumOrder = floatval($items[0]['merchant_minimum'] ?? 0);
-    $prepTime = $items[0]['preparation_time_minutes'] ?? 20;
+    $prepTime = $items[0]['preparation_time'] ?? 20;
     
     // Calculate subtotal
     $subtotal = 0;
@@ -172,7 +173,11 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
             'price' => floatval($item['price']),
             'total' => $itemTotal,
             'formatted_price' => 'MK' . number_format($item['price'], 2),
-            'formatted_total' => 'MK' . number_format($itemTotal, 2)
+            'formatted_total' => 'MK' . number_format($itemTotal, 2),
+            'variant_data' => $item['variant_data'],
+            'add_ons' => $item['add_ons'],
+            'selected_options' => $item['selected_options'],
+            'notes' => $item['special_instructions'] ?? ''
         ];
     }
     
@@ -235,7 +240,7 @@ function getUserDefaultAddress($conn, $userId) {
 }
 
 /*********************************
- * CREATE ORDER - Matches actual table structure
+ * CREATE ORDER - Fixed to match actual table structures
  *********************************/
 function createOrder($conn, $userId, $cartId, $totals, $address) {
     // Generate order number
@@ -245,7 +250,7 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
     $conn->beginTransaction();
     
     try {
-        // Create order
+        // Create order - matching orders table structure
         $stmt = $conn->prepare(
             "INSERT INTO orders 
                 (order_number, user_id, merchant_id, merchant_name,
@@ -260,7 +265,7 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
         );
         
         $deliveryAddress = $address ? $address['address_line1'] . ', ' . $address['city'] : 'Address not set';
-        $specialInstructions = ''; // You can get this from input if needed
+        $specialInstructions = ''; // Can be passed from app if needed
         $preparationTime = $totals['merchant']['preparation_time'] ?? 20;
         $merchantName = $totals['merchant']['name'] ?? '';
         
@@ -281,7 +286,7 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
         $stmt->execute($params);
         $orderId = $conn->lastInsertId();
         
-        // Add order items - matching your exact table structure
+        // Add order items - matching order_items table structure
         $itemStmt = $conn->prepare(
             "INSERT INTO order_items 
                 (order_id, item_name, quantity, price, total,
@@ -310,22 +315,20 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
             ]);
         }
         
-        // Create tracking
+        // Create tracking - FIXED to match actual order_tracking table structure
         $trackStmt = $conn->prepare(
-            "INSERT INTO order_tracking (order_id, status, estimated_delivery)
-             VALUES (:order_id, 'Order placed', :estimated)"
+            "INSERT INTO order_tracking (order_id, status, created_at)
+             VALUES (:order_id, 'Order placed', NOW())"
         );
-        $estimatedDelivery = date('Y-m-d H:i:s', strtotime('+45 minutes'));
         $trackStmt->execute([
-            ':order_id' => $orderId,
-            ':estimated' => $estimatedDelivery
+            ':order_id' => $orderId
         ]);
         
         // Clear cart
         $clearStmt = $conn->prepare("UPDATE cart_items SET is_active = 0 WHERE cart_id = :cart_id");
         $clearStmt->execute([':cart_id' => $cartId]);
         
-        $updateCartStmt = $conn->prepare("UPDATE carts SET status = 'checkout' WHERE id = :cart_id");
+        $updateCartStmt = $conn->prepare("UPDATE carts SET status = 'completed' WHERE id = :cart_id");
         $updateCartStmt->execute([':cart_id' => $cartId]);
         
         $conn->commit();
@@ -538,7 +541,7 @@ try {
         if ($action === 'payment_status') {
             $orderId = $input['order_id'] ?? null;
             $paymentMethod = $input['payment_method'] ?? null;
-            $paymentStatus = $input['payment_status'] ?? 'paid'; // paid or failed
+            $paymentStatus = $input['payment_status'] ?? 'paid';
             
             if (!$orderId || !$paymentMethod) {
                 ResponseHandler::error('Order ID and payment method required', 400);
