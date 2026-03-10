@@ -2,7 +2,7 @@
 /*********************************
  * CHECKOUT SCREEN
  * Aggregator Model: Customer pays Dropx, Dropx pays merchants later
- * Payments handled by mobile app natively
+ * Malawi market - no tips, no tax, no service fees
  *********************************/
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
@@ -138,7 +138,7 @@ function getCartItemsWithMerchant($conn, $cartId) {
 }
 
 /*********************************
- * CALCULATE CART TOTALS
+ * CALCULATE CART TOTALS - Simple version (no tax, no service fee)
  *********************************/
 function calculateCartTotals($conn, $cartId, $userId, $items) {
     if (empty($items)) {
@@ -190,19 +190,8 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
     $cartData = $cartStmt->fetch(PDO::FETCH_ASSOC);
     $discount = floatval($cartData['applied_discount'] ?? 0);
     
-    // Apply discount
-    $adjustedSubtotal = max(0, $subtotal - $discount);
-    
-    // Calculate fees
-    $serviceFee = max(500.00, $adjustedSubtotal * 0.02);
-    $taxRate = 0.165;
-    
-    // Calculate tax
-    $taxableAmount = $adjustedSubtotal + $deliveryFee + $serviceFee;
-    $taxAmount = round($taxableAmount * $taxRate, 2);
-    
-    // Total
-    $totalAmount = $taxableAmount + $taxAmount;
+    // Total = subtotal + delivery fee - discount
+    $totalAmount = ($subtotal + $deliveryFee) - $discount;
     
     return [
         'merchant' => [
@@ -222,14 +211,8 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
         'subtotal_formatted' => 'MK' . number_format($subtotal, 2),
         'discount' => round($discount, 2),
         'discount_formatted' => 'MK' . number_format($discount, 2),
-        'adjusted_subtotal' => round($adjustedSubtotal, 2),
-        'adjusted_subtotal_formatted' => 'MK' . number_format($adjustedSubtotal, 2),
         'delivery_fee' => $deliveryFee,
         'delivery_fee_formatted' => 'MK' . number_format($deliveryFee, 2),
-        'service_fee' => round($serviceFee, 2),
-        'service_fee_formatted' => 'MK' . number_format($serviceFee, 2),
-        'tax_amount' => $taxAmount,
-        'tax_amount_formatted' => 'MK' . number_format($taxAmount, 2),
         'total_amount' => round($totalAmount, 2),
         'total_amount_formatted' => 'MK' . number_format($totalAmount, 2),
         'item_count' => $itemCount,
@@ -252,7 +235,7 @@ function getUserDefaultAddress($conn, $userId) {
 }
 
 /*********************************
- * CREATE ORDER
+ * CREATE ORDER - Clean version (no tips, no service fee, no tax)
  *********************************/
 function createOrder($conn, $userId, $cartId, $totals, $address) {
     // Generate order number
@@ -262,33 +245,37 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
     $conn->beginTransaction();
     
     try {
-        // Create order with pending payment status
+        // Create order - only columns that exist in your table
         $stmt = $conn->prepare(
             "INSERT INTO orders 
-                (order_number, user_id, merchant_id, 
-                 subtotal, discount_amount, delivery_fee, service_fee, tax_amount, total_amount,
-                 delivery_address, delivery_phone, payment_status, status, created_at, updated_at)
+                (order_number, user_id, merchant_id, merchant_name,
+                 subtotal, delivery_fee, discount_amount, total_amount,
+                 delivery_address, special_instructions, preparation_time,
+                 payment_status, status, created_at, updated_at)
              VALUES 
-                (:order_number, :user_id, :merchant_id,
-                 :subtotal, :discount, :delivery_fee, :service_fee, :tax_amount, :total_amount,
-                 :delivery_address, :delivery_phone, 'pending', 'pending_payment', NOW(), NOW())"
+                (:order_number, :user_id, :merchant_id, :merchant_name,
+                 :subtotal, :delivery_fee, :discount, :total_amount,
+                 :delivery_address, :special_instructions, :preparation_time,
+                 'pending', 'pending_payment', NOW(), NOW())"
         );
         
         $deliveryAddress = $address ? $address['address_line1'] . ', ' . $address['city'] : 'Address not set';
-        $deliveryPhone = $address['phone'] ?? '';
+        $specialInstructions = ''; // You can get this from input if needed
+        $preparationTime = $totals['merchant']['preparation_time'] ?? 20;
+        $merchantName = $totals['merchant']['name'] ?? '';
         
         $params = [
             ':order_number' => $orderNumber,
             ':user_id' => $userId,
             ':merchant_id' => $totals['merchant']['id'],
+            ':merchant_name' => $merchantName,
             ':subtotal' => $totals['subtotal'],
-            ':discount' => $totals['discount'],
             ':delivery_fee' => $totals['delivery_fee'],
-            ':service_fee' => $totals['service_fee'],
-            ':tax_amount' => $totals['tax_amount'],
+            ':discount' => $totals['discount'],
             ':total_amount' => $totals['total_amount'],
             ':delivery_address' => $deliveryAddress,
-            ':delivery_phone' => $deliveryPhone
+            ':special_instructions' => $specialInstructions,
+            ':preparation_time' => $preparationTime
         ];
         
         $stmt->execute($params);
@@ -414,10 +401,6 @@ try {
                     'discount_formatted' => $totals['discount_formatted'],
                     'delivery_fee' => $totals['delivery_fee'],
                     'delivery_fee_formatted' => $totals['delivery_fee_formatted'],
-                    'service_fee' => $totals['service_fee'],
-                    'service_fee_formatted' => $totals['service_fee_formatted'],
-                    'tax_amount' => $totals['tax_amount'],
-                    'tax_amount_formatted' => $totals['tax_amount_formatted'],
                     'total_amount' => $totals['total_amount'],
                     'total_amount_formatted' => $totals['total_amount_formatted']
                 ]
