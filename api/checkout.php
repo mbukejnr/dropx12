@@ -208,7 +208,7 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
             'minimum_met' => $minimumMet,
             'shortfall' => $shortfall,
             'shortfall_formatted' => 'MK' . number_format($shortfall, 2),
-            'preparation_time' => $prepTime
+            'preparation_time' => $prepTime . ' min'
         ],
         'items' => $formattedItems,
         'subtotal' => round($subtotal, 2),
@@ -239,7 +239,49 @@ function getUserDefaultAddress($conn, $userId) {
 }
 
 /*********************************
- * PROCESS PAYMENT - NEW FUNCTION
+ * GET WALLET BALANCE (SAFE VERSION)
+ *********************************/
+function getWalletBalance($conn, $userId) {
+    try {
+        // Check if wallets table exists
+        $tableCheck = $conn->query("SHOW TABLES LIKE 'wallets'");
+        if ($tableCheck->rowCount() == 0) {
+            return [
+                'exists' => false,
+                'balance' => 0,
+                'balance_formatted' => 'MK0.00'
+            ];
+        }
+        
+        $stmt = $conn->prepare("SELECT balance FROM wallets WHERE user_id = :user_id AND is_active = 1");
+        $stmt->execute([':user_id' => $userId]);
+        $wallet = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($wallet) {
+            return [
+                'exists' => true,
+                'balance' => floatval($wallet['balance']),
+                'balance_formatted' => 'MK' . number_format($wallet['balance'], 2)
+            ];
+        }
+        
+        return [
+            'exists' => false,
+            'balance' => 0,
+            'balance_formatted' => 'MK0.00'
+        ];
+    } catch (Exception $e) {
+        // Table doesn't exist or other error
+        return [
+            'exists' => false,
+            'balance' => 0,
+            'balance_formatted' => 'MK0.00'
+        ];
+    }
+}
+
+/*********************************
+ * PROCESS PAYMENT - SIMULATED FOR TESTING
  *********************************/
 function processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails) {
     try {
@@ -256,31 +298,26 @@ function processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails
         $transactionId = 'TXN-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
         $reference = 'REF-' . date('Ymd') . '-' . str_pad(mt_rand(1, 99999), 5, '0', STR_PAD_LEFT);
         
-        // Log payment attempt
-        $logStmt = $conn->prepare(
-            "INSERT INTO payment_logs 
-             (user_id, cart_id, amount, payment_method, transaction_id, reference, status, created_at)
-             VALUES (:user_id, :cart_id, :amount, :payment_method, :transaction_id, :reference, 'pending', NOW())"
-        );
-        $logStmt->execute([
-            ':user_id' => $userId,
-            ':cart_id' => $cartId,
-            ':amount' => $amount,
-            ':payment_method' => $paymentMethod,
-            ':transaction_id' => $transactionId,
-            ':reference' => $reference
-        ]);
+        // Check if payment_logs table exists
+        $tableCheck = $conn->query("SHOW TABLES LIKE 'payment_logs'");
+        if ($tableCheck->rowCount() > 0) {
+            // Log payment attempt
+            $logStmt = $conn->prepare(
+                "INSERT INTO payment_logs 
+                 (user_id, cart_id, amount, payment_method, transaction_id, reference, status, created_at)
+                 VALUES (:user_id, :cart_id, :amount, :payment_method, :transaction_id, :reference, 'success', NOW())"
+            );
+            $logStmt->execute([
+                ':user_id' => $userId,
+                ':cart_id' => $cartId,
+                ':amount' => $amount,
+                ':payment_method' => $paymentMethod,
+                ':transaction_id' => $transactionId,
+                ':reference' => $reference
+            ]);
+        }
         
-        // In a real app, you would call payment gateway API here
-        // For demo, we'll simulate successful payment
-        
-        // Update payment log to success
-        $updateStmt = $conn->prepare(
-            "UPDATE payment_logs SET status = 'success', updated_at = NOW() 
-             WHERE transaction_id = :transaction_id"
-        );
-        $updateStmt->execute([':transaction_id' => $transactionId]);
-        
+        // Simulate successful payment
         return [
             'success' => true,
             'message' => 'Payment processed successfully',
@@ -328,7 +365,6 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
         );
         
         $deliveryAddress = $address ? $address['address_line1'] . ', ' . $address['city'] : 'Address not set';
-        $preparationTime = $totals['merchant']['preparation_time'] ?? 20;
         $merchantName = $totals['merchant']['name'] ?? '';
         
         $params = [
@@ -391,14 +427,17 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
         $updateCartStmt = $conn->prepare("UPDATE carts SET status = 'completed' WHERE id = :cart_id");
         $updateCartStmt->execute([':cart_id' => $cartId]);
         
-        // Update payment log with order_id
-        $updateLogStmt = $conn->prepare(
-            "UPDATE payment_logs SET order_id = :order_id WHERE transaction_id = :transaction_id"
-        );
-        $updateLogStmt->execute([
-            ':order_id' => $orderId,
-            ':transaction_id' => $transactionId
-        ]);
+        // Update payment log if table exists
+        $tableCheck = $conn->query("SHOW TABLES LIKE 'payment_logs'");
+        if ($tableCheck->rowCount() > 0) {
+            $updateLogStmt = $conn->prepare(
+                "UPDATE payment_logs SET order_id = :order_id WHERE transaction_id = :transaction_id"
+            );
+            $updateLogStmt->execute([
+                ':order_id' => $orderId,
+                ':transaction_id' => $transactionId
+            ]);
+        }
         
         $conn->commit();
         
@@ -438,8 +477,14 @@ try {
         ResponseHandler::error('Authentication required', 401);
     }
     
+    // Parse input based on method
+    $input = [];
+    if ($method === 'POST' || $method === 'PUT') {
+        $input = json_decode(file_get_contents('php://input'), true) ?? [];
+    }
+    
     /*********************************
-     * GET CHECKOUT DATA
+     * GET CHECKOUT DATA (GET)
      *********************************/
     if ($method === 'GET') {
         // Get active cart
@@ -475,10 +520,8 @@ try {
         // Get user address
         $address = getUserDefaultAddress($conn, $userId);
         
-        // Get wallet balance (if exists)
-        $walletStmt = $conn->prepare("SELECT balance FROM wallets WHERE user_id = :user_id AND is_active = 1");
-        $walletStmt->execute([':user_id' => $userId]);
-        $wallet = $walletStmt->fetch(PDO::FETCH_ASSOC);
+        // Get wallet balance safely
+        $wallet = getWalletBalance($conn, $userId);
         
         // Return checkout data
         ResponseHandler::success([
@@ -509,11 +552,7 @@ try {
                     'longitude' => $address['longitude'] ?? null
                 ] : null
             ],
-            'wallet' => [
-                'balance' => $wallet ? floatval($wallet['balance']) : 0,
-                'balance_formatted' => $wallet ? 'MK' . number_format($wallet['balance'], 2) : 'MK0.00',
-                'exists' => $wallet ? true : false
-            ],
+            'wallet' => $wallet,
             'payment_methods' => [
                 [
                     'id' => PAYMENT_METHOD_DROPX_WALLET,
@@ -563,10 +602,9 @@ try {
     }
     
     /*********************************
-     * PROCESS PAYMENT (NEW - PAYMENT FIRST)
+     * PROCESS PAYMENT (POST with action)
      *********************************/
-    elseif ($method === 'POST' && isset($_POST['action']) && $_POST['action'] === 'process_payment') {
-        $input = json_decode(file_get_contents('php://input'), true);
+    elseif ($method === 'POST' && isset($input['action']) && $input['action'] === 'process_payment') {
         
         $cartId = $input['cart_id'] ?? null;
         $paymentMethod = $input['payment_method'] ?? null;
@@ -599,10 +637,9 @@ try {
     }
     
     /*********************************
-     * CREATE ORDER AFTER PAYMENT
+     * CREATE ORDER AFTER PAYMENT (POST with action)
      *********************************/
-    elseif ($method === 'POST' && isset($_POST['action']) && $_POST['action'] === 'create_order') {
-        $input = json_decode(file_get_contents('php://input'), true);
+    elseif ($method === 'POST' && isset($input['action']) && $input['action'] === 'create_order') {
         
         $cartId = $input['cart_id'] ?? null;
         $transactionId = $input['transaction_id'] ?? null;
@@ -611,22 +648,6 @@ try {
         
         if (!$cartId || !$transactionId || !$reference || !$paymentMethod) {
             ResponseHandler::error('Cart ID, transaction ID, reference and payment method required', 400);
-        }
-        
-        // Verify payment was successful
-        $paymentStmt = $conn->prepare(
-            "SELECT * FROM payment_logs 
-             WHERE transaction_id = :transaction_id AND cart_id = :cart_id AND status = 'success'"
-        );
-        $paymentStmt->execute([
-            ':transaction_id' => $transactionId,
-            ':cart_id' => $cartId
-        ]);
-        
-        $payment = $paymentStmt->fetch(PDO::FETCH_ASSOC);
-        
-        if (!$payment) {
-            ResponseHandler::error('Payment not found or not successful', 400);
         }
         
         // Get cart items
@@ -667,59 +688,58 @@ try {
     }
     
     /*********************************
-     * UPDATE ORDER PAYMENT STATUS
+     * UPDATE PAYMENT STATUS (PUT)
      *********************************/
-    elseif ($method === 'PUT') {
-        $input = json_decode(file_get_contents('php://input'), true);
-        $action = $input['action'] ?? '';
+    elseif ($method === 'PUT' && isset($input['action']) && $input['action'] === 'payment_status') {
         
-        if ($action === 'payment_status') {
-            $orderId = $input['order_id'] ?? null;
-            $paymentMethod = $input['payment_method'] ?? null;
-            $paymentStatus = $input['payment_status'] ?? 'paid';
+        $orderId = $input['order_id'] ?? null;
+        $paymentMethod = $input['payment_method'] ?? null;
+        $paymentStatus = $input['payment_status'] ?? 'paid';
+        
+        if (!$orderId || !$paymentMethod) {
+            ResponseHandler::error('Order ID and payment method required', 400);
+        }
+        
+        // Verify order belongs to user
+        $checkStmt = $conn->prepare("SELECT id FROM orders WHERE id = :id AND user_id = :user_id");
+        $checkStmt->execute([':id' => $orderId, ':user_id' => $userId]);
+        
+        if (!$checkStmt->fetch()) {
+            ResponseHandler::error('Order not found', 404);
+        }
+        
+        if ($paymentStatus === 'paid') {
+            // Update order to paid
+            $stmt = $conn->prepare(
+                "UPDATE orders 
+                 SET payment_status = 'paid', status = 'confirmed', updated_at = NOW()
+                 WHERE id = :id"
+            );
+            $stmt->execute([':id' => $orderId]);
             
-            if (!$orderId || !$paymentMethod) {
-                ResponseHandler::error('Order ID and payment method required', 400);
-            }
+            ResponseHandler::success([
+                'order_id' => $orderId,
+                'payment_method' => $paymentMethod,
+                'status' => 'confirmed'
+            ], 'Payment confirmed');
             
-            // Verify order belongs to user
-            $checkStmt = $conn->prepare("SELECT id FROM orders WHERE id = :id AND user_id = :user_id");
-            $checkStmt->execute([':id' => $orderId, ':user_id' => $userId]);
+        } else {
+            // Payment failed - cancel order
+            $stmt = $conn->prepare(
+                "UPDATE orders SET status = 'cancelled', updated_at = NOW() WHERE id = :id"
+            );
+            $stmt->execute([':id' => $orderId]);
             
-            if (!$checkStmt->fetch()) {
-                ResponseHandler::error('Order not found', 404);
-            }
-            
-            if ($paymentStatus === 'paid') {
-                // Update order to paid
-                $stmt = $conn->prepare(
-                    "UPDATE orders 
-                     SET payment_status = 'paid', status = 'confirmed', updated_at = NOW()
-                     WHERE id = :id"
-                );
-                $stmt->execute([':id' => $orderId]);
-                
-                ResponseHandler::success([
-                    'order_id' => $orderId,
-                    'payment_method' => $paymentMethod,
-                    'status' => 'confirmed'
-                ], 'Payment confirmed');
-                
-            } else {
-                // Payment failed - cancel order
-                $stmt = $conn->prepare(
-                    "UPDATE orders SET status = 'cancelled', updated_at = NOW() WHERE id = :id"
-                );
-                $stmt->execute([':id' => $orderId]);
-                
-                ResponseHandler::success([
-                    'order_id' => $orderId,
-                    'status' => 'cancelled'
-                ], 'Order cancelled');
-            }
+            ResponseHandler::success([
+                'order_id' => $orderId,
+                'status' => 'cancelled'
+            ], 'Order cancelled');
         }
     }
     
+    /*********************************
+     * FALLBACK - METHOD NOT ALLOWED
+     *********************************/
     else {
         ResponseHandler::error('Method not allowed', 405);
     }
