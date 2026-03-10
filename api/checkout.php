@@ -89,7 +89,7 @@ function getActiveCart($conn, $userId) {
 }
 
 /*********************************
- * GET CART ITEMS WITH MERCHANT
+ * GET CART ITEMS WITH MERCHANT - FIXED COLUMN NAME
  *********************************/
 function getCartItemsWithMerchant($conn, $cartId) {
     $stmt = $conn->prepare(
@@ -103,10 +103,11 @@ function getCartItemsWithMerchant($conn, $cartId) {
             m.id as merchant_id,
             m.name as merchant_name,
             m.delivery_fee as merchant_delivery_fee,
-            m.minimum_order as merchant_minimum,
+            m.min_order_amount as merchant_minimum,
             m.bank_account_name,
             m.bank_account_number,
-            m.bank_name
+            m.bank_name,
+            m.preparation_time_minutes
          FROM cart_items ci
          JOIN menu_items mi ON ci.menu_item_id = mi.id
          JOIN merchants m ON mi.merchant_id = m.id
@@ -129,6 +130,8 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
     $merchantName = $items[0]['merchant_name'];
     $deliveryFee = floatval($items[0]['merchant_delivery_fee'] ?? 1500.00);
     $minimumOrder = floatval($items[0]['merchant_minimum'] ?? 0);
+    $prepTime = $items[0]['preparation_time_minutes'] ?? 20;
+    
     $bankDetails = [
         'bank_name' => $items[0]['bank_name'] ?? null,
         'account_name' => $items[0]['bank_account_name'] ?? null,
@@ -198,7 +201,8 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
             'minimum_met' => $minimumMet,
             'shortfall' => $shortfall,
             'shortfall_formatted' => 'MK' . number_format($shortfall, 2),
-            'bank_details' => $bankDetails
+            'bank_details' => $bankDetails,
+            'preparation_time' => $prepTime
         ],
         'items' => $formattedItems,
         'subtotal' => round($subtotal, 2),
