@@ -234,7 +234,7 @@ function getUserDefaultAddress($conn, $userId) {
     return $stmt->fetch(PDO::FETCH_ASSOC);
 }
 
-//*********************************
+/*********************************
  * CREATE ORDER - Fixed status enum values
  *********************************/
 function createOrder($conn, $userId, $cartId, $totals, $address) {
