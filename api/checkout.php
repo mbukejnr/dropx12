@@ -3,11 +3,12 @@
  * CHECKOUT SCREEN
  * Aggregator Model: Customer pays Dropx, Dropx pays merchants later
  * Malawi market - no tips, no tax, no service fees
+ * Payment-first flow: Process payment before creating order
  *********************************/
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
-header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept");
+header("Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Device-ID, X-Platform, X-App-Version, X-Timestamp");
 header("Content-Type: application/json; charset=UTF-8");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -34,7 +35,7 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
- * CONSTANTS - Check if already defined
+ * CONSTANTS
  *********************************/
 if (!defined('CURRENCY')) {
     define('CURRENCY', 'MWK');
@@ -43,7 +44,7 @@ if (!defined('CURRENCY_SYMBOL')) {
     define('CURRENCY_SYMBOL', 'MK');
 }
 
-// Payment methods the app supports
+// Payment methods
 if (!defined('PAYMENT_METHOD_DROPX_WALLET')) {
     define('PAYMENT_METHOD_DROPX_WALLET', 'dropx_wallet');
 }
@@ -58,8 +59,7 @@ if (!defined('PAYMENT_METHOD_BANK_TRANSFER')) {
 }
 
 /*********************************
- * DROPX PAYMENT DETAILS (for aggregator model)
- * Customer pays to Dropx, Dropx pays merchants later
+ * DROPX PAYMENT DETAILS
  *********************************/
 define('DROPX_BANK_NAME', 'NBS Bank');
 define('DROPX_BANK_ACCOUNT_NAME', 'DROPX LIMITED');
@@ -112,7 +112,6 @@ function getActiveCart($conn, $userId) {
 
 /*********************************
  * GET CART ITEMS WITH MERCHANT
- * Using your actual cart_items table structure
  *********************************/
 function getCartItemsWithMerchant($conn, $cartId) {
     $stmt = $conn->prepare(
@@ -139,7 +138,7 @@ function getCartItemsWithMerchant($conn, $cartId) {
 }
 
 /*********************************
- * CALCULATE CART TOTALS - Simple version (no tax, no service fee)
+ * CALCULATE CART TOTALS
  *********************************/
 function calculateCartTotals($conn, $cartId, $userId, $items) {
     if (empty($items)) {
@@ -240,9 +239,73 @@ function getUserDefaultAddress($conn, $userId) {
 }
 
 /*********************************
- * CREATE ORDER - Fixed to match actual table structures
+ * PROCESS PAYMENT - NEW FUNCTION
  *********************************/
-function createOrder($conn, $userId, $cartId, $totals, $address) {
+function processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails) {
+    try {
+        // Get cart items to calculate total
+        $items = getCartItemsWithMerchant($conn, $cartId);
+        if (empty($items)) {
+            return ['success' => false, 'message' => 'Cart is empty'];
+        }
+        
+        $totals = calculateCartTotals($conn, $cartId, $userId, $items);
+        $amount = $totals['total_amount'];
+        
+        // Generate transaction reference
+        $transactionId = 'TXN-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
+        $reference = 'REF-' . date('Ymd') . '-' . str_pad(mt_rand(1, 99999), 5, '0', STR_PAD_LEFT);
+        
+        // Log payment attempt
+        $logStmt = $conn->prepare(
+            "INSERT INTO payment_logs 
+             (user_id, cart_id, amount, payment_method, transaction_id, reference, status, created_at)
+             VALUES (:user_id, :cart_id, :amount, :payment_method, :transaction_id, :reference, 'pending', NOW())"
+        );
+        $logStmt->execute([
+            ':user_id' => $userId,
+            ':cart_id' => $cartId,
+            ':amount' => $amount,
+            ':payment_method' => $paymentMethod,
+            ':transaction_id' => $transactionId,
+            ':reference' => $reference
+        ]);
+        
+        // In a real app, you would call payment gateway API here
+        // For demo, we'll simulate successful payment
+        
+        // Update payment log to success
+        $updateStmt = $conn->prepare(
+            "UPDATE payment_logs SET status = 'success', updated_at = NOW() 
+             WHERE transaction_id = :transaction_id"
+        );
+        $updateStmt->execute([':transaction_id' => $transactionId]);
+        
+        return [
+            'success' => true,
+            'message' => 'Payment processed successfully',
+            'data' => [
+                'transaction_id' => $transactionId,
+                'reference' => $reference,
+                'amount' => $amount,
+                'amount_formatted' => 'MK' . number_format($amount, 2),
+                'payment_method' => $paymentMethod
+            ]
+        ];
+        
+    } catch (Exception $e) {
+        error_log("Payment processing error: " . $e->getMessage());
+        return [
+            'success' => false,
+            'message' => 'Payment processing failed: ' . $e->getMessage()
+        ];
+    }
+}
+
+/*********************************
+ * CREATE ORDER AFTER PAYMENT
+ *********************************/
+function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $paymentMethod, $transactionId, $reference) {
     // Generate order number
     $orderNumber = 'ORD-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
     
@@ -250,22 +313,21 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
     $conn->beginTransaction();
     
     try {
-        // Create order - matching orders table structure
+        // Create order
         $stmt = $conn->prepare(
             "INSERT INTO orders 
                 (order_number, user_id, merchant_id, merchant_name,
                  subtotal, delivery_fee, discount_amount, total_amount,
-                 delivery_address, special_instructions, preparation_time,
+                 delivery_address, payment_method, transaction_id, reference,
                  payment_status, status, created_at, updated_at)
              VALUES 
                 (:order_number, :user_id, :merchant_id, :merchant_name,
                  :subtotal, :delivery_fee, :discount, :total_amount,
-                 :delivery_address, :special_instructions, :preparation_time,
-                 'pending', 'pending', NOW(), NOW())"
+                 :delivery_address, :payment_method, :transaction_id, :reference,
+                 'paid', 'confirmed', NOW(), NOW())"
         );
         
         $deliveryAddress = $address ? $address['address_line1'] . ', ' . $address['city'] : 'Address not set';
-        $specialInstructions = ''; // Can be passed from app if needed
         $preparationTime = $totals['merchant']['preparation_time'] ?? 20;
         $merchantName = $totals['merchant']['name'] ?? '';
         
@@ -279,14 +341,15 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
             ':discount' => $totals['discount'],
             ':total_amount' => $totals['total_amount'],
             ':delivery_address' => $deliveryAddress,
-            ':special_instructions' => $specialInstructions,
-            ':preparation_time' => $preparationTime
+            ':payment_method' => $paymentMethod,
+            ':transaction_id' => $transactionId,
+            ':reference' => $reference
         ];
         
         $stmt->execute($params);
         $orderId = $conn->lastInsertId();
         
-        // Add order items - matching order_items table structure
+        // Add order items
         $itemStmt = $conn->prepare(
             "INSERT INTO order_items 
                 (order_id, item_name, quantity, price, total,
@@ -297,7 +360,6 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
         );
         
         foreach ($totals['items'] as $item) {
-            // Prepare JSON data if available
             $variantData = isset($item['variant_data']) ? json_encode($item['variant_data']) : null;
             $addOnsJson = isset($item['add_ons']) ? json_encode($item['add_ons']) : null;
             $selectedOptions = isset($item['selected_options']) ? json_encode($item['selected_options']) : null;
@@ -315,14 +377,12 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
             ]);
         }
         
-        // Create tracking - FIXED to match actual order_tracking table structure
+        // Create tracking
         $trackStmt = $conn->prepare(
             "INSERT INTO order_tracking (order_id, status, created_at)
              VALUES (:order_id, 'Order placed', NOW())"
         );
-        $trackStmt->execute([
-            ':order_id' => $orderId
-        ]);
+        $trackStmt->execute([':order_id' => $orderId]);
         
         // Clear cart
         $clearStmt = $conn->prepare("UPDATE cart_items SET is_active = 0 WHERE cart_id = :cart_id");
@@ -331,16 +391,30 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
         $updateCartStmt = $conn->prepare("UPDATE carts SET status = 'completed' WHERE id = :cart_id");
         $updateCartStmt->execute([':cart_id' => $cartId]);
         
+        // Update payment log with order_id
+        $updateLogStmt = $conn->prepare(
+            "UPDATE payment_logs SET order_id = :order_id WHERE transaction_id = :transaction_id"
+        );
+        $updateLogStmt->execute([
+            ':order_id' => $orderId,
+            ':transaction_id' => $transactionId
+        ]);
+        
         $conn->commit();
         
         return [
+            'success' => true,
             'order_id' => $orderId,
             'order_number' => $orderNumber
         ];
         
     } catch (Exception $e) {
         $conn->rollBack();
-        throw $e;
+        error_log("Order creation error: " . $e->getMessage());
+        return [
+            'success' => false,
+            'message' => $e->getMessage()
+        ];
     }
 }
 
@@ -401,7 +475,12 @@ try {
         // Get user address
         $address = getUserDefaultAddress($conn, $userId);
         
-        // Return checkout data with Dropx payment details (aggregator model)
+        // Get wallet balance (if exists)
+        $walletStmt = $conn->prepare("SELECT balance FROM wallets WHERE user_id = :user_id AND is_active = 1");
+        $walletStmt->execute([':user_id' => $userId]);
+        $wallet = $walletStmt->fetch(PDO::FETCH_ASSOC);
+        
+        // Return checkout data
         ResponseHandler::success([
             'cart_id' => $cart['id'],
             'order_data' => [
@@ -430,20 +509,25 @@ try {
                     'longitude' => $address['longitude'] ?? null
                 ] : null
             ],
+            'wallet' => [
+                'balance' => $wallet ? floatval($wallet['balance']) : 0,
+                'balance_formatted' => $wallet ? 'MK' . number_format($wallet['balance'], 2) : 'MK0.00',
+                'exists' => $wallet ? true : false
+            ],
             'payment_methods' => [
                 [
                     'id' => PAYMENT_METHOD_DROPX_WALLET,
-                    'name' => 'DropxWallet',
+                    'name' => 'DropX Wallet',
                     'type' => 'wallet',
                     'icon' => 'wallet',
-                    'description' => 'Pay using your DropxWallet balance'
+                    'description' => 'Pay using your DropXWallet balance'
                 ],
                 [
                     'id' => PAYMENT_METHOD_AIRTEL_MONEY,
                     'name' => 'Airtel Money',
                     'type' => 'mobile_money',
                     'icon' => 'airtel',
-                    'description' => 'Pay to Dropx Airtel Money',
+                    'description' => 'Pay via Airtel Money',
                     'provider' => 'Airtel Malawi',
                     'min_amount' => 100,
                     'max_amount' => 1000000,
@@ -454,7 +538,7 @@ try {
                     'name' => 'TNM Mpamba',
                     'type' => 'mobile_money',
                     'icon' => 'tnm',
-                    'description' => 'Pay to Dropx TNM Mpamba',
+                    'description' => 'Pay via TNM Mpamba',
                     'provider' => 'TNM',
                     'min_amount' => 100,
                     'max_amount' => 1000000,
@@ -465,7 +549,7 @@ try {
                     'name' => 'Bank Transfer',
                     'type' => 'bank',
                     'icon' => 'bank',
-                    'description' => 'Pay via bank transfer to Dropx',
+                    'description' => 'Pay via bank transfer',
                     'min_amount' => 1000,
                     'max_amount' => 10000000,
                     'bank_details' => [
@@ -479,20 +563,70 @@ try {
     }
     
     /*********************************
-     * CREATE ORDER (PRE-PAYMENT)
+     * PROCESS PAYMENT (NEW - PAYMENT FIRST)
      *********************************/
-    elseif ($method === 'POST') {
+    elseif ($method === 'POST' && isset($_POST['action']) && $_POST['action'] === 'process_payment') {
         $input = json_decode(file_get_contents('php://input'), true);
         
-        // Get cart
         $cartId = $input['cart_id'] ?? null;
-        if (!$cartId) {
-            $cart = getActiveCart($conn, $userId);
-            $cartId = $cart['id'] ?? null;
-        }
+        $paymentMethod = $input['payment_method'] ?? null;
+        $paymentDetails = $input['payment_details'] ?? [];
         
         if (!$cartId) {
-            ResponseHandler::error('Cart not found', 404);
+            ResponseHandler::error('Cart ID required', 400);
+        }
+        
+        if (!$paymentMethod) {
+            ResponseHandler::error('Payment method required', 400);
+        }
+        
+        // Verify cart belongs to user
+        $cartStmt = $conn->prepare("SELECT id FROM carts WHERE id = :id AND user_id = :user_id AND status = 'active'");
+        $cartStmt->execute([':id' => $cartId, ':user_id' => $userId]);
+        
+        if (!$cartStmt->fetch()) {
+            ResponseHandler::error('Cart not found or not active', 404);
+        }
+        
+        // Process payment
+        $result = processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails);
+        
+        if ($result['success']) {
+            ResponseHandler::success($result['data'], 'Payment processed successfully');
+        } else {
+            ResponseHandler::error($result['message'], 400);
+        }
+    }
+    
+    /*********************************
+     * CREATE ORDER AFTER PAYMENT
+     *********************************/
+    elseif ($method === 'POST' && isset($_POST['action']) && $_POST['action'] === 'create_order') {
+        $input = json_decode(file_get_contents('php://input'), true);
+        
+        $cartId = $input['cart_id'] ?? null;
+        $transactionId = $input['transaction_id'] ?? null;
+        $reference = $input['reference'] ?? null;
+        $paymentMethod = $input['payment_method'] ?? null;
+        
+        if (!$cartId || !$transactionId || !$reference || !$paymentMethod) {
+            ResponseHandler::error('Cart ID, transaction ID, reference and payment method required', 400);
+        }
+        
+        // Verify payment was successful
+        $paymentStmt = $conn->prepare(
+            "SELECT * FROM payment_logs 
+             WHERE transaction_id = :transaction_id AND cart_id = :cart_id AND status = 'success'"
+        );
+        $paymentStmt->execute([
+            ':transaction_id' => $transactionId,
+            ':cart_id' => $cartId
+        ]);
+        
+        $payment = $paymentStmt->fetch(PDO::FETCH_ASSOC);
+        
+        if (!$payment) {
+            ResponseHandler::error('Payment not found or not successful', 400);
         }
         
         // Get cart items
@@ -511,24 +645,25 @@ try {
         }
         
         // Create order
-        $order = createOrder($conn, $userId, $cartId, $totals, $address);
+        $order = createOrderAfterPayment(
+            $conn, $userId, $cartId, $totals, $address, 
+            $paymentMethod, $transactionId, $reference
+        );
         
-        ResponseHandler::success([
-            'order_id' => $order['order_id'],
-            'order_number' => $order['order_number'],
-            'amount' => $totals['total_amount'],
-            'amount_formatted' => $totals['total_amount_formatted'],
-            'merchant' => [
-                'id' => $totals['merchant']['id'],
-                'name' => $totals['merchant']['name']
-            ],
-            'payment_methods' => [
-                PAYMENT_METHOD_DROPX_WALLET,
-                PAYMENT_METHOD_AIRTEL_MONEY,
-                PAYMENT_METHOD_TNM_MPAMBA,
-                PAYMENT_METHOD_BANK_TRANSFER
-            ]
-        ], 'Order created successfully');
+        if ($order['success']) {
+            ResponseHandler::success([
+                'order_id' => $order['order_id'],
+                'order_number' => $order['order_number'],
+                'amount' => $totals['total_amount'],
+                'amount_formatted' => $totals['total_amount_formatted'],
+                'merchant' => [
+                    'id' => $totals['merchant']['id'],
+                    'name' => $totals['merchant']['name']
+                ]
+            ], 'Order created successfully');
+        } else {
+            ResponseHandler::error('Failed to create order: ' . $order['message'], 500);
+        }
     }
     
     /*********************************
@@ -559,13 +694,10 @@ try {
                 // Update order to paid
                 $stmt = $conn->prepare(
                     "UPDATE orders 
-                     SET payment_method = :method, payment_status = 'paid', status = 'confirmed', updated_at = NOW()
+                     SET payment_status = 'paid', status = 'confirmed', updated_at = NOW()
                      WHERE id = :id"
                 );
-                $stmt->execute([
-                    ':method' => $paymentMethod,
-                    ':id' => $orderId
-                ]);
+                $stmt->execute([':id' => $orderId]);
                 
                 ResponseHandler::success([
                     'order_id' => $orderId,
