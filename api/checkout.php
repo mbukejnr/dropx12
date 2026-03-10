@@ -1,8 +1,8 @@
 <?php
 /*********************************
  * CHECKOUT SCREEN
+ * Aggregator Model: Customer pays Dropx, Dropx pays merchants later
  * Payments handled by mobile app natively
- * Just creates order and returns details
  *********************************/
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
@@ -34,16 +34,38 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
- * CONSTANTS
+ * CONSTANTS - Check if already defined
  *********************************/
-define('CURRENCY', 'MWK');
-define('CURRENCY_SYMBOL', 'MK');
+if (!defined('CURRENCY')) {
+    define('CURRENCY', 'MWK');
+}
+if (!defined('CURRENCY_SYMBOL')) {
+    define('CURRENCY_SYMBOL', 'MK');
+}
 
 // Payment methods the app supports
-define('PAYMENT_METHOD_DROPX_WALLET', 'dropx_wallet');
-define('PAYMENT_METHOD_AIRTEL_MONEY', 'airtel_money');
-define('PAYMENT_METHOD_TNM_MPAMBA', 'tnm_mpamba');
-define('PAYMENT_METHOD_BANK_TRANSFER', 'bank_transfer');
+if (!defined('PAYMENT_METHOD_DROPX_WALLET')) {
+    define('PAYMENT_METHOD_DROPX_WALLET', 'dropx_wallet');
+}
+if (!defined('PAYMENT_METHOD_AIRTEL_MONEY')) {
+    define('PAYMENT_METHOD_AIRTEL_MONEY', 'airtel_money');
+}
+if (!defined('PAYMENT_METHOD_TNM_MPAMBA')) {
+    define('PAYMENT_METHOD_TNM_MPAMBA', 'tnm_mpamba');
+}
+if (!defined('PAYMENT_METHOD_BANK_TRANSFER')) {
+    define('PAYMENT_METHOD_BANK_TRANSFER', 'bank_transfer');
+}
+
+/*********************************
+ * DROPX PAYMENT DETAILS (for aggregator model)
+ * Customer pays to Dropx, Dropx pays merchants later
+ *********************************/
+define('DROPX_BANK_NAME', 'NBS Bank');
+define('DROPX_BANK_ACCOUNT_NAME', 'DROPX LIMITED');
+define('DROPX_BANK_ACCOUNT_NUMBER', '1234567890');
+define('DROPX_AIRTEL_MONEY_NUMBER', '0999000000');
+define('DROPX_TNM_MPAMBA_NUMBER', '0888000000');
 
 /*********************************
  * AUTHENTICATION
@@ -89,7 +111,8 @@ function getActiveCart($conn, $userId) {
 }
 
 /*********************************
- * GET CART ITEMS WITH MERCHANT - FIXED COLUMN NAME
+ * GET CART ITEMS WITH MERCHANT
+ * No bank columns needed - payments go to Dropx, not merchants
  *********************************/
 function getCartItemsWithMerchant($conn, $cartId) {
     $stmt = $conn->prepare(
@@ -104,9 +127,6 @@ function getCartItemsWithMerchant($conn, $cartId) {
             m.name as merchant_name,
             m.delivery_fee as merchant_delivery_fee,
             m.min_order_amount as merchant_minimum,
-            m.bank_account_name,
-            m.bank_account_number,
-            m.bank_name,
             m.preparation_time_minutes
          FROM cart_items ci
          JOIN menu_items mi ON ci.menu_item_id = mi.id
@@ -131,12 +151,6 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
     $deliveryFee = floatval($items[0]['merchant_delivery_fee'] ?? 1500.00);
     $minimumOrder = floatval($items[0]['merchant_minimum'] ?? 0);
     $prepTime = $items[0]['preparation_time_minutes'] ?? 20;
-    
-    $bankDetails = [
-        'bank_name' => $items[0]['bank_name'] ?? null,
-        'account_name' => $items[0]['bank_account_name'] ?? null,
-        'account_number' => $items[0]['bank_account_number'] ?? null
-    ];
     
     // Calculate subtotal
     $subtotal = 0;
@@ -201,7 +215,6 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
             'minimum_met' => $minimumMet,
             'shortfall' => $shortfall,
             'shortfall_formatted' => 'MK' . number_format($shortfall, 2),
-            'bank_details' => $bankDetails,
             'preparation_time' => $prepTime
         ],
         'items' => $formattedItems,
@@ -305,9 +318,10 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
             "INSERT INTO order_tracking (order_id, status, estimated_delivery)
              VALUES (:order_id, 'Order placed', :estimated)"
         );
+        $estimatedDelivery = date('Y-m-d H:i:s', strtotime('+45 minutes'));
         $trackStmt->execute([
             ':order_id' => $orderId,
-            ':estimated' => date('Y-m-d H:i:s', strtotime('+45 minutes'))
+            ':estimated' => $estimatedDelivery
         ]);
         
         // Clear cart
@@ -387,7 +401,7 @@ try {
         // Get user address
         $address = getUserDefaultAddress($conn, $userId);
         
-        // Return checkout data
+        // Return checkout data with Dropx payment details (aggregator model)
         ResponseHandler::success([
             'cart_id' => $cart['id'],
             'order_data' => [
@@ -433,30 +447,36 @@ try {
                     'name' => 'Airtel Money',
                     'type' => 'mobile_money',
                     'icon' => 'airtel',
-                    'description' => 'Pay using Airtel Money',
+                    'description' => 'Pay to Dropx Airtel Money',
                     'provider' => 'Airtel Malawi',
                     'min_amount' => 100,
-                    'max_amount' => 1000000
+                    'max_amount' => 1000000,
+                    'dropx_number' => DROPX_AIRTEL_MONEY_NUMBER
                 ],
                 [
                     'id' => PAYMENT_METHOD_TNM_MPAMBA,
                     'name' => 'TNM Mpamba',
                     'type' => 'mobile_money',
                     'icon' => 'tnm',
-                    'description' => 'Pay using TNM Mpamba',
+                    'description' => 'Pay to Dropx TNM Mpamba',
                     'provider' => 'TNM',
                     'min_amount' => 100,
-                    'max_amount' => 1000000
+                    'max_amount' => 1000000,
+                    'dropx_number' => DROPX_TNM_MPAMBA_NUMBER
                 ],
                 [
                     'id' => PAYMENT_METHOD_BANK_TRANSFER,
                     'name' => 'Bank Transfer',
                     'type' => 'bank',
                     'icon' => 'bank',
-                    'description' => 'Pay via bank transfer',
+                    'description' => 'Pay via bank transfer to Dropx',
                     'min_amount' => 1000,
                     'max_amount' => 10000000,
-                    'merchant_bank' => $totals['merchant']['bank_details']
+                    'bank_details' => [
+                        'bank_name' => DROPX_BANK_NAME,
+                        'account_name' => DROPX_BANK_ACCOUNT_NAME,
+                        'account_number' => DROPX_BANK_ACCOUNT_NUMBER
+                    ]
                 ]
             ]
         ]);
