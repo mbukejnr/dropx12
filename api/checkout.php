@@ -235,7 +235,7 @@ function getUserDefaultAddress($conn, $userId) {
 }
 
 /*********************************
- * CREATE ORDER - Fixed status enum values
+ * CREATE ORDER - Matches actual table structure
  *********************************/
 function createOrder($conn, $userId, $cartId, $totals, $address) {
     // Generate order number
@@ -245,7 +245,7 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
     $conn->beginTransaction();
     
     try {
-        // Create order - using correct enum values from your table
+        // Create order
         $stmt = $conn->prepare(
             "INSERT INTO orders 
                 (order_number, user_id, merchant_id, merchant_name,
@@ -281,23 +281,32 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
         $stmt->execute($params);
         $orderId = $conn->lastInsertId();
         
-        // Rest of the function remains the same...
-        // Add order items
+        // Add order items - matching your exact table structure
         $itemStmt = $conn->prepare(
             "INSERT INTO order_items 
-                (order_id, menu_item_id, item_name, quantity, unit_price, total_price)
+                (order_id, item_name, quantity, price, total,
+                 special_instructions, variant_data, add_ons_json, selected_options)
              VALUES 
-                (:order_id, :menu_item_id, :item_name, :quantity, :unit_price, :total_price)"
+                (:order_id, :item_name, :quantity, :price, :total,
+                 :special_instructions, :variant_data, :add_ons_json, :selected_options)"
         );
         
         foreach ($totals['items'] as $item) {
+            // Prepare JSON data if available
+            $variantData = isset($item['variant_data']) ? json_encode($item['variant_data']) : null;
+            $addOnsJson = isset($item['add_ons']) ? json_encode($item['add_ons']) : null;
+            $selectedOptions = isset($item['selected_options']) ? json_encode($item['selected_options']) : null;
+            
             $itemStmt->execute([
                 ':order_id' => $orderId,
-                ':menu_item_id' => $item['menu_item_id'],
                 ':item_name' => $item['name'],
                 ':quantity' => $item['quantity'],
-                ':unit_price' => $item['price'],
-                ':total_price' => $item['total']
+                ':price' => $item['price'],
+                ':total' => $item['total'],
+                ':special_instructions' => $item['notes'] ?? '',
+                ':variant_data' => $variantData,
+                ':add_ons_json' => $addOnsJson,
+                ':selected_options' => $selectedOptions
             ]);
         }
         
