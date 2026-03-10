@@ -234,8 +234,8 @@ function getUserDefaultAddress($conn, $userId) {
     return $stmt->fetch(PDO::FETCH_ASSOC);
 }
 
-/*********************************
- * CREATE ORDER - Clean version (no tips, no service fee, no tax)
+//*********************************
+ * CREATE ORDER - Fixed status enum values
  *********************************/
 function createOrder($conn, $userId, $cartId, $totals, $address) {
     // Generate order number
@@ -245,7 +245,7 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
     $conn->beginTransaction();
     
     try {
-        // Create order - only columns that exist in your table
+        // Create order - using correct enum values from your table
         $stmt = $conn->prepare(
             "INSERT INTO orders 
                 (order_number, user_id, merchant_id, merchant_name,
@@ -256,7 +256,7 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
                 (:order_number, :user_id, :merchant_id, :merchant_name,
                  :subtotal, :delivery_fee, :discount, :total_amount,
                  :delivery_address, :special_instructions, :preparation_time,
-                 'pending', 'pending_payment', NOW(), NOW())"
+                 'pending', 'pending', NOW(), NOW())"
         );
         
         $deliveryAddress = $address ? $address['address_line1'] . ', ' . $address['city'] : 'Address not set';
@@ -281,6 +281,7 @@ function createOrder($conn, $userId, $cartId, $totals, $address) {
         $stmt->execute($params);
         $orderId = $conn->lastInsertId();
         
+        // Rest of the function remains the same...
         // Add order items
         $itemStmt = $conn->prepare(
             "INSERT INTO order_items 
