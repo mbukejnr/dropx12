@@ -496,17 +496,31 @@ function getCartItemAddOns($conn, $cartItemId) {
 }
 
 /*********************************
- * GET CART PROMOTION
+ * GET CART PROMOTION - FIXED
  *********************************/
 function getCartPromotion($conn, $cartId) {
     $stmt = $conn->prepare(
-        "SELECT cp.*, p.code, p.name, p.description, p.discount_type, p.discount_value
+        "SELECT cp.*, 
+                p.id as promotion_id,
+                p.title as name, 
+                p.description, 
+                p.discount_type, 
+                p.discount_value,
+                p.min_order_amount,
+                p.start_date,
+                p.end_date,
+                p.is_active
          FROM cart_promotions cp
          LEFT JOIN promotions p ON cp.promotion_id = p.id
          WHERE cp.cart_id = :cart_id"
     );
     $stmt->execute([':cart_id' => $cartId]);
-    return $stmt->fetch(PDO::FETCH_ASSOC);
+    $result = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    // Debug log to see what's returned
+    error_log("getCartPromotion result: " . json_encode($result));
+    
+    return $result;
 }
 
 /*********************************
@@ -644,7 +658,7 @@ function handlePostRequest($path, $data) {
 }
 
 /*********************************
- * ADD ITEM TO CART (MENU ITEM)
+ * ADD ITEM TO CART (MENU ITEM) - FIXED measurement_type
  *********************************/
 function addItemToCart($conn, $data, $userId, $sessionId, $baseUrl) {
     $menuItemId = $data['menu_item_id'] ?? null;
@@ -771,7 +785,7 @@ function addItemToCart($conn, $data, $userId, $sessionId, $baseUrl) {
             ':price' => $item['price'],
             ':image_url' => $item['image_url'],
             ':quantity' => $quantity,
-            ':measurement_type' => $item['measurement_type'] ?? 'quantity',
+            ':measurement_type' => $item['measurement_type'] ?? 'count', // CHANGED from 'quantity' to 'count'
             ':unit' => $item['unit'] ?? null,
             ':quantity_value' => $item['quantity_value'] ?? null,
             ':custom_unit' => $item['custom_unit'] ?? null,
@@ -808,7 +822,7 @@ function addItemToCart($conn, $data, $userId, $sessionId, $baseUrl) {
 }
 
 /*********************************
- * ADD QUICK ORDER TO CART
+ * ADD QUICK ORDER TO CART - FIXED measurement_type
  *********************************/
 function addQuickOrderToCart($conn, $data, $userId, $sessionId, $baseUrl) {
     $quickOrderId = $data['quick_order_id'] ?? null;
@@ -1007,7 +1021,7 @@ function addQuickOrderToCart($conn, $data, $userId, $sessionId, $baseUrl) {
             ':price' => $finalPrice,
             ':image_url' => $selectedItem['item_image'],
             ':quantity' => $quantity,
-            ':measurement_type' => $selectedItem['measurement_type'] ?? 'quantity',
+            ':measurement_type' => $selectedItem['measurement_type'] ?? 'count', // CHANGED from 'quantity' to 'count'
             ':unit' => $selectedItem['unit'] ?? null,
             ':quantity_value' => $selectedItem['item_quantity'] ?? null,
             ':custom_unit' => $selectedItem['custom_unit'] ?? null,
@@ -1259,27 +1273,22 @@ function clearCart($conn, $data, $userId, $sessionId) {
 }
 
 /*********************************
- * APPLY PROMOTION TO CART
+ * APPLY PROMOTION TO CART - FIXED
  *********************************/
 function applyPromotionToCart($conn, $data, $userId, $sessionId) {
     $promotionId = $data['promotion_id'] ?? null;
     $promoCode = $data['promo_code'] ?? null;
     
-    if (!$promotionId && !$promoCode) {
-        ResponseHandler::error('Promotion ID or code is required', 400);
+    // For now, we'll only support promotion by ID since 'code' column doesn't exist
+    if (!$promotionId) {
+        ResponseHandler::error('Promotion ID is required (promo codes not supported yet)', 400);
     }
     
     $cart = getOrCreateUserCart($conn, $userId, $sessionId);
     
-    // Get promotion
-    if ($promotionId) {
-        $promoStmt = $conn->prepare("SELECT * FROM promotions WHERE id = :id AND is_active = 1");
-        $promoStmt->execute([':id' => $promotionId]);
-    } else {
-        $promoStmt = $conn->prepare("SELECT * FROM promotions WHERE code = :code AND is_active = 1");
-        $promoStmt->execute([':code' => $promoCode]);
-    }
-    
+    // Get promotion by ID only
+    $promoStmt = $conn->prepare("SELECT * FROM promotions WHERE id = :id AND is_active = 1");
+    $promoStmt->execute([':id' => $promotionId]);
     $promotion = $promoStmt->fetch(PDO::FETCH_ASSOC);
     
     if (!$promotion) {
@@ -1338,8 +1347,8 @@ function applyPromotionToCart($conn, $data, $userId, $sessionId) {
         'data' => [
             'promotion' => [
                 'id' => $promotion['id'],
-                'code' => $promotion['code'],
-                'name' => $promotion['name'],
+                'name' => $promotion['title'], // Using title instead of code/name
+                'description' => $promotion['description'],
                 'discount_type' => $promotion['discount_type'],
                 'discount_value' => floatval($promotion['discount_value']),
                 'discount_amount' => $discountAmount
@@ -1559,7 +1568,7 @@ function formatCartItemData($item, $baseUrl) {
         'item_type' => $item['item_type'] ?? 'food',
         
         // Unit info
-        'measurement_type' => $item['measurement_type'] ?? 'quantity',
+        'measurement_type' => $item['measurement_type'] ?? 'count',
         'unit' => $item['unit'] ?? null,
         'quantity_value' => $item['quantity_value'] ?? $item['item_quantity_value'] ?? null,
         'custom_unit' => $item['custom_unit'] ?? null,
