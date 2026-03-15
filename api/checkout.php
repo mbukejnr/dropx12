@@ -111,7 +111,7 @@ function getActiveCart($conn, $userId) {
 }
 
 /*********************************
- * GET CART ITEMS WITH MERCHANT
+ * GET CART ITEMS WITH MERCHANT - FIXED
  *********************************/
 function getCartItemsWithMerchant($conn, $cartId) {
     $stmt = $conn->prepare(
@@ -127,7 +127,7 @@ function getCartItemsWithMerchant($conn, $cartId) {
             ci.merchant_min_order as merchant_minimum,
             ci.preparation_time,
             ci.variant_data,
-            ci.add_ons,
+            ci.add_ons_json as add_ons,  -- FIXED: Changed from add_ons to add_ons_json
             ci.selected_options,
             ci.special_instructions
          FROM cart_items ci
@@ -174,7 +174,7 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
             'formatted_price' => 'MK' . number_format($item['price'], 2),
             'formatted_total' => 'MK' . number_format($itemTotal, 2),
             'variant_data' => $item['variant_data'],
-            'add_ons' => $item['add_ons'],
+            'add_ons' => $item['add_ons'], // Now this works because of the alias
             'selected_options' => $item['selected_options'],
             'notes' => $item['special_instructions'] ?? ''
         ];
@@ -239,12 +239,12 @@ function getUserDefaultAddress($conn, $userId) {
 }
 
 /*********************************
- * GET WALLET BALANCE (SAFE VERSION)
+ * GET WALLET BALANCE - FIXED (uses dropx_wallets table)
  *********************************/
 function getWalletBalance($conn, $userId) {
     try {
-        // Check if wallets table exists
-        $tableCheck = $conn->query("SHOW TABLES LIKE 'wallets'");
+        // Check if dropx_wallets table exists
+        $tableCheck = $conn->query("SHOW TABLES LIKE 'dropx_wallets'");
         if ($tableCheck->rowCount() == 0) {
             return [
                 'exists' => false,
@@ -253,7 +253,7 @@ function getWalletBalance($conn, $userId) {
             ];
         }
         
-        $stmt = $conn->prepare("SELECT balance FROM wallets WHERE user_id = :user_id AND is_active = 1");
+        $stmt = $conn->prepare("SELECT balance FROM dropx_wallets WHERE user_id = :user_id AND is_active = 1");
         $stmt->execute([':user_id' => $userId]);
         $wallet = $stmt->fetch(PDO::FETCH_ASSOC);
         
@@ -271,7 +271,7 @@ function getWalletBalance($conn, $userId) {
             'balance_formatted' => 'MK0.00'
         ];
     } catch (Exception $e) {
-        // Table doesn't exist or other error
+        error_log("Wallet balance error: " . $e->getMessage());
         return [
             'exists' => false,
             'balance' => 0,
@@ -408,7 +408,7 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
                 ':total' => $item['total'],
                 ':special_instructions' => $item['notes'] ?? '',
                 ':variant_data' => $variantData,
-                ':add_ons_json' => $addOnsJson,
+                ':add_ons_json' => $addOnsJson, // FIXED: Using add_ons_json column name
                 ':selected_options' => $selectedOptions
             ]);
         }
