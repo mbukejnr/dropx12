@@ -68,7 +68,7 @@ define('DROPX_AIRTEL_MONEY_NUMBER', '0999000000');
 define('DROPX_TNM_MPAMBA_NUMBER', '0888000000');
 
 /*********************************
- * ORDER STATUS CONSTANTS - Match your ENUM
+ * ORDER STATUS CONSTANTS - EXACTLY matching your ENUM
  *********************************/
 if (!defined('ORDER_STATUS_PENDING')) {
     define('ORDER_STATUS_PENDING', 'pending');
@@ -84,7 +84,7 @@ if (!defined('ORDER_STATUS_SUCCESS')) {
 }
 
 /*********************************
- * PAYMENT STATUS CONSTANTS - Match your ENUM
+ * PAYMENT STATUS CONSTANTS - EXACTLY matching your ENUM
  *********************************/
 if (!defined('PAYMENT_STATUS_PENDING')) {
     define('PAYMENT_STATUS_PENDING', 'pending');
@@ -226,7 +226,7 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
     $cartData = $cartStmt->fetch(PDO::FETCH_ASSOC);
     $discount = floatval($cartData['applied_discount'] ?? 0);
     
-    // Total = subtotal + delivery fee - discount (no tip_amount as per Malawi market)
+    // Total = subtotal + delivery fee - discount
     $totalAmount = ($subtotal + $deliveryFee) - $discount;
     
     return [
@@ -372,7 +372,7 @@ function processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails
 }
 
 /*********************************
- * CREATE ORDER AFTER PAYMENT - UPDATED TO MATCH YOUR TABLE STRUCTURE
+ * CREATE ORDER AFTER PAYMENT - FIXED for your ENUM values
  *********************************/
 function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $paymentMethod, $transactionId, $reference) {
     // Generate order number
@@ -382,7 +382,22 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
     $conn->beginTransaction();
     
     try {
-        // Create order - UPDATED to match your exact table structure
+        // VALIDATE STATUS VALUES - ONLY use values from your ENUM
+        $validPaymentStatuses = ['pending', 'paid', 'failed', 'refunded'];
+        $validOrderStatuses = ['pending', 'paid', 'failed', 'success'];
+        
+        $paymentStatus = PAYMENT_STATUS_PAID; // 'paid'
+        $orderStatus = ORDER_STATUS_SUCCESS; // 'success'
+        
+        // Double-check they're valid
+        if (!in_array($paymentStatus, $validPaymentStatuses)) {
+            throw new Exception("Invalid payment status: $paymentStatus");
+        }
+        if (!in_array($orderStatus, $validOrderStatuses)) {
+            throw new Exception("Invalid order status: $orderStatus");
+        }
+        
+        // Create order - with explicit status values
         $stmt = $conn->prepare(
             "INSERT INTO orders 
                 (order_number, user_id, merchant_id, merchant_name,
@@ -410,11 +425,6 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
             }
         }
         
-        // IMPORTANT: Using 'paid' for payment_status and 'success' for status
-        // This matches your ENUM definitions: 
-        // payment_status: pending, paid, failed, refunded
-        // status: pending, paid, failed, success
-        
         $params = [
             ':order_number' => $orderNumber,
             ':user_id' => $userId,
@@ -429,16 +439,19 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
             ':payment_method' => $paymentMethod,
             ':transaction_id' => $transactionId,
             ':reference' => $reference,
-            ':payment_status' => PAYMENT_STATUS_PAID, // 'paid'
-            ':status' => ORDER_STATUS_SUCCESS, // 'success' - this is what your code was trying to do with 'confirmed'
+            ':payment_status' => 'paid', // Explicitly 'paid' from your ENUM
+            ':status' => 'success', // Explicitly 'success' from your ENUM
             ':special_instructions' => $specialInstructions,
             ':preparation_time' => $totals['merchant']['preparation_time'] ?? null
         ];
         
+        // Log the params for debugging
+        error_log("Creating order with params: " . json_encode($params));
+        
         $stmt->execute($params);
         $orderId = $conn->lastInsertId();
         
-        // Add order items - UPDATED to match your order_items table structure
+        // Add order items
         $itemStmt = $conn->prepare(
             "INSERT INTO order_items 
                 (order_id, item_name, quantity, price, total,
@@ -503,6 +516,7 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
     } catch (Exception $e) {
         $conn->rollBack();
         error_log("Order creation error: " . $e->getMessage());
+        error_log("Error trace: " . $e->getTraceAsString());
         return [
             'success' => false,
             'message' => $e->getMessage()
@@ -690,7 +704,7 @@ try {
     }
     
     /*********************************
-     * CREATE ORDER AFTER PAYMENT (POST with action)
+     * CREATE ORDER AFTER PAYMENT (POST with action) - FIXED
      *********************************/
     elseif ($method === 'POST' && isset($input['action']) && $input['action'] === 'create_order') {
         
@@ -734,7 +748,8 @@ try {
                     'id' => $totals['merchant']['id'],
                     'name' => $totals['merchant']['name']
                 ],
-                'status' => ORDER_STATUS_SUCCESS // 'success'
+                'status' => 'success', // Explicitly 'success'
+                'payment_status' => 'paid' // Explicitly 'paid'
             ], 'Order created successfully');
         } else {
             ResponseHandler::error('Failed to create order: ' . $order['message'], 500);
@@ -742,13 +757,13 @@ try {
     }
     
     /*********************************
-     * UPDATE PAYMENT STATUS (PUT) - UPDATED to match your ENUMs
+     * UPDATE PAYMENT STATUS (PUT) - FIXED for your ENUMs
      *********************************/
     elseif ($method === 'PUT' && isset($input['action']) && $input['action'] === 'payment_status') {
         
         $orderId = $input['order_id'] ?? null;
         $paymentMethod = $input['payment_method'] ?? null;
-        $paymentStatus = $input['payment_status'] ?? PAYMENT_STATUS_PAID;
+        $paymentStatus = $input['payment_status'] ?? 'paid';
         
         if (!$orderId || !$paymentMethod) {
             ResponseHandler::error('Order ID and payment method required', 400);
@@ -762,8 +777,16 @@ try {
             ResponseHandler::error('Order not found', 404);
         }
         
-        if ($paymentStatus === PAYMENT_STATUS_PAID) {
-            // Update order to paid - using your ENUM values
+        // Validate payment status
+        $validPaymentStatuses = ['pending', 'paid', 'failed', 'refunded'];
+        $validOrderStatuses = ['pending', 'paid', 'failed', 'success'];
+        
+        if (!in_array($paymentStatus, $validPaymentStatuses)) {
+            ResponseHandler::error("Invalid payment status. Must be one of: " . implode(', ', $validPaymentStatuses), 400);
+        }
+        
+        if ($paymentStatus === 'paid') {
+            // Update order to paid
             $stmt = $conn->prepare(
                 "UPDATE orders 
                  SET payment_status = :payment_status, 
@@ -773,19 +796,19 @@ try {
             );
             $stmt->execute([
                 ':id' => $orderId,
-                ':payment_status' => PAYMENT_STATUS_PAID, // 'paid'
-                ':status' => ORDER_STATUS_SUCCESS // 'success'
+                ':payment_status' => 'paid',
+                ':status' => 'success'
             ]);
             
             ResponseHandler::success([
                 'order_id' => $orderId,
                 'payment_method' => $paymentMethod,
-                'payment_status' => PAYMENT_STATUS_PAID,
-                'status' => ORDER_STATUS_SUCCESS
+                'payment_status' => 'paid',
+                'status' => 'success'
             ], 'Payment confirmed');
             
-        } elseif ($paymentStatus === PAYMENT_STATUS_FAILED) {
-            // Payment failed - update status
+        } elseif ($paymentStatus === 'failed') {
+            // Payment failed
             $stmt = $conn->prepare(
                 "UPDATE orders 
                  SET payment_status = :payment_status, 
@@ -795,27 +818,54 @@ try {
             );
             $stmt->execute([
                 ':id' => $orderId,
-                ':payment_status' => PAYMENT_STATUS_FAILED, // 'failed'
-                ':status' => ORDER_STATUS_FAILED // 'failed'
+                ':payment_status' => 'failed',
+                ':status' => 'failed'
             ]);
             
             ResponseHandler::success([
                 'order_id' => $orderId,
-                'payment_status' => PAYMENT_STATUS_FAILED,
-                'status' => ORDER_STATUS_FAILED
+                'payment_status' => 'failed',
+                'status' => 'failed'
             ], 'Payment failed');
             
-        } else {
-            // Other status updates
+        } elseif ($paymentStatus === 'refunded') {
+            // Payment refunded
             $stmt = $conn->prepare(
-                "UPDATE orders SET updated_at = NOW() WHERE id = :id"
+                "UPDATE orders 
+                 SET payment_status = :payment_status, 
+                     status = :status, 
+                     updated_at = NOW() 
+                 WHERE id = :id"
             );
-            $stmt->execute([':id' => $orderId]);
+            $stmt->execute([
+                ':id' => $orderId,
+                ':payment_status' => 'refunded',
+                ':status' => 'failed' // or could be 'pending' - adjust as needed
+            ]);
             
             ResponseHandler::success([
                 'order_id' => $orderId,
-                'status' => 'updated'
-            ], 'Order updated');
+                'payment_status' => 'refunded',
+                'status' => 'failed'
+            ], 'Payment refunded');
+            
+        } else {
+            // Just update payment status
+            $stmt = $conn->prepare(
+                "UPDATE orders 
+                 SET payment_status = :payment_status, 
+                     updated_at = NOW() 
+                 WHERE id = :id"
+            );
+            $stmt->execute([
+                ':id' => $orderId,
+                ':payment_status' => $paymentStatus
+            ]);
+            
+            ResponseHandler::success([
+                'order_id' => $orderId,
+                'payment_status' => $paymentStatus
+            ], 'Payment status updated');
         }
     }
     
@@ -828,6 +878,7 @@ try {
     
 } catch (Exception $e) {
     error_log("Checkout error: " . $e->getMessage());
+    error_log("Error trace: " . $e->getTraceAsString());
     ResponseHandler::error('Server error: ' . $e->getMessage(), 500);
 }
 ?>
