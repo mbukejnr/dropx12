@@ -68,6 +68,38 @@ define('DROPX_AIRTEL_MONEY_NUMBER', '0999000000');
 define('DROPX_TNM_MPAMBA_NUMBER', '0888000000');
 
 /*********************************
+ * ORDER STATUS CONSTANTS - Match your ENUM
+ *********************************/
+if (!defined('ORDER_STATUS_PENDING')) {
+    define('ORDER_STATUS_PENDING', 'pending');
+}
+if (!defined('ORDER_STATUS_PAID')) {
+    define('ORDER_STATUS_PAID', 'paid');
+}
+if (!defined('ORDER_STATUS_FAILED')) {
+    define('ORDER_STATUS_FAILED', 'failed');
+}
+if (!defined('ORDER_STATUS_SUCCESS')) {
+    define('ORDER_STATUS_SUCCESS', 'success');
+}
+
+/*********************************
+ * PAYMENT STATUS CONSTANTS - Match your ENUM
+ *********************************/
+if (!defined('PAYMENT_STATUS_PENDING')) {
+    define('PAYMENT_STATUS_PENDING', 'pending');
+}
+if (!defined('PAYMENT_STATUS_PAID')) {
+    define('PAYMENT_STATUS_PAID', 'paid');
+}
+if (!defined('PAYMENT_STATUS_FAILED')) {
+    define('PAYMENT_STATUS_FAILED', 'failed');
+}
+if (!defined('PAYMENT_STATUS_REFUNDED')) {
+    define('PAYMENT_STATUS_REFUNDED', 'refunded');
+}
+
+/*********************************
  * AUTHENTICATION
  *********************************/
 function authenticateUser($conn) {
@@ -111,7 +143,7 @@ function getActiveCart($conn, $userId) {
 }
 
 /*********************************
- * GET CART ITEMS WITH MERCHANT - FIXED
+ * GET CART ITEMS WITH MERCHANT
  *********************************/
 function getCartItemsWithMerchant($conn, $cartId) {
     $stmt = $conn->prepare(
@@ -127,7 +159,7 @@ function getCartItemsWithMerchant($conn, $cartId) {
             ci.merchant_min_order as merchant_minimum,
             ci.preparation_time,
             ci.variant_data,
-            ci.add_ons_json as add_ons,  -- FIXED: Changed from add_ons to add_ons_json
+            ci.add_ons_json as add_ons,
             ci.selected_options,
             ci.special_instructions
          FROM cart_items ci
@@ -174,7 +206,7 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
             'formatted_price' => 'MK' . number_format($item['price'], 2),
             'formatted_total' => 'MK' . number_format($itemTotal, 2),
             'variant_data' => $item['variant_data'],
-            'add_ons' => $item['add_ons'], // Now this works because of the alias
+            'add_ons' => $item['add_ons'],
             'selected_options' => $item['selected_options'],
             'notes' => $item['special_instructions'] ?? ''
         ];
@@ -194,7 +226,7 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
     $cartData = $cartStmt->fetch(PDO::FETCH_ASSOC);
     $discount = floatval($cartData['applied_discount'] ?? 0);
     
-    // Total = subtotal + delivery fee - discount
+    // Total = subtotal + delivery fee - discount (no tip_amount as per Malawi market)
     $totalAmount = ($subtotal + $deliveryFee) - $discount;
     
     return [
@@ -239,7 +271,7 @@ function getUserDefaultAddress($conn, $userId) {
 }
 
 /*********************************
- * GET WALLET BALANCE - FIXED (uses dropx_wallets table)
+ * GET WALLET BALANCE
  *********************************/
 function getWalletBalance($conn, $userId) {
     try {
@@ -340,7 +372,7 @@ function processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails
 }
 
 /*********************************
- * CREATE ORDER AFTER PAYMENT
+ * CREATE ORDER AFTER PAYMENT - UPDATED TO MATCH YOUR TABLE STRUCTURE
  *********************************/
 function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $paymentMethod, $transactionId, $reference) {
     // Generate order number
@@ -350,22 +382,38 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
     $conn->beginTransaction();
     
     try {
-        // Create order
+        // Create order - UPDATED to match your exact table structure
         $stmt = $conn->prepare(
             "INSERT INTO orders 
                 (order_number, user_id, merchant_id, merchant_name,
                  subtotal, delivery_fee, discount_amount, total_amount,
-                 delivery_address, payment_method, transaction_id, reference,
-                 payment_status, status, created_at, updated_at)
+                 delivery_address, delivery_address_id, payment_method, 
+                 transaction_id, reference, payment_status, status, 
+                 special_instructions, preparation_time, created_at, updated_at)
              VALUES 
                 (:order_number, :user_id, :merchant_id, :merchant_name,
                  :subtotal, :delivery_fee, :discount, :total_amount,
-                 :delivery_address, :payment_method, :transaction_id, :reference,
-                 'paid', 'confirmed', NOW(), NOW())"
+                 :delivery_address, :delivery_address_id, :payment_method,
+                 :transaction_id, :reference, :payment_status, :status,
+                 :special_instructions, :preparation_time, NOW(), NOW())"
         );
         
         $deliveryAddress = $address ? $address['address_line1'] . ', ' . $address['city'] : 'Address not set';
+        $deliveryAddressId = $address ? $address['id'] : null;
         $merchantName = $totals['merchant']['name'] ?? '';
+        
+        // Collect special instructions from items
+        $specialInstructions = '';
+        foreach ($totals['items'] as $item) {
+            if (!empty($item['notes'])) {
+                $specialInstructions .= $item['name'] . ': ' . $item['notes'] . "\n";
+            }
+        }
+        
+        // IMPORTANT: Using 'paid' for payment_status and 'success' for status
+        // This matches your ENUM definitions: 
+        // payment_status: pending, paid, failed, refunded
+        // status: pending, paid, failed, success
         
         $params = [
             ':order_number' => $orderNumber,
@@ -377,15 +425,20 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
             ':discount' => $totals['discount'],
             ':total_amount' => $totals['total_amount'],
             ':delivery_address' => $deliveryAddress,
+            ':delivery_address_id' => $deliveryAddressId,
             ':payment_method' => $paymentMethod,
             ':transaction_id' => $transactionId,
-            ':reference' => $reference
+            ':reference' => $reference,
+            ':payment_status' => PAYMENT_STATUS_PAID, // 'paid'
+            ':status' => ORDER_STATUS_SUCCESS, // 'success' - this is what your code was trying to do with 'confirmed'
+            ':special_instructions' => $specialInstructions,
+            ':preparation_time' => $totals['merchant']['preparation_time'] ?? null
         ];
         
         $stmt->execute($params);
         $orderId = $conn->lastInsertId();
         
-        // Add order items
+        // Add order items - UPDATED to match your order_items table structure
         $itemStmt = $conn->prepare(
             "INSERT INTO order_items 
                 (order_id, item_name, quantity, price, total,
@@ -408,7 +461,7 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
                 ':total' => $item['total'],
                 ':special_instructions' => $item['notes'] ?? '',
                 ':variant_data' => $variantData,
-                ':add_ons_json' => $addOnsJson, // FIXED: Using add_ons_json column name
+                ':add_ons_json' => $addOnsJson,
                 ':selected_options' => $selectedOptions
             ]);
         }
@@ -559,7 +612,7 @@ try {
                     'name' => 'DropX Wallet',
                     'type' => 'wallet',
                     'icon' => 'wallet',
-                    'description' => 'Pay using your DropXWallet balance'
+                    'description' => 'Pay using your DropX Wallet balance'
                 ],
                 [
                     'id' => PAYMENT_METHOD_AIRTEL_MONEY,
@@ -680,7 +733,8 @@ try {
                 'merchant' => [
                     'id' => $totals['merchant']['id'],
                     'name' => $totals['merchant']['name']
-                ]
+                ],
+                'status' => ORDER_STATUS_SUCCESS // 'success'
             ], 'Order created successfully');
         } else {
             ResponseHandler::error('Failed to create order: ' . $order['message'], 500);
@@ -688,13 +742,13 @@ try {
     }
     
     /*********************************
-     * UPDATE PAYMENT STATUS (PUT)
+     * UPDATE PAYMENT STATUS (PUT) - UPDATED to match your ENUMs
      *********************************/
     elseif ($method === 'PUT' && isset($input['action']) && $input['action'] === 'payment_status') {
         
         $orderId = $input['order_id'] ?? null;
         $paymentMethod = $input['payment_method'] ?? null;
-        $paymentStatus = $input['payment_status'] ?? 'paid';
+        $paymentStatus = $input['payment_status'] ?? PAYMENT_STATUS_PAID;
         
         if (!$orderId || !$paymentMethod) {
             ResponseHandler::error('Order ID and payment method required', 400);
@@ -708,32 +762,60 @@ try {
             ResponseHandler::error('Order not found', 404);
         }
         
-        if ($paymentStatus === 'paid') {
-            // Update order to paid
+        if ($paymentStatus === PAYMENT_STATUS_PAID) {
+            // Update order to paid - using your ENUM values
             $stmt = $conn->prepare(
                 "UPDATE orders 
-                 SET payment_status = 'paid', status = 'confirmed', updated_at = NOW()
+                 SET payment_status = :payment_status, 
+                     status = :status, 
+                     updated_at = NOW()
                  WHERE id = :id"
             );
-            $stmt->execute([':id' => $orderId]);
+            $stmt->execute([
+                ':id' => $orderId,
+                ':payment_status' => PAYMENT_STATUS_PAID, // 'paid'
+                ':status' => ORDER_STATUS_SUCCESS // 'success'
+            ]);
             
             ResponseHandler::success([
                 'order_id' => $orderId,
                 'payment_method' => $paymentMethod,
-                'status' => 'confirmed'
+                'payment_status' => PAYMENT_STATUS_PAID,
+                'status' => ORDER_STATUS_SUCCESS
             ], 'Payment confirmed');
             
-        } else {
-            // Payment failed - cancel order
+        } elseif ($paymentStatus === PAYMENT_STATUS_FAILED) {
+            // Payment failed - update status
             $stmt = $conn->prepare(
-                "UPDATE orders SET status = 'cancelled', updated_at = NOW() WHERE id = :id"
+                "UPDATE orders 
+                 SET payment_status = :payment_status, 
+                     status = :status, 
+                     updated_at = NOW() 
+                 WHERE id = :id"
+            );
+            $stmt->execute([
+                ':id' => $orderId,
+                ':payment_status' => PAYMENT_STATUS_FAILED, // 'failed'
+                ':status' => ORDER_STATUS_FAILED // 'failed'
+            ]);
+            
+            ResponseHandler::success([
+                'order_id' => $orderId,
+                'payment_status' => PAYMENT_STATUS_FAILED,
+                'status' => ORDER_STATUS_FAILED
+            ], 'Payment failed');
+            
+        } else {
+            // Other status updates
+            $stmt = $conn->prepare(
+                "UPDATE orders SET updated_at = NOW() WHERE id = :id"
             );
             $stmt->execute([':id' => $orderId]);
             
             ResponseHandler::success([
                 'order_id' => $orderId,
-                'status' => 'cancelled'
-            ], 'Order cancelled');
+                'status' => 'updated'
+            ], 'Order updated');
         }
     }
     
