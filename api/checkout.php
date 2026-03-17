@@ -11,6 +11,11 @@ header("Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Device-ID, X-Platform, X-App-Version, X-Timestamp");
 header("Content-Type: application/json; charset=UTF-8");
 
+// Debug logging for status constants
+error_log("=== CHECKOUT.PHP INITIALIZED ===");
+error_log("ORDER_STATUS_SUCCESS = '" . (defined('ORDER_STATUS_SUCCESS') ? ORDER_STATUS_SUCCESS : 'not defined') . "'");
+error_log("PAYMENT_STATUS_PAID = '" . (defined('PAYMENT_STATUS_PAID') ? PAYMENT_STATUS_PAID : 'not defined') . "'");
+
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
     exit();
@@ -98,6 +103,12 @@ if (!defined('PAYMENT_STATUS_FAILED')) {
 if (!defined('PAYMENT_STATUS_REFUNDED')) {
     define('PAYMENT_STATUS_REFUNDED', 'refunded');
 }
+
+// Debug after defining constants
+error_log("After definition - ORDER_STATUS_SUCCESS = '" . ORDER_STATUS_SUCCESS . "' (length: " . strlen(ORDER_STATUS_SUCCESS) . ")");
+error_log("After definition - PAYMENT_STATUS_PAID = '" . PAYMENT_STATUS_PAID . "' (length: " . strlen(PAYMENT_STATUS_PAID) . ")");
+error_log("Hex of ORDER_STATUS_SUCCESS: " . bin2hex(ORDER_STATUS_SUCCESS));
+error_log("Hex of PAYMENT_STATUS_PAID: " . bin2hex(PAYMENT_STATUS_PAID));
 
 /*********************************
  * AUTHENTICATION
@@ -386,18 +397,25 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
         $validPaymentStatuses = ['pending', 'paid', 'failed', 'refunded'];
         $validOrderStatuses = ['pending', 'paid', 'failed', 'success'];
         
-        $paymentStatus = PAYMENT_STATUS_PAID; // 'paid'
-        $orderStatus = ORDER_STATUS_SUCCESS; // 'success'
+        $paymentStatus = PAYMENT_STATUS_PAID; // Should be 'paid'
+        $orderStatus = ORDER_STATUS_SUCCESS; // Should be 'success'
+        
+        // Debug logging
+        error_log("=== ORDER CREATION DEBUG ===");
+        error_log("Creating order - payment_status: '" . $paymentStatus . "' (length: " . strlen($paymentStatus) . ")");
+        error_log("Creating order - status: '" . $orderStatus . "' (length: " . strlen($orderStatus) . ")");
+        error_log("payment_status hex: " . bin2hex($paymentStatus));
+        error_log("status hex: " . bin2hex($orderStatus));
         
         // Double-check they're valid
         if (!in_array($paymentStatus, $validPaymentStatuses)) {
-            throw new Exception("Invalid payment status: $paymentStatus");
+            throw new Exception("Invalid payment status: '$paymentStatus' (hex: " . bin2hex($paymentStatus) . ") - must be one of: " . implode(', ', $validPaymentStatuses));
         }
         if (!in_array($orderStatus, $validOrderStatuses)) {
-            throw new Exception("Invalid order status: $orderStatus");
+            throw new Exception("Invalid order status: '$orderStatus' (hex: " . bin2hex($orderStatus) . ") - must be one of: " . implode(', ', $validOrderStatuses));
         }
         
-        // Create order - with explicit status values
+        // Create order - with explicit status values from constants
         $stmt = $conn->prepare(
             "INSERT INTO orders 
                 (order_number, user_id, merchant_id, merchant_name,
@@ -439,8 +457,8 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
             ':payment_method' => $paymentMethod,
             ':transaction_id' => $transactionId,
             ':reference' => $reference,
-            ':payment_status' => 'paid', // Explicitly 'paid' from your ENUM
-            ':status' => 'success', // Explicitly 'success' from your ENUM
+            ':payment_status' => PAYMENT_STATUS_PAID, // Use constant: 'paid'
+            ':status' => ORDER_STATUS_SUCCESS,        // Use constant: 'success'
             ':special_instructions' => $specialInstructions,
             ':preparation_time' => $totals['merchant']['preparation_time'] ?? null
         ];
@@ -507,6 +525,8 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
         
         $conn->commit();
         
+        error_log("✅ Order created successfully: ID $orderId, Number $orderNumber");
+        
         return [
             'success' => true,
             'order_id' => $orderId,
@@ -515,7 +535,7 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
         
     } catch (Exception $e) {
         $conn->rollBack();
-        error_log("Order creation error: " . $e->getMessage());
+        error_log("❌ Order creation error: " . $e->getMessage());
         error_log("Error trace: " . $e->getTraceAsString());
         return [
             'success' => false,
@@ -717,6 +737,12 @@ try {
             ResponseHandler::error('Cart ID, transaction ID, reference and payment method required', 400);
         }
         
+        error_log("=== CREATE ORDER REQUEST ===");
+        error_log("Cart ID: $cartId");
+        error_log("Transaction ID: $transactionId");
+        error_log("Reference: $reference");
+        error_log("Payment Method: $paymentMethod");
+        
         // Get cart items
         $items = getCartItemsWithMerchant($conn, $cartId);
         if (empty($items)) {
@@ -748,8 +774,8 @@ try {
                     'id' => $totals['merchant']['id'],
                     'name' => $totals['merchant']['name']
                 ],
-                'status' => 'success', // Explicitly 'success'
-                'payment_status' => 'paid' // Explicitly 'paid'
+                'status' => ORDER_STATUS_SUCCESS, // 'success'
+                'payment_status' => PAYMENT_STATUS_PAID // 'paid'
             ], 'Order created successfully');
         } else {
             ResponseHandler::error('Failed to create order: ' . $order['message'], 500);
@@ -796,15 +822,15 @@ try {
             );
             $stmt->execute([
                 ':id' => $orderId,
-                ':payment_status' => 'paid',
-                ':status' => 'success'
+                ':payment_status' => PAYMENT_STATUS_PAID, // 'paid'
+                ':status' => ORDER_STATUS_SUCCESS // 'success'
             ]);
             
             ResponseHandler::success([
                 'order_id' => $orderId,
                 'payment_method' => $paymentMethod,
-                'payment_status' => 'paid',
-                'status' => 'success'
+                'payment_status' => PAYMENT_STATUS_PAID,
+                'status' => ORDER_STATUS_SUCCESS
             ], 'Payment confirmed');
             
         } elseif ($paymentStatus === 'failed') {
@@ -818,14 +844,14 @@ try {
             );
             $stmt->execute([
                 ':id' => $orderId,
-                ':payment_status' => 'failed',
-                ':status' => 'failed'
+                ':payment_status' => PAYMENT_STATUS_FAILED, // 'failed'
+                ':status' => ORDER_STATUS_FAILED // 'failed'
             ]);
             
             ResponseHandler::success([
                 'order_id' => $orderId,
-                'payment_status' => 'failed',
-                'status' => 'failed'
+                'payment_status' => PAYMENT_STATUS_FAILED,
+                'status' => ORDER_STATUS_FAILED
             ], 'Payment failed');
             
         } elseif ($paymentStatus === 'refunded') {
@@ -839,14 +865,14 @@ try {
             );
             $stmt->execute([
                 ':id' => $orderId,
-                ':payment_status' => 'refunded',
-                ':status' => 'failed' // or could be 'pending' - adjust as needed
+                ':payment_status' => PAYMENT_STATUS_REFUNDED, // 'refunded'
+                ':status' => ORDER_STATUS_FAILED // or could be 'pending' - adjust as needed
             ]);
             
             ResponseHandler::success([
                 'order_id' => $orderId,
-                'payment_status' => 'refunded',
-                'status' => 'failed'
+                'payment_status' => PAYMENT_STATUS_REFUNDED,
+                'status' => ORDER_STATUS_FAILED
             ], 'Payment refunded');
             
         } else {
