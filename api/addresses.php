@@ -33,7 +33,6 @@ require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
  * GET USER FROM SESSION/AUTH
- * This pre-fills data from users table
  *********************************/
 function getUserFromSession() {
     if (empty($_SESSION['user_id'])) {
@@ -84,7 +83,6 @@ function authenticateUser() {
     $sessionToken = $headers['X-Session-Token'] ?? $headers['x-session-token'] ?? null;
     
     if ($userId && $sessionToken) {
-        // Validate session token from database
         $db = new Database();
         $conn = $db->getConnection();
         
@@ -110,7 +108,6 @@ function authenticateUser() {
     $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
     if (strpos($authHeader, 'Bearer ') === 0) {
         $token = substr($authHeader, 7);
-        // Validate JWT or other token format
         $db = new Database();
         $conn = $db->getConnection();
         
@@ -214,7 +211,7 @@ function getLocationsList() {
     }
 
     if ($search) {
-        $whereConditions[] = "(label LIKE :search OR address_line1 LIKE :search OR area LIKE :search OR sector LIKE :search OR landmark LIKE :search)";
+        $whereConditions[] = "(label LIKE :search OR address_line1 LIKE :search OR street LIKE :search OR area LIKE :search OR sector LIKE :search OR landmark LIKE :search)";
         $queryParams[':search'] = "%$search%";
     }
 
@@ -236,10 +233,11 @@ function getLocationsList() {
                 id,
                 user_id,
                 label,
-                full_name,  -- This might be overridden per address
-                phone,       -- This might be overridden per address
+                full_name,
+                phone,
                 address_line1,
                 address_line2,
+                street,
                 city,
                 neighborhood,
                 area,
@@ -307,13 +305,13 @@ function getLocationsList() {
     $statsStmt->execute([':user_id' => $userId]);
     $stats = $statsStmt->fetch(PDO::FETCH_ASSOC);
 
-    // Get Lilongwe areas and sectors from database if available
-    $areasSectors = getAreasAndSectorsFromDB($conn);
+    // Get streets, areas, sectors etc. from database
+    $locationData = getLocationDataFromDB($conn, $userId);
 
     ResponseHandler::success([
         'locations' => $formattedLocations,
         'current_location' => $currentLocation,
-        'user' => $user, // Include user details from auth for pre-filling new addresses
+        'user' => $user,
         'total_count' => $totalCount,
         'pagination' => [
             'page' => $page,
@@ -329,7 +327,11 @@ function getLocationsList() {
             'work' => $stats['work_locations'] ?? 0,
             'other' => $stats['other_locations'] ?? 0
         ],
-        'areas_sectors' => $areasSectors
+        'streets' => $locationData['streets'],
+        'areas' => $locationData['areas'],
+        'sectors' => $locationData['sectors'],
+        'cities' => $locationData['cities'],
+        'neighborhoods' => $locationData['neighborhoods']
     ]);
 }
 
@@ -342,7 +344,6 @@ function getLocationDetails($locationId) {
         ResponseHandler::error('Authentication required', 401);
     }
     
-    // Get user details from auth
     $user = getUserFromSession();
     
     $db = new Database();
@@ -357,6 +358,7 @@ function getLocationDetails($locationId) {
             phone,
             address_line1,
             address_line2,
+            street,
             city,
             neighborhood,
             area,
@@ -418,6 +420,7 @@ function getLocationDetails($locationId) {
         "SELECT 
             id,
             label,
+            street,
             area,
             sector,
             location_type,
@@ -449,13 +452,12 @@ function getLocationDetails($locationId) {
 
     ResponseHandler::success([
         'location' => $formattedLocation,
-        'user' => $user // Include user details from auth
+        'user' => $user
     ]);
 }
 
 /*********************************
  * CREATE NEW LOCATION
- * Pre-fills from auth unless overridden
  *********************************/
 function createLocation() {
     $userId = authenticateUser();
@@ -463,7 +465,6 @@ function createLocation() {
         ResponseHandler::error('Authentication required', 401);
     }
     
-    // Get user details from auth for pre-filling
     $user = getUserFromSession();
     
     $input = json_decode(file_get_contents('php://input'), true);
@@ -471,7 +472,7 @@ function createLocation() {
         $input = $_POST;
     }
     
-    // Validate required fields - only address fields are required
+    // Validate required fields
     $required = ['label', 'address_line1', 'city'];
     foreach ($required as $field) {
         if (empty($input[$field])) {
@@ -482,6 +483,7 @@ function createLocation() {
     $label = trim($input['label']);
     $addressLine1 = trim($input['address_line1']);
     $addressLine2 = trim($input['address_line2'] ?? '');
+    $street = trim($input['street'] ?? '');
     $city = trim($input['city']);
     $neighborhood = trim($input['neighborhood'] ?? '');
     $area = trim($input['area'] ?? $city);
@@ -492,12 +494,11 @@ function createLocation() {
     $longitude = isset($input['longitude']) ? floatval($input['longitude']) : null;
     $isDefault = boolval($input['is_default'] ?? false);
     
-    // PRE-FILL FROM AUTH: Use auth data for contact info, but allow override from input
-    // This way users can use different contact info for different delivery addresses
+    // Pre-fill from auth
     $fullName = trim($input['full_name'] ?? $user['full_name'] ?? '');
     $phone = trim($input['phone'] ?? $user['phone'] ?? '');
 
-    // Validate phone if provided (either from auth or override)
+    // Validate phone
     if (empty($phone)) {
         ResponseHandler::error('Phone number is required for delivery', 400);
     }
@@ -515,30 +516,29 @@ function createLocation() {
     $db = new Database();
     $conn = $db->getConnection();
     
-    // Start transaction
     $conn->beginTransaction();
 
     try {
-        // Check for duplicate address
+        // Check for duplicate
         $duplicateStmt = $conn->prepare(
             "SELECT id FROM addresses 
              WHERE user_id = :user_id 
              AND address_line1 = :address_line1 
-             AND city = :city 
-             AND area = :area"
+             AND street = :street
+             AND city = :city"
         );
         $duplicateStmt->execute([
             ':user_id' => $userId,
             ':address_line1' => $addressLine1,
-            ':city' => $city,
-            ':area' => $area
+            ':street' => $street,
+            ':city' => $city
         ]);
         
         if ($duplicateStmt->fetch()) {
             ResponseHandler::error('This address already exists in your saved locations', 409);
         }
 
-        // If setting as default, remove default from other locations
+        // Handle default
         if ($isDefault) {
             $updateStmt = $conn->prepare(
                 "UPDATE addresses 
@@ -548,15 +548,15 @@ function createLocation() {
             $updateStmt->execute([':user_id' => $userId]);
         }
 
-        // Create the new location with contact info (pre-filled from auth unless overridden)
+        // Create location
         $stmt = $conn->prepare(
             "INSERT INTO addresses 
                 (user_id, label, full_name, phone, address_line1, address_line2, 
-                 city, neighborhood, area, sector, location_type, landmark, 
+                 street, city, neighborhood, area, sector, location_type, landmark, 
                  latitude, longitude, is_default, created_at, last_used)
              VALUES 
                 (:user_id, :label, :full_name, :phone, :address_line1, :address_line2, 
-                 :city, :neighborhood, :area, :sector, :location_type, :landmark, 
+                 :street, :city, :neighborhood, :area, :sector, :location_type, :landmark, 
                  :latitude, :longitude, :is_default, NOW(), NOW())"
         );
         
@@ -567,6 +567,7 @@ function createLocation() {
             ':phone' => $phone,
             ':address_line1' => $addressLine1,
             ':address_line2' => $addressLine2,
+            ':street' => $street,
             ':city' => $city,
             ':neighborhood' => $neighborhood,
             ':area' => $area,
@@ -580,7 +581,7 @@ function createLocation() {
 
         $locationId = $conn->lastInsertId();
 
-        // If no default exists and this isn't set as default, set it as default
+        // Auto-set default if none exists
         if (!$isDefault) {
             $checkDefaultStmt = $conn->prepare(
                 "SELECT COUNT(*) as default_count 
@@ -603,7 +604,7 @@ function createLocation() {
 
         $conn->commit();
 
-        // Get the created location
+        // Get created location
         $locationStmt = $conn->prepare(
             "SELECT 
                 id,
@@ -613,6 +614,7 @@ function createLocation() {
                 phone,
                 address_line1,
                 address_line2,
+                street,
                 city,
                 neighborhood,
                 area,
@@ -633,19 +635,17 @@ function createLocation() {
 
         $formattedLocation = formatLocationData($location, $user);
 
-        // Log activity
         logUserActivity($conn, $userId, 'location_created', "Created location: $label", [
             'location_id' => $locationId,
             'location_type' => $locationType,
-            'is_default' => $isDefault,
-            'used_auth_data' => empty($input['full_name']) && empty($input['phone']) // Track if used auth pre-fill
+            'street' => $street,
+            'is_default' => $isDefault
         ]);
 
         ResponseHandler::success([
             'location' => $formattedLocation,
-            'user' => $user, // Include user details from auth
-            'message' => 'Location created successfully',
-            'prefilled_from_auth' => empty($input['full_name']) && empty($input['phone']) // Indicate if we used auth data
+            'user' => $user,
+            'message' => 'Location created successfully'
         ], 201);
 
     } catch (Exception $e) {
@@ -663,7 +663,6 @@ function updateLocation($locationId) {
         ResponseHandler::error('Authentication required', 401);
     }
     
-    // Get user details from auth
     $user = getUserFromSession();
     
     $input = json_decode(file_get_contents('php://input'), true);
@@ -674,7 +673,7 @@ function updateLocation($locationId) {
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Check if location exists and belongs to user
+    // Check if location exists
     $checkStmt = $conn->prepare(
         "SELECT * FROM addresses 
          WHERE id = :id AND user_id = :user_id"
@@ -700,7 +699,6 @@ function updateLocation($locationId) {
     }
 
     if (isset($input['full_name'])) {
-        // Allow override of full name per address
         $updateFields[] = "full_name = :full_name";
         $params[':full_name'] = trim($input['full_name']);
     }
@@ -722,6 +720,11 @@ function updateLocation($locationId) {
     if (isset($input['address_line2'])) {
         $updateFields[] = "address_line2 = :address_line2";
         $params[':address_line2'] = trim($input['address_line2']);
+    }
+
+    if (isset($input['street'])) {
+        $updateFields[] = "street = :street";
+        $params[':street'] = trim($input['street']);
     }
 
     if (isset($input['city'])) {
@@ -781,14 +784,12 @@ function updateLocation($locationId) {
         ResponseHandler::error('No fields to update', 400);
     }
 
-    // Start transaction
     $conn->beginTransaction();
 
     try {
-        // Handle default location change
+        // Handle default
         if (isset($input['is_default']) && boolval($input['is_default']) !== boolval($currentLocation['is_default'])) {
             if (boolval($input['is_default'])) {
-                // Remove default from other locations
                 $removeDefaultStmt = $conn->prepare(
                     "UPDATE addresses 
                      SET is_default = 0 
@@ -802,7 +803,6 @@ function updateLocation($locationId) {
             }
         }
 
-        // Update the location
         $updateFields[] = "updated_at = NOW()";
         
         $sql = "UPDATE addresses SET " . implode(", ", $updateFields) . " WHERE id = :id";
@@ -821,6 +821,7 @@ function updateLocation($locationId) {
                 phone,
                 address_line1,
                 address_line2,
+                street,
                 city,
                 neighborhood,
                 area,
@@ -841,7 +842,6 @@ function updateLocation($locationId) {
 
         $formattedLocation = formatLocationData($location, $user);
 
-        // Log activity
         logUserActivity($conn, $userId, 'location_updated', "Updated location: {$currentLocation['label']}", [
             'location_id' => $locationId,
             'changes' => array_keys($input)
@@ -871,7 +871,7 @@ function deleteLocation($locationId) {
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Check if location exists and belongs to user
+    // Check if location exists
     $checkStmt = $conn->prepare(
         "SELECT id, label, is_default FROM addresses 
          WHERE id = :id AND user_id = :user_id"
@@ -887,7 +887,7 @@ function deleteLocation($locationId) {
         ResponseHandler::error('Location not found', 404);
     }
 
-    // Check if location is used in any recent orders
+    // Check if used in recent orders
     $orderCheckStmt = $conn->prepare(
         "SELECT COUNT(*) as order_count FROM orders 
          WHERE user_id = :user_id 
@@ -904,7 +904,6 @@ function deleteLocation($locationId) {
         ResponseHandler::error('Cannot delete location that has been used in recent orders. Consider archiving instead.', 400);
     }
 
-    // Start transaction
     $conn->beginTransaction();
 
     try {
@@ -918,9 +917,8 @@ function deleteLocation($locationId) {
             ':user_id' => $userId
         ]);
 
-        // If deleting default location, set a new default
+        // If deleting default, set new default
         if ($location['is_default']) {
-            // Get another location to set as default
             $newDefaultStmt = $conn->prepare(
                 "SELECT id FROM addresses 
                  WHERE user_id = :user_id 
@@ -931,7 +929,6 @@ function deleteLocation($locationId) {
             $newDefault = $newDefaultStmt->fetch(PDO::FETCH_ASSOC);
 
             if ($newDefault) {
-                // Set new default
                 $setDefaultStmt = $conn->prepare(
                     "UPDATE addresses 
                      SET is_default = 1 
@@ -943,7 +940,6 @@ function deleteLocation($locationId) {
 
         $conn->commit();
 
-        // Log activity
         logUserActivity($conn, $userId, 'location_deleted', "Deleted location: {$location['label']}", [
             'location_id' => $locationId,
             'was_default' => $location['is_default']
@@ -982,7 +978,7 @@ function handlePostRequest() {
             validateAddress($input);
             break;
         case 'get_areas_sectors':
-            getAreasAndSectors();
+            getLocationData();
             break;
         default:
             ResponseHandler::error('Invalid action', 400);
@@ -1029,7 +1025,7 @@ function setDefaultLocation($locationId) {
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Check if location exists and belongs to user
+    // Check if location exists
     $checkStmt = $conn->prepare(
         "SELECT id, label FROM addresses 
          WHERE id = :id AND user_id = :user_id"
@@ -1045,11 +1041,10 @@ function setDefaultLocation($locationId) {
         ResponseHandler::error('Location not found', 404);
     }
 
-    // Start transaction
     $conn->beginTransaction();
 
     try {
-        // Remove default from all locations
+        // Remove default from all
         $removeDefaultStmt = $conn->prepare(
             "UPDATE addresses 
              SET is_default = 0 
@@ -1057,7 +1052,7 @@ function setDefaultLocation($locationId) {
         );
         $removeDefaultStmt->execute([':user_id' => $userId]);
 
-        // Set the specified location as default
+        // Set new default
         $setDefaultStmt = $conn->prepare(
             "UPDATE addresses 
              SET is_default = 1, 
@@ -1079,6 +1074,7 @@ function setDefaultLocation($locationId) {
                 phone,
                 address_line1,
                 address_line2,
+                street,
                 city,
                 neighborhood,
                 area,
@@ -1097,7 +1093,6 @@ function setDefaultLocation($locationId) {
         $locationStmt->execute([':id' => $locationId]);
         $location = $locationStmt->fetch(PDO::FETCH_ASSOC);
 
-        // Get user details
         $user = getUserFromSession();
         $formattedLocation = formatLocationData($location, $user);
 
@@ -1113,7 +1108,7 @@ function setDefaultLocation($locationId) {
 }
 
 /*********************************
- * UPDATE LAST USED TIMESTAMP
+ * UPDATE LAST USED
  *********************************/
 function updateLastUsed($locationId) {
     $userId = authenticateUser();
@@ -1124,7 +1119,6 @@ function updateLastUsed($locationId) {
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Check if location exists and belongs to user
     $checkStmt = $conn->prepare(
         "SELECT id FROM addresses 
          WHERE id = :id AND user_id = :user_id"
@@ -1139,7 +1133,6 @@ function updateLastUsed($locationId) {
     }
 
     try {
-        // Update last used timestamp
         $stmt = $conn->prepare(
             "UPDATE addresses 
              SET last_used = NOW(),
@@ -1167,16 +1160,16 @@ function searchLocations($input) {
         ResponseHandler::error('Authentication required', 401);
     }
     
-    // Get user details from auth
     $user = getUserFromSession();
     
     $query = trim($input['query'] ?? '');
     $city = $input['city'] ?? '';
     $area = $input['area'] ?? '';
     $sector = $input['sector'] ?? '';
+    $street = $input['street'] ?? '';
     $limit = min(50, max(1, intval($input['limit'] ?? 10)));
     
-    if (empty($query) && empty($city) && empty($area) && empty($sector)) {
+    if (empty($query) && empty($city) && empty($area) && empty($sector) && empty($street)) {
         ResponseHandler::error('Search query or filters required', 400);
     }
     
@@ -1187,7 +1180,7 @@ function searchLocations($input) {
     $params = [':user_id' => $userId];
     
     if ($query) {
-        $whereConditions[] = "(label LIKE :query OR address_line1 LIKE :query OR landmark LIKE :query)";
+        $whereConditions[] = "(label LIKE :query OR address_line1 LIKE :query OR street LIKE :query OR landmark LIKE :query)";
         $params[':query'] = "%$query%";
     }
     
@@ -1206,6 +1199,11 @@ function searchLocations($input) {
         $params[':sector'] = $sector;
     }
     
+    if ($street) {
+        $whereConditions[] = "street = :street";
+        $params[':street'] = $street;
+    }
+    
     $whereClause = "WHERE " . implode(" AND ", $whereConditions);
     
     $sql = "SELECT 
@@ -1215,6 +1213,7 @@ function searchLocations($input) {
                 phone,
                 address_line1,
                 address_line2,
+                street,
                 city,
                 area,
                 sector,
@@ -1227,9 +1226,10 @@ function searchLocations($input) {
             ORDER BY 
                 CASE 
                     WHEN label LIKE :query_exact THEN 1
-                    WHEN address_line1 LIKE :query_exact THEN 2
-                    WHEN area LIKE :query_exact THEN 3
-                    ELSE 4
+                    WHEN street LIKE :query_exact THEN 2
+                    WHEN address_line1 LIKE :query_exact THEN 3
+                    WHEN area LIKE :query_exact THEN 4
+                    ELSE 5
                 END,
                 is_default DESC,
                 last_used DESC
@@ -1246,7 +1246,6 @@ function searchLocations($input) {
     $stmt->execute();
     $locations = $stmt->fetchAll(PDO::FETCH_ASSOC);
     
-    // Format location data
     $formattedLocations = [];
     foreach ($locations as $loc) {
         $formattedLocations[] = formatLocationData($loc, $user);
@@ -1272,7 +1271,6 @@ function validateAddress($input) {
 
     $errors = [];
     
-    // Check address length
     if (strlen($address) < 5) {
         $errors[] = 'Address is too short (minimum 5 characters)';
     }
@@ -1285,7 +1283,6 @@ function validateAddress($input) {
         $errors[] = 'City is required';
     }
     
-    // Check for invalid characters
     if (preg_match('/[<>{}[\]]/', $address)) {
         $errors[] = 'Address contains invalid characters';
     }
@@ -1304,72 +1301,125 @@ function validateAddress($input) {
 }
 
 /*********************************
- * GET AREAS AND SECTORS
+ * GET LOCATION DATA (STREETS, AREAS, SECTORS)
  *********************************/
-function getAreasAndSectors() {
+function getLocationData() {
+    $userId = authenticateUser();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required', 401);
+    }
+
     $db = new Database();
     $conn = $db->getConnection();
     
-    $areasSectors = getAreasAndSectorsFromDB($conn);
+    $locationData = getLocationDataFromDB($conn, $userId);
     
-    ResponseHandler::success($areasSectors);
+    ResponseHandler::success($locationData);
 }
 
 /*********************************
- * GET AREAS AND SECTORS FROM DATABASE
+ * GET LOCATION DATA FROM DATABASE
  *********************************/
-function getAreasAndSectorsFromDB($conn) {
-    // Get unique areas from addresses table
-    $areasStmt = $conn->query(
-        "SELECT DISTINCT area 
-         FROM addresses 
-         WHERE area IS NOT NULL AND area != '' 
-         ORDER BY area"
-    );
+function getLocationDataFromDB($conn, $userId = null) {
+    // Get unique streets
+    $streetsQuery = "SELECT DISTINCT street 
+                     FROM addresses 
+                     WHERE street IS NOT NULL AND street != ''";
+    $params = [];
+    
+    if ($userId) {
+        $streetsQuery .= " AND user_id = :user_id";
+        $params[':user_id'] = $userId;
+    }
+    
+    $streetsQuery .= " ORDER BY street";
+    $streetsStmt = $conn->prepare($streetsQuery);
+    $streetsStmt->execute($params);
+    $streets = $streetsStmt->fetchAll(PDO::FETCH_COLUMN);
+    
+    // Get unique areas
+    $areasQuery = "SELECT DISTINCT area 
+                   FROM addresses 
+                   WHERE area IS NOT NULL AND area != ''";
+    
+    if ($userId) {
+        $areasQuery .= " AND user_id = :user_id";
+    }
+    
+    $areasQuery .= " ORDER BY area";
+    $areasStmt = $conn->prepare($areasQuery);
+    $areasStmt->execute($params);
     $areas = $areasStmt->fetchAll(PDO::FETCH_COLUMN);
     
-    // Get unique sectors from addresses table
-    $sectorsStmt = $conn->query(
-        "SELECT DISTINCT sector 
-         FROM addresses 
-         WHERE sector IS NOT NULL AND sector != '' 
-         ORDER BY sector"
-    );
+    // Get unique sectors
+    $sectorsQuery = "SELECT DISTINCT sector 
+                     FROM addresses 
+                     WHERE sector IS NOT NULL AND sector != ''";
+    
+    if ($userId) {
+        $sectorsQuery .= " AND user_id = :user_id";
+    }
+    
+    $sectorsQuery .= " ORDER BY sector";
+    $sectorsStmt = $conn->prepare($sectorsQuery);
+    $sectorsStmt->execute($params);
     $sectors = $sectorsStmt->fetchAll(PDO::FETCH_COLUMN);
     
-    // Get unique cities from addresses table
-    $citiesStmt = $conn->query(
-        "SELECT DISTINCT city 
-         FROM addresses 
-         WHERE city IS NOT NULL AND city != '' 
-         ORDER BY city"
-    );
+    // Get unique cities
+    $citiesQuery = "SELECT DISTINCT city 
+                    FROM addresses 
+                    WHERE city IS NOT NULL AND city != ''";
+    
+    if ($userId) {
+        $citiesQuery .= " AND user_id = :user_id";
+    }
+    
+    $citiesQuery .= " ORDER BY city";
+    $citiesStmt = $conn->prepare($citiesQuery);
+    $citiesStmt->execute($params);
     $cities = $citiesStmt->fetchAll(PDO::FETCH_COLUMN);
     
+    // Get unique neighborhoods
+    $neighborhoodsQuery = "SELECT DISTINCT neighborhood 
+                           FROM addresses 
+                           WHERE neighborhood IS NOT NULL AND neighborhood != ''";
+    
+    if ($userId) {
+        $neighborhoodsQuery .= " AND user_id = :user_id";
+    }
+    
+    $neighborhoodsQuery .= " ORDER BY neighborhood";
+    $neighborhoodsStmt = $conn->prepare($neighborhoodsQuery);
+    $neighborhoodsStmt->execute($params);
+    $neighborhoods = $neighborhoodsStmt->fetchAll(PDO::FETCH_COLUMN);
+    
+    // If no data found for user, get global data
+    if (empty($streets) && $userId) {
+        return getLocationDataFromDB($conn, null);
+    }
+    
     return [
+        'streets' => $streets ?: [],
         'areas' => $areas ?: [],
         'sectors' => $sectors ?: [],
-        'cities' => $cities ?: ['Lilongwe', 'Blantyre', 'Mzuzu']
+        'cities' => $cities ?: ['Lilongwe', 'Blantyre', 'Mzuzu', 'Zomba'],
+        'neighborhoods' => $neighborhoods ?: []
     ];
 }
 
 /*********************************
  * FORMAT LOCATION DATA
- * Uses auth data as fallback for contact info
  *********************************/
 function formatLocationData($loc, $user = null) {
     if (empty($loc)) {
         return null;
     }
     
-    // Generate display addresses
     $displayAddress = generateDisplayAddress($loc);
     $shortAddress = generateShortAddress($loc);
     
-    // Get type info
     $typeInfo = getLocationTypeInfo($loc['location_type'] ?? 'other');
     
-    // Use location-specific contact info if available, otherwise fallback to auth data
     $fullName = !empty($loc['full_name']) ? $loc['full_name'] : ($user['full_name'] ?? '');
     $phone = !empty($loc['phone']) ? $loc['phone'] : ($user['phone'] ?? '');
     
@@ -1377,11 +1427,11 @@ function formatLocationData($loc, $user = null) {
         'id' => $loc['id'],
         'user_id' => $loc['user_id'] ?? null,
         'name' => $loc['label'] ?? '',
-        // Contact info: use location-specific if available, otherwise auth data
         'full_name' => $fullName,
         'phone' => $phone,
         'address' => $loc['address_line1'] ?? '',
         'apartment' => $loc['address_line2'] ?? '',
+        'street' => $loc['street'] ?? '',
         'city' => $loc['city'] ?? '',
         'area' => $loc['area'] ?? '',
         'sector' => $loc['sector'] ?? '',
@@ -1398,7 +1448,6 @@ function formatLocationData($loc, $user = null) {
         'short_address' => $shortAddress,
         'type_icon' => $typeInfo['icon'],
         'type_color' => $typeInfo['color'],
-        // Indicate if contact info came from auth or is location-specific
         'contact_source' => empty($loc['full_name']) && empty($loc['phone']) ? 'auth' : 'location_specific'
     ];
 }
@@ -1408,6 +1457,10 @@ function formatLocationData($loc, $user = null) {
  *********************************/
 function generateDisplayAddress($loc) {
     $parts = [];
+    
+    if (!empty($loc['street'])) {
+        $parts[] = $loc['street'];
+    }
     
     if (!empty($loc['address_line1'])) {
         $parts[] = $loc['address_line1'];
@@ -1440,6 +1493,10 @@ function generateDisplayAddress($loc) {
 function generateShortAddress($loc) {
     $parts = [];
     
+    if (!empty($loc['street'])) {
+        $parts[] = $loc['street'];
+    }
+    
     if (!empty($loc['landmark'])) {
         $parts[] = 'Near ' . $loc['landmark'];
     }
@@ -1462,15 +1519,15 @@ function getLocationTypeInfo($type) {
     $types = [
         'home' => [
             'icon' => 'home',
-            'color' => '#2196F3' // Blue
+            'color' => '#2196F3'
         ],
         'work' => [
             'icon' => 'work',
-            'color' => '#4CAF50' // Green
+            'color' => '#4CAF50'
         ],
         'other' => [
             'icon' => 'location_on',
-            'color' => '#FF9800' // Orange
+            'color' => '#FF9800'
         ]
     ];
 
@@ -1500,7 +1557,6 @@ function logUserActivity($conn, $userId, $activityType, $description, $metadata 
             ':metadata' => $metaJson
         ]);
     } catch (Exception $e) {
-        // Silently fail logging
         error_log('Failed to log user activity: ' . $e->getMessage());
     }
 }
