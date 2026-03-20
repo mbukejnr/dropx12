@@ -58,7 +58,7 @@ function handleGetRequest() {
     if (!empty($_SESSION['user_id']) && !empty($_SESSION['logged_in'])) {
         $stmt = $conn->prepare(
             "SELECT id, full_name, email, phone, address, city, gender, avatar,
-                    member_level, member_points, total_orders,
+                    member_level, member_points, total_orders, login_method,
                     rating, verified, member_since, created_at, updated_at
              FROM users WHERE id = :id"
         );
@@ -115,10 +115,9 @@ function handlePostRequest() {
 }
 
 /*********************************
- * LOGIN - EXACTLY AS FLUTTER SENDS
+ * LOGIN - Supports both email and phone
  *********************************/
 function loginUser($conn, $data) {
-    // Your Flutter sends: identifier (email or phone) and password
     $identifier = trim($data['identifier'] ?? '');
     $password = $data['password'] ?? '';
     $rememberMe = $data['remember_me'] ?? false;
@@ -127,16 +126,16 @@ function loginUser($conn, $data) {
         ResponseHandler::error('Email/phone and password required', 400);
     }
 
-    // Check if identifier is email or phone (same logic as Flutter)
+    // Detect if identifier is email or phone
     $isPhone = preg_match('/^[\+]?[0-9\s\-\(\)]+$/', $identifier);
-    $isEmail = filter_var($identifier, FILTER_VALIDATE_EMAIL); // FIXED
+    $isEmail = filter_var($identifier, FILTER_VALIDATE_EMAIL);
 
     if (!$isPhone && !$isEmail) {
         ResponseHandler::error('Please enter a valid email or phone number', 400);
     }
 
     if ($isPhone) {
-        // Clean phone number (remove all non-digit except leading +)
+        // Clean phone number
         $phone = cleanPhoneNumber($identifier);
         if (!$phone || strlen($phone) < 10) {
             ResponseHandler::error('Invalid phone number', 400);
@@ -179,34 +178,22 @@ function loginUser($conn, $data) {
 }
 
 /*********************************
- * REGISTER - EXACT FIELDS FROM FLUTTER SIGNUPSCREEN
+ * REGISTER - User chooses login method (email or phone)
+ * Address removed from registration
  *********************************/
 function registerUser($conn, $data) {
-    // Your Flutter SignUpScreen sends these exact fields:
+    // Registration fields - address removed
     $fullName = trim($data['full_name'] ?? '');
     $email = trim($data['email'] ?? '');
     $phone = !empty($data['phone']) ? cleanPhoneNumber($data['phone']) : null;
     $password = $data['password'] ?? '';
-    $address = trim($data['address'] ?? '');
     $city = trim($data['city'] ?? '');
     $gender = $data['gender'] ?? null;
+    $loginMethod = $data['login_method'] ?? 'email'; // 'email' or 'phone' - what user chose
 
-    // Validation (matching Flutter validation)
+    // Validation
     if (!$fullName) {
         ResponseHandler::error('Full name is required', 400);
-    }
-    
-    if (!$email) {
-        ResponseHandler::error('Email address is required', 400);
-    }
-    
-    // FIXED: Changed $filter_var to filter_var()
-    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        ResponseHandler::error('Enter a valid email address', 400);
-    }
-    
-    if ($phone && strlen($phone) < 10) {
-        ResponseHandler::error('Enter a valid phone number', 400);
     }
     
     if (!$password) {
@@ -217,12 +204,44 @@ function registerUser($conn, $data) {
         ResponseHandler::error('Password must be at least 6 characters', 400);
     }
 
+    // Validate based on chosen login method
+    if ($loginMethod === 'email') {
+        if (!$email) {
+            ResponseHandler::error('Email address is required', 400);
+        }
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            ResponseHandler::error('Enter a valid email address', 400);
+        }
+        // Make email required, phone optional
+        if ($phone && strlen($phone) < 10) {
+            ResponseHandler::error('Enter a valid phone number', 400);
+        }
+    } else if ($loginMethod === 'phone') {
+        if (!$phone) {
+            ResponseHandler::error('Phone number is required', 400);
+        }
+        if (strlen($phone) < 10) {
+            ResponseHandler::error('Enter a valid phone number', 400);
+        }
+        // Make phone required, email optional
+        if ($email && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            ResponseHandler::error('Enter a valid email address', 400);
+        }
+    }
+
     // Check if user already exists (email or phone)
-    $checkSql = "SELECT id FROM users WHERE email = :email";
-    $params = [':email' => $email];
+    $checkSql = "SELECT id FROM users WHERE ";
+    $params = [];
     
-    if ($phone) {
-        $checkSql .= " OR phone = :phone";
+    if ($email && $phone) {
+        $checkSql .= "email = :email OR phone = :phone";
+        $params[':email'] = $email;
+        $params[':phone'] = $phone;
+    } else if ($email) {
+        $checkSql .= "email = :email";
+        $params[':email'] = $email;
+    } else if ($phone) {
+        $checkSql .= "phone = :phone";
         $params[':phone'] = $phone;
     }
     
@@ -233,23 +252,23 @@ function registerUser($conn, $data) {
         ResponseHandler::error('User already exists with this email or phone', 409);
     }
 
-    // Create user (no username field, just full_name)
+    // Create user - address field set to empty string
     $stmt = $conn->prepare(
         "INSERT INTO users (full_name, email, phone, password, address, city, gender, 
-                            member_level, member_points, total_orders, 
-                           rating, verified, member_since, created_at, updated_at)
-         VALUES (:full_name, :email, :phone, :password, :address, :city, :gender,
-                  'basic', 0, 0, 0.00, 0, :member_since, NOW(), NOW())"
+                            member_level, member_points, total_orders, login_method,
+                            rating, verified, member_since, created_at, updated_at)
+         VALUES (:full_name, :email, :phone, :password, '', :city, :gender,
+                  'basic', 0, 0, :login_method, 0.00, 0, :member_since, NOW(), NOW())"
     );
     
     $stmt->execute([
         ':full_name' => $fullName,
-        ':email' => $email,
-        ':phone' => $phone,
+        ':email' => $email ?: null,
+        ':phone' => $phone ?: null,
         ':password' => password_hash($password, PASSWORD_DEFAULT),
-        ':address' => $address,
         ':city' => $city,
         ':gender' => $gender,
+        ':login_method' => $loginMethod,
         ':member_since' => date('M d, Y') // Format: Jan 15, 2023 like Flutter
     ]);
 
@@ -257,8 +276,8 @@ function registerUser($conn, $data) {
     $userId = $conn->lastInsertId();
     $stmt = $conn->prepare(
         "SELECT id, full_name, email, phone, address, city, gender, avatar,
-                 member_level, member_points, total_orders,
-                rating, verified, member_since, created_at, updated_at
+                 member_level, member_points, total_orders, login_method,
+                 rating, verified, member_since, created_at, updated_at
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $userId]);
@@ -274,7 +293,7 @@ function registerUser($conn, $data) {
 }
 
 /*********************************
- * UPDATE PROFILE - MATCHES FLUTTER EDIT PROFILE
+ * UPDATE PROFILE - Address can be added later
  *********************************/
 function updateProfile($conn, $data) {
     if (empty($_SESSION['user_id'])) {
@@ -298,7 +317,6 @@ function updateProfile($conn, $data) {
         ResponseHandler::error('Email is required', 400);
     }
     
-    // FIXED: Changed $filter_var to filter_var()
     if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
         ResponseHandler::error('Enter a valid email address', 400);
     }
@@ -344,8 +362,8 @@ function updateProfile($conn, $data) {
     // Get updated user
     $stmt = $conn->prepare(
         "SELECT id, full_name, email, phone, address, city, gender, avatar,
-                 member_level, member_points, total_orders,
-                rating, verified, member_since, created_at, updated_at
+                 member_level, member_points, total_orders, login_method,
+                 rating, verified, member_since, created_at, updated_at
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -413,7 +431,7 @@ function forgotPassword($conn, $data) {
 
     // Check if identifier is email or phone
     $isPhone = preg_match('/^[\+]?[0-9\s\-\(\)]+$/', $identifier);
-    $isEmail = filter_var($identifier, FILTER_VALIDATE_EMAIL); // FIXED
+    $isEmail = filter_var($identifier, FILTER_VALIDATE_EMAIL);
 
     if (!$isPhone && !$isEmail) {
         ResponseHandler::error('Please enter a valid email or phone number', 400);
@@ -491,7 +509,7 @@ function formatUserData($u) {
         'city' => $u['city'] ?? '',
         'gender' => $u['gender'] ?? '',
         'avatar' => $u['avatar'] ?? null,
-       
+        'login_method' => $u['login_method'] ?? 'email',
         'member_level' => $u['member_level'] ?? 'basic',
         'member_points' => (int) ($u['member_points'] ?? 0),
         'total_orders' => (int) ($u['total_orders'] ?? 0),
@@ -502,3 +520,4 @@ function formatUserData($u) {
         'updated_at' => $u['updated_at'] ?? ''
     ];
 }
+?>
