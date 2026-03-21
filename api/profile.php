@@ -37,67 +37,6 @@ require_once __DIR__ . '/../includes/ResponseHandler.php';
 $baseUrl = "https://dropx12-production.up.railway.app";
 
 /*********************************
- * GENERATE 5-DIGIT ACCOUNT NUMBER
- *********************************/
-function generateAccountNumber($conn) {
-    $maxAttempts = 100;
-    
-    // First, try to use sequential numbers starting from 10000
-    $stmt = $conn->query("SELECT MAX(CAST(account_number AS UNSIGNED)) as max_number FROM users WHERE account_number REGEXP '^[0-9]{5}$'");
-    $result = $stmt->fetch(PDO::FETCH_ASSOC);
-    $startNumber = 10000;
-    $nextNumber = ($result['max_number'] ?? ($startNumber - 1)) + 1;
-    
-    // Ensure it's within 5-digit range (10000-99999)
-    if ($nextNumber >= 10000 && $nextNumber <= 99999) {
-        $accountNumber = str_pad($nextNumber, 5, '0', STR_PAD_LEFT);
-        
-        // Check if exists
-        $check = $conn->prepare("SELECT id FROM users WHERE account_number = :account_number");
-        $check->execute([':account_number' => $accountNumber]);
-        
-        if ($check->rowCount() === 0) {
-            return $accountNumber;
-        }
-    }
-    
-    // If sequential fails, try random 5-digit numbers
-    for ($i = 0; $i < $maxAttempts; $i++) {
-        // Generate random number between 10000 and 99999
-        $randomNumber = mt_rand(10000, 99999);
-        $accountNumber = str_pad($randomNumber, 5, '0', STR_PAD_LEFT);
-        
-        // Check if exists
-        $check = $conn->prepare("SELECT id FROM users WHERE account_number = :account_number");
-        $check->execute([':account_number' => $accountNumber]);
-        
-        if ($check->rowCount() === 0) {
-            return $accountNumber;
-        }
-    }
-    
-    // Last resort: use timestamp (get last 5 digits)
-    $timestamp = time();
-    $accountNumber = substr($timestamp, -5);
-    $accountNumber = str_pad($accountNumber, 5, '0', STR_PAD_LEFT);
-    
-    // Ensure it's >= 10000
-    if ((int)$accountNumber < 10000) {
-        $accountNumber = str_pad((int)$accountNumber + 10000, 5, '0', STR_PAD_LEFT);
-    }
-    
-    return $accountNumber;
-}
-
-/*********************************
- * HELPER FUNCTION FOR BASE URL
- *********************************/
-function getBaseUrl() {
-    global $baseUrl;
-    return $baseUrl;
-}
-
-/*********************************
  * GET USER WALLET BALANCE
  *********************************/
 function getUserWalletBalance($conn, $userId) {
@@ -172,9 +111,9 @@ function handleGetProfile($conn, $baseUrl) {
         ResponseHandler::error('Unauthorized', 401);
     }
 
-    // Get user profile without wallet_balance from users table
+    // Get user profile without account_number
     $stmt = $conn->prepare(
-        "SELECT id, account_number, full_name, email, phone, address, city, gender, avatar,
+        "SELECT id, full_name, email, phone, address, city, gender, avatar,
                 member_level, member_points, total_orders,
                 rating, verified, member_since, 
                 DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
@@ -201,7 +140,7 @@ function handleGetUserStats($conn) {
         ResponseHandler::error('Unauthorized', 401);
     }
 
-    // Get user stats (excluding wallet_balance from users table)
+    // Get user stats
     $stmt = $conn->prepare(
         "SELECT 
             member_points,
@@ -344,7 +283,7 @@ function loginUser($conn, $data, $baseUrl) {
 }
 
 /*********************************
- * REGISTER WITH 5-DIGIT ACCOUNT NUMBER
+ * REGISTER WITHOUT ACCOUNT NUMBER
  *********************************/
 function registerUser($conn, $data, $baseUrl) {
     $fullName = trim($data['full_name'] ?? '');
@@ -396,16 +335,13 @@ function registerUser($conn, $data, $baseUrl) {
         ResponseHandler::error('User already exists with this email or phone', 409);
     }
 
-    // Generate 5-digit account number
-    $accountNumber = generateAccountNumber($conn);
-
-    // Create user (without wallet_balance field)
+    // Create user without account_number
     $stmt = $conn->prepare(
         "INSERT INTO users (full_name, email, phone, password, address, city, gender, 
                            member_level, member_points, total_orders, 
-                           rating, verified, member_since, account_number, created_at, updated_at)
+                           rating, verified, member_since, created_at, updated_at)
          VALUES (:full_name, :email, :phone, :password, :address, :city, :gender,
-                 'basic', 0, 0, 0.00, 0, :member_since, :account_number, NOW(), NOW())"
+                 'basic', 0, 0, 0.00, 0, :member_since, NOW(), NOW())"
     );
     
     $stmt->execute([
@@ -416,8 +352,7 @@ function registerUser($conn, $data, $baseUrl) {
         ':address' => $address,
         ':city' => $city,
         ':gender' => $gender,
-        ':member_since' => date('M d, Y'),
-        ':account_number' => $accountNumber
+        ':member_since' => date('M d, Y')
     ]);
 
     // Get the new user
@@ -427,7 +362,7 @@ function registerUser($conn, $data, $baseUrl) {
     createUserWallet($conn, $userId);
     
     $stmt = $conn->prepare(
-        "SELECT id, account_number, full_name, email, phone, address, city, gender, avatar,
+        "SELECT id, full_name, email, phone, address, city, gender, avatar,
                 member_level, member_points, total_orders,
                 rating, verified, member_since, created_at, updated_at
          FROM users WHERE id = :id"
@@ -444,7 +379,7 @@ function registerUser($conn, $data, $baseUrl) {
 
     ResponseHandler::success([
         'user' => formatUserData($user, $baseUrl, $walletBalance)
-    ], 'Registration successful. Your account number is ' . $accountNumber, 201);
+    ], 'Registration successful', 201);
 }
 
 /*********************************
@@ -517,7 +452,7 @@ function updateProfile($conn, $data, $baseUrl) {
 
     // Get updated user
     $stmt = $conn->prepare(
-        "SELECT id, account_number, full_name, email, phone, address, city, gender, avatar,
+        "SELECT id, full_name, email, phone, address, city, gender, avatar,
                 member_level, member_points, total_orders,
                 rating, verified, member_since, 
                 DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') as created_at,
@@ -599,10 +534,10 @@ function forgotPassword($conn, $data) {
 
     if ($isPhone) {
         $phone = cleanPhoneNumber($identifier);
-        $stmt = $conn->prepare("SELECT id, email, account_number FROM users WHERE phone = :phone");
+        $stmt = $conn->prepare("SELECT id, email FROM users WHERE phone = :phone");
         $stmt->execute([':phone' => $phone]);
     } else {
-        $stmt = $conn->prepare("SELECT id, email, account_number FROM users WHERE email = :email");
+        $stmt = $conn->prepare("SELECT id, email FROM users WHERE email = :email");
         $stmt->execute([':email' => $identifier]);
     }
     
@@ -629,7 +564,7 @@ function forgotPassword($conn, $data) {
     ]);
 
     // In production, send email/SMS with reset link
-    ResponseHandler::success([], 'Reset instructions sent to your email/phone. Account: ' . $user['account_number']);
+    ResponseHandler::success([], 'Reset instructions sent to your email/phone');
 }
 
 /*********************************
@@ -741,6 +676,14 @@ function cleanPhoneNumber($phone) {
 }
 
 /*********************************
+ * GET BASE URL
+ *********************************/
+function getBaseUrl() {
+    global $baseUrl;
+    return $baseUrl;
+}
+
+/*********************************
  * FORMAT USER DATA FOR FLUTTER
  *********************************/
 function formatUserData($u, $baseUrl, $walletBalance = null) {
@@ -756,7 +699,6 @@ function formatUserData($u, $baseUrl, $walletBalance = null) {
     
     return [
         'id' => $u['id'],
-        'account_number' => $u['account_number'] ?? generateTempAccountNumber($u['id']),
         'name' => $u['full_name'] ?: 'User',
         'full_name' => $u['full_name'] ?: 'User',
         'email' => $u['email'] ?? '',
@@ -765,26 +707,19 @@ function formatUserData($u, $baseUrl, $walletBalance = null) {
         'city' => $u['city'] ?? '',
         'gender' => $u['gender'] ?? '',
         'avatar' => $avatarUrl,
-        'profile_image' => $avatarUrl, // Add for compatibility
+        'profile_image' => $avatarUrl,
         'wallet_balance' => $walletBalance !== null ? (float) $walletBalance : 0.00,
         'member_level' => $u['member_level'] ?? 'basic',
         'member_points' => (int) ($u['member_points'] ?? 0),
         'total_orders' => (int) ($u['total_orders'] ?? 0),
         'rating' => (float) ($u['rating'] ?? 0.00),
         'verified' => (bool) ($u['verified'] ?? false),
-        'is_verified' => (bool) ($u['verified'] ?? false), // Add for compatibility
+        'is_verified' => (bool) ($u['verified'] ?? false),
         'member_since' => $u['member_since'] ?? formatDateForFlutter($u['created_at']),
         'created_at' => $u['created_at'] ?? '',
         'updated_at' => $u['updated_at'] ?? '',
-        'location' => $u['city'] ?? '' // Use city as location for compatibility
+        'location' => $u['city'] ?? ''
     ];
-}
-
-/*********************************
- * GENERATE TEMP ACCOUNT NUMBER
- *********************************/
-function generateTempAccountNumber($userId) {
-    return str_pad(10000 + $userId, 5, '0', STR_PAD_LEFT);
 }
 
 /*********************************

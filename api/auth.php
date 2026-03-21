@@ -57,7 +57,7 @@ function handleGetRequest() {
 
     if (!empty($_SESSION['user_id']) && !empty($_SESSION['logged_in'])) {
         $stmt = $conn->prepare(
-            "SELECT id, full_name, email, phone, address, city, gender, avatar,
+            "SELECT id, full_name, email, phone, gender, avatar,
                     member_level, member_points, total_orders, login_method,
                     rating, verified, member_since, created_at, updated_at
              FROM users WHERE id = :id"
@@ -68,7 +68,7 @@ function handleGetRequest() {
         if ($user) {
             ResponseHandler::success([
                 'authenticated' => true,
-                'user' => formatUserData($user)
+                'user' => formatUserData($conn, $user)
             ]);
         }
     }
@@ -102,6 +102,9 @@ function handlePostRequest() {
             break;
         case 'update_profile':
             updateProfile($conn, $input);
+            break;
+        case 'update_address':
+            updateAddress($conn, $input);
             break;
         case 'change_password':
             changePassword($conn, $input);
@@ -173,21 +176,20 @@ function loginUser($conn, $data) {
     unset($user['password']);
 
     ResponseHandler::success([
-        'user' => formatUserData($user)
+        'user' => formatUserData($conn, $user)
     ], 'Login successful');
 }
 
 /*********************************
  * REGISTER - User chooses login method (email or phone)
- * Address removed from registration
+ * Address fields removed - can be added later via update_address
  *********************************/
 function registerUser($conn, $data) {
-    // Registration fields - address removed
+    // Registration fields - no address fields
     $fullName = trim($data['full_name'] ?? '');
     $email = trim($data['email'] ?? '');
     $phone = !empty($data['phone']) ? cleanPhoneNumber($data['phone']) : null;
     $password = $data['password'] ?? '';
-    $city = trim($data['city'] ?? '');
     $gender = $data['gender'] ?? null;
     $loginMethod = $data['login_method'] ?? 'email'; // 'email' or 'phone' - what user chose
 
@@ -212,7 +214,7 @@ function registerUser($conn, $data) {
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
             ResponseHandler::error('Enter a valid email address', 400);
         }
-        // Make email required, phone optional
+        // Phone is optional
         if ($phone && strlen($phone) < 10) {
             ResponseHandler::error('Enter a valid phone number', 400);
         }
@@ -223,7 +225,7 @@ function registerUser($conn, $data) {
         if (strlen($phone) < 10) {
             ResponseHandler::error('Enter a valid phone number', 400);
         }
-        // Make phone required, email optional
+        // Email is optional
         if ($email && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
             ResponseHandler::error('Enter a valid email address', 400);
         }
@@ -252,12 +254,12 @@ function registerUser($conn, $data) {
         ResponseHandler::error('User already exists with this email or phone', 409);
     }
 
-    // Create user - address field set to empty string
+    // Create user - no address fields
     $stmt = $conn->prepare(
-        "INSERT INTO users (full_name, email, phone, password, address, city, gender, 
+        "INSERT INTO users (full_name, email, phone, password, gender, 
                             member_level, member_points, total_orders, login_method,
                             rating, verified, member_since, created_at, updated_at)
-         VALUES (:full_name, :email, :phone, :password, '', :city, :gender,
+         VALUES (:full_name, :email, :phone, :password, :gender,
                   'basic', 0, 0, :login_method, 0.00, 0, :member_since, NOW(), NOW())"
     );
     
@@ -266,16 +268,15 @@ function registerUser($conn, $data) {
         ':email' => $email ?: null,
         ':phone' => $phone ?: null,
         ':password' => password_hash($password, PASSWORD_DEFAULT),
-        ':city' => $city,
         ':gender' => $gender,
         ':login_method' => $loginMethod,
-        ':member_since' => date('M d, Y') // Format: Jan 15, 2023 like Flutter
+        ':member_since' => date('M d, Y') // Format: Jan 15, 2023
     ]);
 
     // Get the new user
     $userId = $conn->lastInsertId();
     $stmt = $conn->prepare(
-        "SELECT id, full_name, email, phone, address, city, gender, avatar,
+        "SELECT id, full_name, email, phone, gender, avatar,
                  member_level, member_points, total_orders, login_method,
                  rating, verified, member_since, created_at, updated_at
          FROM users WHERE id = :id"
@@ -288,12 +289,12 @@ function registerUser($conn, $data) {
     $_SESSION['logged_in'] = true;
 
     ResponseHandler::success([
-        'user' => formatUserData($user)
+        'user' => formatUserData($conn, $user)
     ], 'Registration successful', 201);
 }
 
 /*********************************
- * UPDATE PROFILE - Address can be added later
+ * UPDATE PROFILE - Update basic user info (no address)
  *********************************/
 function updateProfile($conn, $data) {
     if (empty($_SESSION['user_id'])) {
@@ -304,8 +305,7 @@ function updateProfile($conn, $data) {
     $fullName = trim($data['full_name'] ?? '');
     $email = trim($data['email'] ?? '');
     $phone = !empty($data['phone']) ? cleanPhoneNumber($data['phone']) : null;
-    $address = trim($data['address'] ?? '');
-    $city = trim($data['city'] ?? '');
+    $gender = $data['gender'] ?? null;
     $avatar = $data['avatar'] ?? null;
 
     // Validation
@@ -338,14 +338,14 @@ function updateProfile($conn, $data) {
         ResponseHandler::error('Email or phone already in use', 409);
     }
 
-    // Update user
+    // Update user (no address fields)
     $stmt = $conn->prepare(
         "UPDATE users SET 
             full_name = :full_name,
             email = :email,
             phone = :phone,
-            address = :address,
-            city = :city,
+            gender = :gender,
+            avatar = :avatar,
             updated_at = NOW()
          WHERE id = :id"
     );
@@ -354,14 +354,14 @@ function updateProfile($conn, $data) {
         ':full_name' => $fullName,
         ':email' => $email,
         ':phone' => $phone,
-        ':address' => $address,
-        ':city' => $city,
+        ':gender' => $gender,
+        ':avatar' => $avatar,
         ':id' => $_SESSION['user_id']
     ]);
 
     // Get updated user
     $stmt = $conn->prepare(
-        "SELECT id, full_name, email, phone, address, city, gender, avatar,
+        "SELECT id, full_name, email, phone, gender, avatar,
                  member_level, member_points, total_orders, login_method,
                  rating, verified, member_since, created_at, updated_at
          FROM users WHERE id = :id"
@@ -370,8 +370,182 @@ function updateProfile($conn, $data) {
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
     ResponseHandler::success([
-        'user' => formatUserData($user)
+        'user' => formatUserData($conn, $user)
     ], 'Profile updated successfully');
+}
+
+/*********************************
+ * UPDATE ADDRESS - Add or update user address
+ *********************************/
+function updateAddress($conn, $data) {
+    if (empty($_SESSION['user_id'])) {
+        ResponseHandler::error('Unauthorized', 401);
+    }
+
+    $addressLine1 = trim($data['address_line1'] ?? '');
+    $addressLine2 = trim($data['address_line2'] ?? '');
+    $city = trim($data['city'] ?? '');
+    $state = trim($data['state'] ?? '');
+    $postalCode = trim($data['postal_code'] ?? '');
+    $country = trim($data['country'] ?? 'Egypt');
+    $addressType = $data['address_type'] ?? 'home';
+    $isDefault = $data['is_default'] ?? true;
+
+    // Validation
+    if (!$addressLine1) {
+        ResponseHandler::error('Address line 1 is required', 400);
+    }
+    
+    if (!$city) {
+        ResponseHandler::error('City is required', 400);
+    }
+
+    $userId = $_SESSION['user_id'];
+
+    // Check if user already has a default address
+    if ($isDefault) {
+        // Remove default flag from all existing addresses
+        $stmt = $conn->prepare("UPDATE user_addresses SET is_default = 0 WHERE user_id = :user_id");
+        $stmt->execute([':user_id' => $userId]);
+    }
+
+    // Check if address already exists for this user
+    $checkStmt = $conn->prepare(
+        "SELECT id FROM user_addresses 
+         WHERE user_id = :user_id AND address_line1 = :address_line1 AND city = :city"
+    );
+    $checkStmt->execute([
+        ':user_id' => $userId,
+        ':address_line1' => $addressLine1,
+        ':city' => $city
+    ]);
+    
+    $existingAddress = $checkStmt->fetch(PDO::FETCH_ASSOC);
+    
+    if ($existingAddress) {
+        // Update existing address
+        $stmt = $conn->prepare(
+            "UPDATE user_addresses SET 
+                address_line2 = :address_line2,
+                state = :state,
+                postal_code = :postal_code,
+                country = :country,
+                address_type = :address_type,
+                is_default = :is_default,
+                updated_at = NOW()
+             WHERE id = :id AND user_id = :user_id"
+        );
+        
+        $stmt->execute([
+            ':address_line2' => $addressLine2,
+            ':state' => $state,
+            ':postal_code' => $postalCode,
+            ':country' => $country,
+            ':address_type' => $addressType,
+            ':is_default' => $isDefault ? 1 : 0,
+            ':id' => $existingAddress['id'],
+            ':user_id' => $userId
+        ]);
+        
+        $addressId = $existingAddress['id'];
+    } else {
+        // Insert new address
+        $stmt = $conn->prepare(
+            "INSERT INTO user_addresses 
+                (user_id, address_line1, address_line2, city, state, postal_code, 
+                 country, address_type, is_default, created_at, updated_at)
+             VALUES 
+                (:user_id, :address_line1, :address_line2, :city, :state, :postal_code,
+                 :country, :address_type, :is_default, NOW(), NOW())"
+        );
+        
+        $stmt->execute([
+            ':user_id' => $userId,
+            ':address_line1' => $addressLine1,
+            ':address_line2' => $addressLine2,
+            ':city' => $city,
+            ':state' => $state,
+            ':postal_code' => $postalCode,
+            ':country' => $country,
+            ':address_type' => $addressType,
+            ':is_default' => $isDefault ? 1 : 0
+        ]);
+        
+        $addressId = $conn->lastInsertId();
+    }
+
+    // Get the updated address
+    $stmt = $conn->prepare(
+        "SELECT * FROM user_addresses WHERE id = :id AND user_id = :user_id"
+    );
+    $stmt->execute([':id' => $addressId, ':user_id' => $userId]);
+    $address = $stmt->fetch(PDO::FETCH_ASSOC);
+
+    ResponseHandler::success([
+        'address' => $address
+    ], 'Address saved successfully');
+}
+
+/*********************************
+ * GET ADDRESSES - Get all addresses for current user
+ *********************************/
+function getAddresses($conn) {
+    if (empty($_SESSION['user_id'])) {
+        ResponseHandler::error('Unauthorized', 401);
+    }
+    
+    $stmt = $conn->prepare(
+        "SELECT * FROM user_addresses 
+         WHERE user_id = :user_id 
+         ORDER BY is_default DESC, created_at DESC"
+    );
+    $stmt->execute([':user_id' => $_SESSION['user_id']]);
+    $addresses = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    
+    ResponseHandler::success([
+        'addresses' => $addresses
+    ], 'Addresses retrieved successfully');
+}
+
+/*********************************
+ * DELETE ADDRESS - Delete an address
+ *********************************/
+function deleteAddress($conn, $data) {
+    if (empty($_SESSION['user_id'])) {
+        ResponseHandler::error('Unauthorized', 401);
+    }
+    
+    $addressId = $data['address_id'] ?? 0;
+    
+    if (!$addressId) {
+        ResponseHandler::error('Address ID is required', 400);
+    }
+    
+    // Check if address belongs to user
+    $stmt = $conn->prepare(
+        "SELECT id, is_default FROM user_addresses 
+         WHERE id = :id AND user_id = :user_id"
+    );
+    $stmt->execute([
+        ':id' => $addressId,
+        ':user_id' => $_SESSION['user_id']
+    ]);
+    $address = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$address) {
+        ResponseHandler::error('Address not found', 404);
+    }
+    
+    // Delete address
+    $stmt = $conn->prepare(
+        "DELETE FROM user_addresses WHERE id = :id AND user_id = :user_id"
+    );
+    $stmt->execute([
+        ':id' => $addressId,
+        ':user_id' => $_SESSION['user_id']
+    ]);
+    
+    ResponseHandler::success([], 'Address deleted successfully');
 }
 
 /*********************************
@@ -451,6 +625,7 @@ function forgotPassword($conn, $data) {
     if (!$user) {
         // For security, don't reveal if user exists
         ResponseHandler::success([], 'If your account exists, you will receive reset instructions');
+        return;
     }
 
     // Generate reset token (in production, send actual email/SMS)
@@ -497,27 +672,51 @@ function cleanPhoneNumber($phone) {
 
 /*********************************
  * FORMAT USER DATA FOR FLUTTER
+ * Now includes address from user_addresses table
  *********************************/
-function formatUserData($u) {
+function formatUserData($conn, $user) {
+    // Get default address if exists
+    $address = null;
+    $city = null;
+    
+    if (!empty($user['id'])) {
+        $stmt = $conn->prepare(
+            "SELECT address_line1, address_line2, city, state, postal_code, country 
+             FROM user_addresses 
+             WHERE user_id = :user_id AND is_default = 1 
+             LIMIT 1"
+        );
+        $stmt->execute([':user_id' => $user['id']]);
+        $defaultAddress = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($defaultAddress) {
+            $address = $defaultAddress['address_line1'];
+            if (!empty($defaultAddress['address_line2'])) {
+                $address .= ', ' . $defaultAddress['address_line2'];
+            }
+            $city = $defaultAddress['city'] ?? '';
+        }
+    }
+    
     return [
-        'id' => $u['id'],
-        'name' => $u['full_name'] ?: 'User',
-        'full_name' => $u['full_name'] ?: 'User',
-        'email' => $u['email'] ?? '',
-        'phone' => $u['phone'] ?? '',
-        'address' => $u['address'] ?? '',
-        'city' => $u['city'] ?? '',
-        'gender' => $u['gender'] ?? '',
-        'avatar' => $u['avatar'] ?? null,
-        'login_method' => $u['login_method'] ?? 'email',
-        'member_level' => $u['member_level'] ?? 'basic',
-        'member_points' => (int) ($u['member_points'] ?? 0),
-        'total_orders' => (int) ($u['total_orders'] ?? 0),
-        'rating' => (float) ($u['rating'] ?? 0.00),
-        'verified' => (bool) ($u['verified'] ?? false),
-        'member_since' => $u['member_since'] ?? date('M d, Y'),
-        'created_at' => $u['created_at'] ?? '',
-        'updated_at' => $u['updated_at'] ?? ''
+        'id' => $user['id'],
+        'name' => $user['full_name'] ?: 'User',
+        'full_name' => $user['full_name'] ?: 'User',
+        'email' => $user['email'] ?? '',
+        'phone' => $user['phone'] ?? '',
+        'address' => $address ?? '', // Comes from user_addresses table
+        'city' => $city ?? '',
+        'gender' => $user['gender'] ?? '',
+        'avatar' => $user['avatar'] ?? null,
+        'login_method' => $user['login_method'] ?? 'email',
+        'member_level' => $user['member_level'] ?? 'basic',
+        'member_points' => (int) ($user['member_points'] ?? 0),
+        'total_orders' => (int) ($user['total_orders'] ?? 0),
+        'rating' => (float) ($user['rating'] ?? 0.00),
+        'verified' => (bool) ($user['verified'] ?? false),
+        'member_since' => $user['member_since'] ?? date('M d, Y'),
+        'created_at' => $user['created_at'] ?? '',
+        'updated_at' => $user['updated_at'] ?? ''
     ];
 }
 ?>
