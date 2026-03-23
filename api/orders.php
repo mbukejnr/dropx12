@@ -1,31 +1,28 @@
 <?php
 /*********************************
- * CORS Configuration
+ * ORDERS API - CUSTOMER APP ONLY
+ * All orders must come from cart
+ * Cancel only within first 2 minutes
  *********************************/
-// Start output buffering to prevent headers already sent error
+
 ob_start();
 
-// Turn off display_errors for production
 ini_set('display_errors', 0);
 error_reporting(E_ALL & ~E_WARNING & ~E_NOTICE);
 
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Session-Token, X-App-Version, X-Platform, X-Device-ID, X-Timestamp");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Session-Token");
 header("Access-Control-Max-Age: 3600");
 header("Content-Type: application/json; charset=UTF-8");
-header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
-header("Pragma: no-cache");
+header("Cache-Control: no-store, no-cache, must-revalidate");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
     exit();
 }
 
-/*********************************
- * ERROR HANDLING
- *********************************/
 set_error_handler(function($errno, $errstr, $errfile, $errline) {
     if (strpos($errstr, 'Undefined array key') !== false) {
         return true;
@@ -33,9 +30,6 @@ set_error_handler(function($errno, $errstr, $errfile, $errline) {
     throw new ErrorException($errstr, 0, $errno, $errfile, $errline);
 });
 
-/*********************************
- * SESSION CONFIG
- *********************************/
 if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
         'lifetime' => 86400 * 30,
@@ -48,17 +42,11 @@ if (session_status() === PHP_SESSION_NONE) {
     session_start();
 }
 
-/*********************************
- * BASE URL CONFIGURATION
- *********************************/
 $baseUrl = "https://dropx12-production.up.railway.app";
 
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
-/*********************************
- * AUTHENTICATION CHECK
- *********************************/
 function checkAuthentication() {
     $sessionToken = $_SERVER['HTTP_X_SESSION_TOKEN'] ?? null;
     
@@ -79,23 +67,19 @@ function checkAuthentication() {
     return null;
 }
 
-/*********************************
- * ROUTER
- *********************************/
 try {
     $method = $_SERVER['REQUEST_METHOD'];
-    
     $input = json_decode(file_get_contents('php://input'), true);
     if (!$input) {
         $input = $_POST;
     }
     
     $action = $input['action'] ?? $_GET['action'] ?? '';
-
     $userId = checkAuthentication();
+    
     if (!$userId) {
         ob_clean();
-        ResponseHandler::error('Authentication required. Please login.', 401, 'AUTH_REQUIRED');
+        ResponseHandler::error('Authentication required', 401, 'AUTH_REQUIRED');
     }
 
     if ($method === 'GET') {
@@ -117,17 +101,11 @@ try {
         ResponseHandler::error('Method not allowed', 405);
     }
 
-} catch (ErrorException $e) {
-    ob_clean();
-    ResponseHandler::error('Server error: ' . $e->getMessage(), 500, 'SERVER_ERROR');
 } catch (Exception $e) {
     ob_clean();
-    ResponseHandler::error('Server error: ' . $e->getMessage(), 500, 'SERVER_ERROR');
+    ResponseHandler::error('Server error: ' . $e->getMessage(), 500);
 }
 
-/*********************************
- * GET ACTIONS HANDLER
- *********************************/
 function handleGetActions($action, $input, $userId) {
     $db = new Database();
     $conn = $db->getConnection();
@@ -135,553 +113,64 @@ function handleGetActions($action, $input, $userId) {
     try {
         switch ($action) {
             case 'get_orders':
-                handleGetOrders($conn, $input, $userId);
+                getOrders($conn, $input, $userId);
                 break;
             case 'get_order':
                 $orderId = $input['order_id'] ?? $_GET['order_id'] ?? '';
                 if ($orderId) {
                     getOrderDetails($conn, $orderId, $userId);
                 } else {
-                    ob_clean();
                     ResponseHandler::error('Order ID required', 400);
                 }
                 break;
             case 'latest_active':
                 getLatestActiveOrder($conn, $userId);
                 break;
-            case 'track_order':
-                $orderId = $input['order_id'] ?? $_GET['order_id'] ?? '';
-                if ($orderId) {
-                    trackOrder($conn, $orderId, $userId);
-                } else {
-                    ob_clean();
-                    ResponseHandler::error('Order ID required', 400);
-                }
-                break;
             default:
-                ob_clean();
                 ResponseHandler::error('Invalid action', 400);
         }
     } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Error in get action: ' . $e->getMessage(), 500);
+        ResponseHandler::error('Error: ' . $e->getMessage(), 500);
     }
 }
 
-/*********************************
- * POST ACTIONS HANDLER
- *********************************/
 function handlePostActions($action, $input, $userId) {
     $db = new Database();
     $conn = $db->getConnection();
     
     try {
         switch ($action) {
-            case 'create_order':
-                createOrder($conn, $input, $userId);
-                break;
             case 'create_from_cart':
                 createOrderFromCart($conn, $input, $userId);
                 break;
             case 'cancel_order':
                 cancelOrder($conn, $input, $userId);
                 break;
-            case 'reorder':
-                reorder($conn, $input, $userId);
-                break;
-            case 'quick_order':
-                createQuickOrderFromItems($conn, $input, $userId);
-                break;
             default:
-                ob_clean();
                 ResponseHandler::error('Invalid action', 400);
         }
     } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Error in post action: ' . $e->getMessage(), 500);
+        ResponseHandler::error('Error: ' . $e->getMessage(), 500);
     }
 }
 
 /*********************************
- * GET REQUESTS (Legacy)
+ * GET ORDERS - SIMPLE LIST FOR CUSTOMER
  *********************************/
-function handleGetRequest($userId) {
-    $db = new Database();
-    $conn = $db->getConnection();
-    
-    try {
-        $orderId = $_GET['id'] ?? null;
-        
-        if ($orderId) {
-            getOrderDetails($conn, $orderId, $userId);
-        } else {
-            getOrdersList($conn, $userId);
-        }
-    } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Error in get request: ' . $e->getMessage(), 500);
-    }
-}
-
-/*********************************
- * POST REQUESTS (Legacy)
- *********************************/
-function handlePostRequest($userId) {
-    $db = new Database();
-    $conn = $db->getConnection();
-    
-    try {
-        $input = json_decode(file_get_contents('php://input'), true);
-        if (!$input) {
-            $input = $_POST;
-        }
-        
-        $action = $input['action'] ?? '';
-
-        switch ($action) {
-            case 'create_order':
-                createOrder($conn, $input, $userId);
-                break;
-            case 'create_from_cart':
-                createOrderFromCart($conn, $input, $userId);
-                break;
-            case 'cancel_order':
-                cancelOrder($conn, $input, $userId);
-                break;
-            case 'reorder':
-                reorder($conn, $input, $userId);
-                break;
-            case 'latest_active':
-                getLatestActiveOrder($conn, $userId);
-                break;
-            case 'track_order':
-                $orderId = $input['order_id'] ?? '';
-                if ($orderId) {
-                    trackOrder($conn, $orderId, $userId);
-                } else {
-                    ob_clean();
-                    ResponseHandler::error('Order ID required', 400);
-                }
-                break;
-            default:
-                ob_clean();
-                ResponseHandler::error('Invalid action', 400);
-        }
-    } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Error in post request: ' . $e->getMessage(), 500);
-    }
-}
-
-/*********************************
- * PUT REQUESTS
- *********************************/
-function handlePutRequest($userId) {
-    $db = new Database();
-    $conn = $db->getConnection();
-    
-    try {
-        $input = json_decode(file_get_contents('php://input'), true);
-        if (!$input) {
-            parse_str(file_get_contents('php://input'), $input);
-        }
-        
-        $action = $input['action'] ?? '';
-
-        switch ($action) {
-            case 'update_order':
-                updateOrder($conn, $input, $userId);
-                break;
-            case 'update_delivery_address':
-                updateDeliveryAddress($conn, $input, $userId);
-                break;
-            default:
-                ob_clean();
-                ResponseHandler::error('Invalid action', 400);
-        }
-    } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Error in put request: ' . $e->getMessage(), 500);
-    }
-}
-
-/*********************************
- * GET ORDER DETAILS (PROFESSIONAL VERSION)
- * Shows complete order details including items, add-ons, variants, and tracking
- *********************************/
-function getOrderDetails($conn, $orderId, $userId) {
-    global $baseUrl;
-    
-    try {
-        // Validate inputs
-        if (!$orderId || !is_numeric($orderId)) {
-            ob_clean();
-            ResponseHandler::error('Invalid order ID', 400);
-            return;
-        }
-
-        // Get order header with merchant and customer details
-        $orderSql = "SELECT 
-                        o.id,
-                        o.order_number,
-                        o.status,
-                        o.subtotal,
-                        o.delivery_fee,
-                        o.tip_amount,
-                        o.discount_amount,
-                        o.total_amount,
-                        o.payment_method,
-                        o.payment_status,
-                        o.delivery_address,
-                        o.special_instructions as order_instructions,
-                        o.cancellation_reason,
-                        o.created_at,
-                        o.updated_at,
-                        o.merchant_id,
-                        
-                        -- Customer details
-                        u.id as customer_id,
-                        u.full_name as customer_name,
-                        u.phone as customer_phone,
-                        u.email as customer_email,
-                        
-                        -- Merchant details
-                        m.id as merchant_id,
-                        m.name as merchant_name,
-                        m.address as merchant_address,
-                        m.phone as merchant_phone,
-                        m.email as merchant_email,
-                        m.image_url as merchant_image,
-                        m.latitude as merchant_lat,
-                        m.longitude as merchant_lng,
-                        m.delivery_fee as merchant_delivery_fee,
-                        m.preparation_time,
-                        m.cuisine_type,
-                        
-                        -- Driver details - with correct column names (rating and image removed)
-                        d.id as driver_id,
-                        d.name as driver_name,
-                        d.phone as driver_phone,
-                        d.vehicle_type,
-                        d.vehicle_number
-                        
-                    FROM orders o
-                    LEFT JOIN users u ON o.user_id = u.id
-                    LEFT JOIN merchants m ON o.merchant_id = m.id
-                    LEFT JOIN drivers d ON o.driver_id = d.id
-                    WHERE o.id = :order_id AND o.user_id = :user_id";
-
-        $orderStmt = $conn->prepare($orderSql);
-        $orderStmt->execute([
-            ':order_id' => $orderId,
-            ':user_id' => $userId
-        ]);
-        
-        $order = $orderStmt->fetch(PDO::FETCH_ASSOC);
-
-        if (!$order) {
-            ob_clean();
-            ResponseHandler::error('Order not found', 404);
-            return;
-        }
-
-        // Get order items with complete details - SEPARATE QUERY FOR RELIABILITY
-        $itemsSql = "SELECT 
-                        oi.id as item_id,
-                        oi.quick_order_id,
-                        oi.quick_order_item_id,
-                        oi.item_name,
-                        oi.description,
-                        oi.quantity,
-                        oi.price as unit_price,
-                        oi.total as item_total,
-                        oi.variant_id,
-                        oi.variant_data,
-                        oi.add_ons_json,
-                        oi.special_instructions as item_instructions,
-                        oi.created_at as item_created_at
-                    FROM order_items oi
-                    WHERE oi.order_id = :order_id
-                    ORDER BY oi.id ASC";
-
-        $itemsStmt = $conn->prepare($itemsSql);
-        $itemsStmt->execute([':order_id' => $orderId]);
-        $dbItems = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
-
-        // Get status history
-        $historySql = "SELECT 
-                        old_status,
-                        new_status,
-                        reason,
-                        notes,
-                        created_at as timestamp,
-                        changed_by,
-                        changed_by_id
-                    FROM order_status_history
-                    WHERE order_id = :order_id
-                    ORDER BY created_at ASC";
-
-        $historyStmt = $conn->prepare($historySql);
-        $historyStmt->execute([':order_id' => $orderId]);
-        $statusHistory = $historyStmt->fetchAll(PDO::FETCH_ASSOC);
-
-        // Get tracking information
-        $trackingSql = "SELECT 
-                        status,
-                        location,
-                        description,
-                        created_at as timestamp
-                    FROM order_tracking
-                    WHERE order_id = :order_id
-                    ORDER BY created_at ASC";
-
-        $trackingStmt = $conn->prepare($trackingSql);
-        $trackingStmt->execute([':order_id' => $orderId]);
-        $tracking = $trackingStmt->fetchAll(PDO::FETCH_ASSOC);
-
-        // Format items with proper add-ons structure
-        $formattedItems = [];
-        $totalItemsCount = 0;
-        $totalAddOnsCount = 0;
-
-        foreach ($dbItems as $dbItem) {
-            // Parse add-ons JSON
-            $addOns = [];
-            $addOnsTotal = 0;
-            
-            if (!empty($dbItem['add_ons_json'])) {
-                $rawAddOns = json_decode($dbItem['add_ons_json'], true);
-                if (is_array($rawAddOns)) {
-                    foreach ($rawAddOns as $addOn) {
-                        // Ensure add-on has all required fields
-                        $addOnPrice = floatval($addOn['price'] ?? 0);
-                        $addOnQty = intval($addOn['quantity'] ?? 1);
-                        $addOnTotal = floatval($addOn['total'] ?? ($addOnPrice * $addOnQty));
-                        
-                        $addOnItem = [
-                            'id' => $addOn['id'] ?? null,
-                            'name' => $addOn['name'] ?? 'Add-on',
-                            'price' => $addOnPrice,
-                            'quantity' => $addOnQty,
-                            'original_quantity' => intval($addOn['original_quantity'] ?? $addOnQty),
-                            'per_item_quantity' => intval($addOn['per_item_quantity'] ?? 1),
-                            'total' => $addOnTotal,
-                            'category' => $addOn['category'] ?? 'Add-ons',
-                            'is_per_item' => isset($addOn['is_per_item']) ? (bool)$addOn['is_per_item'] : true,
-                            'is_required' => isset($addOn['is_required']) ? (bool)$addOn['is_required'] : false,
-                            'max_quantity' => intval($addOn['max_quantity'] ?? 1)
-                        ];
-                        
-                        $addOns[] = $addOnItem;
-                        $addOnsTotal += $addOnTotal;
-                    }
-                }
-            }
-
-            // Parse variant data
-            $variant = null;
-            if (!empty($dbItem['variant_data'])) {
-                $variantData = json_decode($dbItem['variant_data'], true);
-                if (is_array($variantData)) {
-                    $variant = [
-                        'id' => $variantData['id'] ?? null,
-                        'name' => $variantData['name'] ?? null,
-                        'price' => floatval($variantData['price'] ?? 0),
-                        'options' => $variantData['options'] ?? null
-                    ];
-                }
-            }
-
-            // Build item data
-            $itemTotal = floatval($dbItem['item_total']);
-            $itemData = [
-                'id' => intval($dbItem['item_id']),
-                'name' => $dbItem['item_name'],
-                'description' => $dbItem['description'] ?? '',
-                'quantity' => intval($dbItem['quantity']),
-                'unit_price' => floatval($dbItem['unit_price']),
-                'item_total' => $itemTotal,
-                
-                // Add-ons
-                'add_ons' => $addOns,
-                'add_ons_total' => $addOnsTotal,
-                'has_addons' => !empty($addOns),
-                'addons_count' => count($addOns),
-                
-                // Variant
-                'variant' => $variant,
-                'has_variant' => !is_null($variant),
-                'variant_id' => $dbItem['variant_id'] ? intval($dbItem['variant_id']) : null,
-                
-                // Quick order reference
-                'quick_order_id' => $dbItem['quick_order_id'] ? intval($dbItem['quick_order_id']) : null,
-                'quick_order_item_id' => $dbItem['quick_order_item_id'] ? intval($dbItem['quick_order_item_id']) : null,
-                
-                // Instructions
-                'special_instructions' => $dbItem['item_instructions'] ?? '',
-                
-                // Timestamps
-                'created_at' => $dbItem['item_created_at']
-            ];
-            
-            $formattedItems[] = $itemData;
-            $totalItemsCount += $itemData['quantity'];
-            $totalAddOnsCount += count($addOns);
-        }
-
-        // Calculate progress based on status
-        $statusProgress = [
-            'pending' => 20,
-            'confirmed' => 40,
-            'preparing' => 60,
-            'ready' => 80,
-            'out_for_delivery' => 90,
-            'delivered' => 100,
-            'cancelled' => 0,
-            'rejected' => 0
-        ];
-
-        // Estimate delivery time
-        $estimatedDelivery = null;
-        if (!in_array($order['status'], ['delivered', 'cancelled', 'rejected'])) {
-            $prepTime = intval($order['preparation_time'] ?? 30);
-            $createdAt = new DateTime($order['created_at']);
-            $estimatedDelivery = $createdAt->modify("+{$prepTime} minutes")->format('Y-m-d H:i:s');
-        }
-
-        // Build complete order response
-        $orderData = [
-            'id' => intval($order['id']),
-            'order_number' => $order['order_number'],
-            'status' => $order['status'],
-            'status_label' => ucfirst(str_replace('_', ' ', $order['status'])),
-            'status_progress' => $statusProgress[$order['status']] ?? 20,
-            
-            // Financial details
-            'financial' => [
-                'subtotal' => floatval($order['subtotal']),
-                'delivery_fee' => floatval($order['delivery_fee']),
-                'tip_amount' => floatval($order['tip_amount'] ?? 0),
-                'discount_amount' => floatval($order['discount_amount'] ?? 0),
-                'total_amount' => floatval($order['total_amount']),
-                'payment_method' => $order['payment_method'] ?? 'cash',
-                'payment_status' => $order['payment_status'] ?? 'pending'
-            ],
-            
-            // Customer information
-            'customer' => [
-                'id' => intval($order['customer_id'] ?? 0),
-                'name' => $order['customer_name'] ?? 'Customer',
-                'phone' => $order['customer_phone'] ?? '',
-                'email' => $order['customer_email'] ?? ''
-            ],
-            
-            // Merchant information - WITH FALLBACK HANDLING
-            'merchant' => [
-                'id' => intval($order['merchant_id'] ?? 0),
-                'name' => !empty($order['merchant_name']) ? $order['merchant_name'] : 'Restaurant',
-                'address' => $order['merchant_address'] ?? '',
-                'phone' => $order['merchant_phone'] ?? '',
-                'email' => $order['merchant_email'] ?? '',
-                'image' => formatImageUrl($order['merchant_image'], 'merchants'),
-                'cuisine' => $order['cuisine_type'] ?? '',
-                'location' => [
-                    'lat' => $order['merchant_lat'] ? floatval($order['merchant_lat']) : null,
-                    'lng' => $order['merchant_lng'] ? floatval($order['merchant_lng']) : null
-                ]
-            ],
-            
-            // Driver information (if assigned) - UPDATED with correct column names
-            'driver' => ($order['driver_id']) ? [
-                'id' => intval($order['driver_id']),
-                'name' => $order['driver_name'] ?? '',
-                'phone' => $order['driver_phone'] ?? '',
-                'vehicle_type' => $order['vehicle_type'] ?? '',
-                'vehicle_number' => $order['vehicle_number'] ?? ''
-            ] : null,
-            
-            // Delivery details
-            'delivery' => [
-                'address' => $order['delivery_address'],
-                'estimated_delivery' => $estimatedDelivery,
-                'instructions' => $order['order_instructions'] ?? ''
-            ],
-            
-            // Order items with add-ons
-            'items' => $formattedItems,
-            'items_summary' => [
-                'total_items' => $totalItemsCount,
-                'unique_items' => count($formattedItems),
-                'total_addons' => $totalAddOnsCount,
-                'has_addons' => $totalAddOnsCount > 0
-            ],
-            
-            // Timeline
-            'timeline' => [
-                'created_at' => $order['created_at'],
-                'updated_at' => $order['updated_at'],
-                'status_history' => $statusHistory,
-                'tracking' => $tracking
-            ],
-            
-            // Actions
-            'actions' => [
-                'can_cancel' => in_array($order['status'], ['pending', 'confirmed']),
-                'can_reorder' => true,
-                'can_rate' => in_array($order['status'], ['delivered'])
-            ],
-            
-            // Additional information
-            'cancellation_reason' => $order['cancellation_reason'] ?? null,
-            'special_instructions' => $order['order_instructions'] ?? ''
-        ];
-
-        ob_clean();
-        ResponseHandler::success(['order' => $orderData]);
-        
-    } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Failed to get order details: ' . $e->getMessage(), 500);
-    }
-}
-
-                      
-
-/*********************************
- * GET ORDERS HANDLER (Enhanced with Add-ons)
- *********************************/
-function handleGetOrders($conn, $input, $userId) {
+function getOrders($conn, $input, $userId) {
     try {
         $page = max(1, intval($input['page'] ?? $_GET['page'] ?? 1));
         $limit = min(50, max(1, intval($input['limit'] ?? $_GET['limit'] ?? 20)));
         $offset = ($page - 1) * $limit;
         
         $status = $input['status'] ?? $_GET['status'] ?? 'all';
-        $orderNumber = $input['order_number'] ?? $_GET['order_number'] ?? '';
-        $startDate = $input['start_date'] ?? $_GET['start_date'] ?? '';
-        $endDate = $input['end_date'] ?? $_GET['end_date'] ?? '';
-
+        
         $whereConditions = ["o.user_id = :user_id"];
         $params = [':user_id' => $userId];
 
         if ($status !== 'all') {
             $whereConditions[] = "o.status = :status";
             $params[':status'] = $status;
-        }
-
-        if ($orderNumber) {
-            $whereConditions[] = "o.order_number LIKE :order_number";
-            $params[':order_number'] = "%$orderNumber%";
-        }
-
-        if ($startDate) {
-            $whereConditions[] = "DATE(o.created_at) >= :start_date";
-            $params[':start_date'] = $startDate;
-        }
-
-        if ($endDate) {
-            $whereConditions[] = "DATE(o.created_at) <= :end_date";
-            $params[':end_date'] = $endDate;
         }
 
         $whereClause = "WHERE " . implode(" AND ", $whereConditions);
@@ -692,49 +181,20 @@ function handleGetOrders($conn, $input, $userId) {
         $countStmt->execute($params);
         $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-        // Get orders with merchant details - WITH PROPER ALIASES
+        // Get orders - simple version
         $sql = "SELECT 
                     o.id,
                     o.order_number,
                     o.status,
-                    o.subtotal,
-                    o.delivery_fee,
-                    o.tip_amount,
-                    o.discount_amount,
                     o.total_amount,
-                    o.payment_method,
-                    o.payment_status,
-                    o.delivery_address,
-                    o.special_instructions,
                     o.created_at,
-                    o.updated_at,
-                    o.merchant_id,
-                    
-                    -- Merchant details with aliases
                     m.name as merchant_name,
                     m.image_url as merchant_image,
-                    
-                    -- Item counts
                     (
                         SELECT COUNT(*) 
                         FROM order_items oi 
                         WHERE oi.order_id = o.id
-                    ) as item_count,
-                    (
-                        SELECT SUM(quantity) 
-                        FROM order_items oi 
-                        WHERE oi.order_id = o.id
-                    ) as total_items,
-                    
-                    -- Current status from history
-                    (
-                        SELECT new_status 
-                        FROM order_status_history 
-                        WHERE order_id = o.id 
-                        ORDER BY created_at DESC 
-                        LIMIT 1
-                    ) as current_status
-                    
+                    ) as item_count
                 FROM orders o
                 LEFT JOIN merchants m ON o.merchant_id = m.id
                 $whereClause
@@ -753,37 +213,17 @@ function handleGetOrders($conn, $input, $userId) {
         
         $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Get user details once
-        $userStmt = $conn->prepare(
-            "SELECT full_name, phone FROM users WHERE id = :user_id"
-        );
-        $userStmt->execute([':user_id' => $userId]);
-        $user = $userStmt->fetch(PDO::FETCH_ASSOC);
-
-        // Get add-ons count for each order
+        // Format orders
         $formattedOrders = [];
         foreach ($orders as $order) {
-            // Get add-ons count for this order
-            $addOnsSql = "SELECT COUNT(*) as addons_count 
-                         FROM order_items oi
-                         WHERE oi.order_id = :order_id 
-                         AND oi.add_ons_json IS NOT NULL 
-                         AND oi.add_ons_json != ''";
-            
-            $addOnsStmt = $conn->prepare($addOnsSql);
-            $addOnsStmt->execute([':order_id' => $order['id']]);
-            $addOnsResult = $addOnsStmt->fetch(PDO::FETCH_ASSOC);
-            $hasAddOns = ($addOnsResult['addons_count'] ?? 0) > 0;
-
-            // Get preview items (first 3 items)
+            // Get preview items (first 2 items only)
             $previewSql = "SELECT 
                             item_name, 
-                            quantity,
-                            add_ons_json
+                            quantity
                           FROM order_items 
                           WHERE order_id = :order_id 
                           ORDER BY id ASC 
-                          LIMIT 3";
+                          LIMIT 2";
             
             $previewStmt = $conn->prepare($previewSql);
             $previewStmt->execute([':order_id' => $order['id']]);
@@ -791,73 +231,259 @@ function handleGetOrders($conn, $input, $userId) {
             
             $itemsPreview = [];
             foreach ($previewItems as $item) {
-                $itemsPreview[] = [
-                    'name' => $item['item_name'],
-                    'quantity' => (int)$item['quantity'],
-                    'has_addons' => !empty($item['add_ons_json'])
-                ];
+                $itemsPreview[] = $item['item_name'] . ' x' . $item['quantity'];
             }
 
             $formattedOrders[] = [
-                'id' => (int)$order['id'],
+                'id' => intval($order['id']),
                 'order_number' => $order['order_number'],
                 'status' => $order['status'],
-                'current_status' => $order['current_status'] ?? $order['status'],
-                'customer_name' => $user['full_name'] ?? 'Customer',
-                'customer_phone' => $user['phone'] ?? '',
-                'delivery_address' => $order['delivery_address'],
-                'financial' => [
-                    'total_amount' => (float)$order['total_amount'],
-                    'delivery_fee' => (float)$order['delivery_fee'],
-                    'subtotal' => (float)$order['subtotal'],
-                    'tip_amount' => (float)($order['tip_amount'] ?? 0),
-                    'discount_amount' => (float)($order['discount_amount'] ?? 0)
-                ],
-                'items' => [
-                    'count' => (int)$order['item_count'],
-                    'total_quantity' => (int)$order['total_items'],
-                    'has_addons' => $hasAddOns,
-                    'preview' => $itemsPreview
-                ],
-                'created_at' => $order['created_at'],
-                'payment' => [
-                    'method' => $order['payment_method'] ?? 'cash',
-                    'status' => $order['payment_status'] ?? 'pending'
-                ],
+                'status_label' => ucfirst(str_replace('_', ' ', $order['status'])),
+                'total' => floatval($order['total_amount']),
+                'date' => date('M d, Y', strtotime($order['created_at'])),
+                'time' => date('h:i A', strtotime($order['created_at'])),
                 'merchant' => [
-                    'id' => $order['merchant_id'] ? (int)$order['merchant_id'] : null,
                     'name' => !empty($order['merchant_name']) ? $order['merchant_name'] : 'Restaurant',
                     'image' => formatImageUrl($order['merchant_image'], 'merchants')
                 ],
-                'special_instructions' => $order['special_instructions'] ?? '',
-                'updated_at' => $order['updated_at'],
-                'cancellation_reason' => $order['cancellation_reason'] ?? null,
-                'actions' => [
-                    'can_cancel' => in_array($order['status'], ['pending', 'confirmed']),
-                    'can_reorder' => true
+                'items' => [
+                    'count' => intval($order['item_count']),
+                    'preview' => $itemsPreview
                 ]
             ];
         }
 
-        ob_clean();
         ResponseHandler::success([
             'orders' => $formattedOrders,
             'pagination' => [
-                'current_page' => $page,
+                'page' => $page,
                 'per_page' => $limit,
-                'total_items' => (int)$totalCount,
-                'total_pages' => ceil($totalCount / $limit)
+                'total' => intval($totalCount),
+                'pages' => ceil($totalCount / $limit)
             ]
         ]);
         
     } catch (Exception $e) {
-        ob_clean();
         ResponseHandler::error('Failed to fetch orders: ' . $e->getMessage(), 500);
     }
 }
 
 /*********************************
- * CREATE ORDER FROM CART (Enhanced Add-ons)
+ * GET ORDER DETAILS - SIMPLE CUSTOMER VIEW
+ *********************************/
+function getOrderDetails($conn, $orderId, $userId) {
+    global $baseUrl;
+    
+    try {
+        if (!$orderId || !is_numeric($orderId)) {
+            ResponseHandler::error('Invalid order ID', 400);
+            return;
+        }
+
+        // Simple query - only what customers need
+        $orderSql = "SELECT 
+                        o.id,
+                        o.order_number,
+                        o.status,
+                        o.subtotal,
+                        o.delivery_fee,
+                        o.discount_amount,
+                        o.total_amount,
+                        o.payment_method,
+                        o.delivery_address,
+                        o.special_instructions as order_instructions,
+                        o.cancellation_reason,
+                        o.created_at,
+                        o.updated_at,
+                        
+                        -- Merchant details
+                        m.id as merchant_id,
+                        m.name as merchant_name,
+                        m.address as merchant_address,
+                        m.phone as merchant_phone,
+                        m.image_url as merchant_image,
+                        m.cuisine_type
+                        
+                    FROM orders o
+                    LEFT JOIN merchants m ON o.merchant_id = m.id
+                    WHERE o.id = :order_id AND o.user_id = :user_id";
+
+        $orderStmt = $conn->prepare($orderSql);
+        $orderStmt->execute([
+            ':order_id' => $orderId,
+            ':user_id' => $userId
+        ]);
+        
+        $order = $orderStmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$order) {
+            ResponseHandler::error('Order not found', 404);
+            return;
+        }
+
+        // Get order items
+        $itemsSql = "SELECT 
+                        oi.id as item_id,
+                        oi.item_name,
+                        oi.description,
+                        oi.quantity,
+                        oi.price as unit_price,
+                        oi.total as item_total,
+                        oi.add_ons_json,
+                        oi.special_instructions as item_instructions
+                    FROM order_items oi
+                    WHERE oi.order_id = :order_id
+                    ORDER BY oi.id ASC";
+
+        $itemsStmt = $conn->prepare($itemsSql);
+        $itemsStmt->execute([':order_id' => $orderId]);
+        $dbItems = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Get status history
+        $historySql = "SELECT 
+                        new_status,
+                        notes,
+                        created_at as timestamp
+                    FROM order_status_history
+                    WHERE order_id = :order_id
+                    ORDER BY created_at ASC";
+
+        $historyStmt = $conn->prepare($historySql);
+        $historyStmt->execute([':order_id' => $orderId]);
+        $statusHistory = $historyStmt->fetchAll(PDO::FETCH_ASSOC);
+
+        // Format items with add-ons
+        $formattedItems = [];
+        $totalItems = 0;
+
+        foreach ($dbItems as $dbItem) {
+            // Parse add-ons - simple version
+            $addOns = [];
+            if (!empty($dbItem['add_ons_json'])) {
+                $rawAddOns = json_decode($dbItem['add_ons_json'], true);
+                if (is_array($rawAddOns)) {
+                    foreach ($rawAddOns as $addOn) {
+                        $addOns[] = [
+                            'name' => $addOn['name'] ?? 'Add-on',
+                            'quantity' => intval($addOn['quantity'] ?? 1),
+                            'price' => floatval($addOn['price'] ?? 0)
+                        ];
+                    }
+                }
+            }
+            
+            $formattedItems[] = [
+                'id' => intval($dbItem['item_id']),
+                'name' => $dbItem['item_name'],
+                'description' => $dbItem['description'] ?? '',
+                'quantity' => intval($dbItem['quantity']),
+                'price' => floatval($dbItem['unit_price']),
+                'total' => floatval($dbItem['item_total']),
+                'add_ons' => $addOns,
+                'special_instructions' => $dbItem['item_instructions'] ?? ''
+            ];
+            
+            $totalItems += intval($dbItem['quantity']);
+        }
+
+        // Status progress
+        $statusProgress = [
+            'pending' => 20,
+            'confirmed' => 40,
+            'preparing' => 60,
+            'ready' => 80,
+            'out_for_delivery' => 90,
+            'delivered' => 100,
+            'cancelled' => 0,
+            'rejected' => 0
+        ];
+
+        // Format timeline
+        $timeline = [];
+        foreach ($statusHistory as $history) {
+            $timeline[] = [
+                'status' => $history['new_status'],
+                'label' => ucfirst(str_replace('_', ' ', $history['new_status'])),
+                'time' => $history['timestamp'],
+                'note' => $history['notes'] ?? ''
+            ];
+        }
+
+        // Calculate if order can still be cancelled (within 2 minutes)
+        $canCancel = false;
+        $cancelTimeRemaining = 0;
+        $cancelTimeLimit = 120; // 2 minutes
+        
+        if (in_array($order['status'], ['pending', 'confirmed'])) {
+            $createdAt = new DateTime($order['created_at']);
+            $now = new DateTime();
+            $timeDifference = $now->getTimestamp() - $createdAt->getTimestamp();
+            
+            if ($timeDifference <= $cancelTimeLimit) {
+                $canCancel = true;
+                $cancelTimeRemaining = $cancelTimeLimit - $timeDifference;
+            }
+        }
+
+        // Build simple response
+        $response = [
+            'id' => intval($order['id']),
+            'order_number' => $order['order_number'],
+            'status' => $order['status'],
+            'status_label' => ucfirst(str_replace('_', ' ', $order['status'])),
+            'status_progress' => $statusProgress[$order['status']] ?? 20,
+            
+            'totals' => [
+                'subtotal' => floatval($order['subtotal']),
+                'delivery_fee' => floatval($order['delivery_fee']),
+                'discount' => floatval($order['discount_amount'] ?? 0),
+                'total' => floatval($order['total_amount'])
+            ],
+            
+            'payment' => [
+                'method' => $order['payment_method'] ?? 'Cash on Delivery'
+            ],
+            
+            'merchant' => [
+                'id' => intval($order['merchant_id'] ?? 0),
+                'name' => !empty($order['merchant_name']) ? $order['merchant_name'] : 'Restaurant',
+                'address' => $order['merchant_address'] ?? '',
+                'phone' => $order['merchant_phone'] ?? '',
+                'image' => formatImageUrl($order['merchant_image'], 'merchants'),
+                'cuisine' => $order['cuisine_type'] ?? ''
+            ],
+            
+            'delivery' => [
+                'address' => $order['delivery_address'],
+                'instructions' => $order['order_instructions'] ?? ''
+            ],
+            
+            'items' => $formattedItems,
+            'items_count' => $totalItems,
+            'unique_items' => count($formattedItems),
+            
+            'timeline' => $timeline,
+            
+            'actions' => [
+                'can_cancel' => $canCancel,
+                'cancel_time_remaining' => $cancelTimeRemaining,
+                'can_reorder' => true
+            ],
+            
+            'created_at' => $order['created_at'],
+            'updated_at' => $order['updated_at'],
+            'cancellation_reason' => $order['cancellation_reason'] ?? null
+        ];
+
+        ResponseHandler::success(['order' => $response]);
+        
+    } catch (Exception $e) {
+        ResponseHandler::error('Failed to get order details: ' . $e->getMessage(), 500);
+    }
+}
+
+/*********************************
+ * CREATE ORDER FROM CART - ONLY WAY TO CREATE ORDERS
  *********************************/
 function createOrderFromCart($conn, $data, $userId) {
     try {
@@ -865,19 +491,16 @@ function createOrderFromCart($conn, $data, $userId) {
         $deliveryAddress = trim($data['delivery_address'] ?? '');
         $paymentMethod = $data['payment_method'] ?? 'Cash on Delivery';
         $specialInstructions = trim($data['special_instructions'] ?? '');
-        $tipAmount = floatval($data['tip_amount'] ?? 0);
 
         if (!$cartId) {
-            ob_clean();
             ResponseHandler::error('Cart ID is required', 400);
         }
 
         if (!$deliveryAddress) {
-            ob_clean();
             ResponseHandler::error('Delivery address is required', 400);
         }
 
-        // Get cart items with complete add-ons information
+        // Get cart items
         $cartStmt = $conn->prepare(
             "SELECT 
                 ci.*,
@@ -886,14 +509,9 @@ function createOrderFromCart($conn, $data, $userId) {
                 m.delivery_fee,
                 m.min_order_amount,
                 m.is_open,
-                m.is_active,
-                m.preparation_time as merchant_prep_time,
-                qo.title as quick_order_title,
-                qo.id as quick_order_id,
-                qo.image_url as quick_order_image
+                m.is_active
              FROM cart_items ci
              LEFT JOIN merchants m ON ci.merchant_id = m.id
-             LEFT JOIN quick_orders qo ON ci.quick_order_id = qo.id
              WHERE ci.cart_id = :cart_id 
              AND ci.is_active = 1
              AND ci.is_saved_for_later = 0"
@@ -903,118 +521,75 @@ function createOrderFromCart($conn, $data, $userId) {
         $cartItems = $cartStmt->fetchAll(PDO::FETCH_ASSOC);
 
         if (empty($cartItems)) {
-            ob_clean();
             ResponseHandler::error('Cart is empty', 400);
         }
 
-        // Validate all items are from same merchant
+        // Validate all items from same merchant
         $merchantId = $cartItems[0]['merchant_id'];
         $merchantName = $cartItems[0]['merchant_name'];
         
         foreach ($cartItems as $item) {
             if ($item['merchant_id'] != $merchantId) {
-                ob_clean();
                 ResponseHandler::error('All items must be from the same merchant', 400);
             }
         }
 
-        // Check merchant is open and active
+        // Check merchant is open
         if (!$cartItems[0]['is_open'] || !$cartItems[0]['is_active']) {
-            ob_clean();
             ResponseHandler::error("$merchantName is currently not available", 400);
         }
 
-        // Calculate totals with enhanced add-ons tracking
+        // Calculate totals
         $subtotal = 0;
         $deliveryFee = floatval($cartItems[0]['delivery_fee'] ?? 0);
-        $itemsWithAddOns = [];
+        $itemsData = [];
         
         foreach ($cartItems as $item) {
             $price = floatval($item['price'] ?? 0);
             $quantity = intval($item['quantity'] ?? 1);
             
-            // Get detailed add-ons for this item
+            // Get add-ons
             $addOnsStmt = $conn->prepare(
-                "SELECT ca.*, qoa.category, qoa.is_per_item, qoa.max_quantity
-                 FROM cart_addons ca
-                 LEFT JOIN quick_order_addons qoa ON ca.addon_id = qoa.id
+                "SELECT ca.* FROM cart_addons ca
                  WHERE ca.cart_item_id = :item_id"
             );
             $addOnsStmt->execute([':item_id' => $item['id']]);
             $addOns = $addOnsStmt->fetchAll(PDO::FETCH_ASSOC);
             
-            // Calculate add-ons total and prepare detailed add-ons data
             $addOnsTotal = 0;
             $addOnsData = [];
             foreach ($addOns as $addOn) {
                 $addOnPrice = floatval($addOn['price'] ?? 0);
                 $addOnQty = intval($addOn['quantity'] ?? 1);
-                $addOnTotal = $addOnPrice * $addOnQty;
-                $addOnsTotal += $addOnTotal;
+                $addOnsTotal += $addOnPrice * $addOnQty;
                 
                 $addOnsData[] = [
-                    'id' => $addOn['addon_id'],
                     'name' => $addOn['name'],
                     'price' => $addOnPrice,
-                    'quantity' => $addOnQty,
-                    'total' => $addOnTotal,
-                    'category' => $addOn['category'] ?? 'addons',
-                    'is_per_item' => (bool)($addOn['is_per_item'] ?? true),
-                    'max_quantity' => (int)($addOn['max_quantity'] ?? 1)
+                    'quantity' => $addOnQty
                 ];
             }
             
             $itemTotal = ($price * $quantity) + $addOnsTotal;
             $subtotal += $itemTotal;
             
-            // Parse variant data if exists
-            $variantData = null;
-            if (!empty($item['variant_data'])) {
-                if (is_string($item['variant_data'])) {
-                    $variantData = json_decode($item['variant_data'], true);
-                } else {
-                    $variantData = $item['variant_data'];
-                }
-            }
-            
-            // Parse selected options
-            $selectedOptions = null;
-            if (!empty($item['selected_options'])) {
-                if (is_string($item['selected_options'])) {
-                    $selectedOptions = json_decode($item['selected_options'], true);
-                } else {
-                    $selectedOptions = $item['selected_options'];
-                }
-            }
-            
-            $itemsWithAddOns[] = [
+            $itemsData[] = [
                 'cart_item' => $item,
                 'add_ons' => $addOnsData,
                 'add_ons_total' => $addOnsTotal,
-                'item_total' => $itemTotal,
-                'variant_data' => $variantData,
-                'selected_options' => $selectedOptions
+                'item_total' => $itemTotal
             ];
         }
 
         // Check minimum order
         $minOrder = floatval($cartItems[0]['min_order_amount'] ?? 0);
         if ($subtotal < $minOrder) {
-            ob_clean();
             ResponseHandler::error("Minimum order amount is MK " . number_format($minOrder, 2), 400);
         }
 
-        // Get any applied promotion
-        $promoStmt = $conn->prepare(
-            "SELECT discount_amount FROM cart_promotions WHERE cart_id = :cart_id"
-        );
-        $promoStmt->execute([':cart_id' => $cartId]);
-        $promoResult = $promoStmt->fetch(PDO::FETCH_ASSOC);
-        $discountAmount = floatval($promoResult['discount_amount'] ?? 0);
+        $totalAmount = $subtotal + $deliveryFee;
 
-        $totalAmount = $subtotal + $deliveryFee + $tipAmount - $discountAmount;
-
-        // Generate unique order number
+        // Generate order number
         $orderNumber = 'ORD-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
 
         // Begin transaction
@@ -1023,12 +598,12 @@ function createOrderFromCart($conn, $data, $userId) {
         // Create order
         $orderSql = "INSERT INTO orders (
             order_number, user_id, merchant_id, subtotal, 
-            delivery_fee, tip_amount, discount_amount, total_amount,
+            delivery_fee, total_amount,
             payment_method, payment_status, delivery_address, 
             special_instructions, status, created_at, updated_at
         ) VALUES (
             :order_number, :user_id, :merchant_id, :subtotal,
-            :delivery_fee, :tip_amount, :discount_amount, :total_amount,
+            :delivery_fee, :total_amount,
             :payment_method, 'pending', :delivery_address,
             :special_instructions, 'pending', NOW(), NOW()
         )";
@@ -1040,8 +615,6 @@ function createOrderFromCart($conn, $data, $userId) {
             ':merchant_id' => $merchantId,
             ':subtotal' => $subtotal,
             ':delivery_fee' => $deliveryFee,
-            ':tip_amount' => $tipAmount,
-            ':discount_amount' => $discountAmount,
             ':total_amount' => $totalAmount,
             ':payment_method' => $paymentMethod,
             ':delivery_address' => $deliveryAddress,
@@ -1050,37 +623,28 @@ function createOrderFromCart($conn, $data, $userId) {
 
         $orderId = $conn->lastInsertId();
 
-        // Create order items with enhanced add-ons
+        // Create order items
         $itemSql = "INSERT INTO order_items (
-            order_id, quick_order_id, quick_order_item_id,
-            item_name, description, quantity, price, total,
-            variant_id, variant_data, selected_options,
+            order_id, item_name, description, quantity, price, total,
             add_ons_json, special_instructions, created_at
         ) VALUES (
-            :order_id, :quick_order_id, :quick_order_item_id,
-            :item_name, :description, :quantity, :price, :total,
-            :variant_id, :variant_data, :selected_options,
+            :order_id, :item_name, :description, :quantity, :price, :total,
             :add_ons_json, :special_instructions, NOW()
         )";
 
         $itemStmt = $conn->prepare($itemSql);
 
-        foreach ($itemsWithAddOns as $itemData) {
+        foreach ($itemsData as $itemData) {
             $item = $itemData['cart_item'];
             $addOnsData = $itemData['add_ons'];
             
             $itemStmt->execute([
                 ':order_id' => $orderId,
-                ':quick_order_id' => $item['quick_order_id'] ?? null,
-                ':quick_order_item_id' => $item['quick_order_item_id'] ?? null,
-                ':item_name' => $item['name'] ?? $item['quick_order_title'] ?? 'Item',
+                ':item_name' => $item['name'] ?? 'Item',
                 ':description' => $item['description'] ?? '',
                 ':quantity' => intval($item['quantity'] ?? 1),
                 ':price' => floatval($item['price'] ?? 0),
                 ':total' => $itemData['item_total'],
-                ':variant_id' => $item['variant_id'] ?? null,
-                ':variant_data' => $itemData['variant_data'] ? json_encode($itemData['variant_data']) : null,
-                ':selected_options' => $itemData['selected_options'] ? json_encode($itemData['selected_options']) : null,
                 ':add_ons_json' => !empty($addOnsData) ? json_encode($addOnsData) : null,
                 ':special_instructions' => $item['special_instructions'] ?? ''
             ]);
@@ -1104,23 +668,12 @@ function createOrderFromCart($conn, $data, $userId) {
             ':changed_by_id' => $userId
         ]);
 
-        // Create tracking record
-        $trackingSql = "INSERT INTO order_tracking (
-            order_id, status, created_at, updated_at
-        ) VALUES (
-            :order_id, 'pending', NOW(), NOW()
-        )";
-        
-        $trackingStmt = $conn->prepare($trackingSql);
-        $trackingStmt->execute([':order_id' => $orderId]);
-
-        // Clear cart items
+        // Clear cart
         $clearItemsStmt = $conn->prepare(
             "UPDATE cart_items SET is_active = 0 WHERE cart_id = :cart_id"
         );
         $clearItemsStmt->execute([':cart_id' => $cartId]);
 
-        // Clear cart add-ons
         $clearAddOnsStmt = $conn->prepare(
             "DELETE ca FROM cart_addons ca
              INNER JOIN cart_items ci ON ca.cart_item_id = ci.id
@@ -1128,574 +681,26 @@ function createOrderFromCart($conn, $data, $userId) {
         );
         $clearAddOnsStmt->execute([':cart_id' => $cartId]);
 
-        // Clear cart promotions
-        $clearPromoStmt = $conn->prepare(
-            "DELETE FROM cart_promotions WHERE cart_id = :cart_id"
-        );
-        $clearPromoStmt->execute([':cart_id' => $cartId]);
-
-        // Update user's total orders
+        // Update user stats
         $updateUserSql = "UPDATE users SET total_orders = total_orders + 1 WHERE id = :user_id";
         $updateUserStmt = $conn->prepare($updateUserSql);
         $updateUserStmt->execute([':user_id' => $userId]);
 
         $conn->commit();
 
-        // Get created order details to return
+        // Return order details
         getOrderDetails($conn, $orderId, $userId);
 
     } catch (Exception $e) {
         if ($conn->inTransaction()) {
             $conn->rollBack();
         }
-        ob_clean();
         ResponseHandler::error('Failed to create order: ' . $e->getMessage(), 500);
     }
 }
 
 /*********************************
- * CREATE QUICK ORDER FROM ITEMS (Enhanced Add-ons)
- *********************************/
-function createQuickOrderFromItems($conn, $data, $userId) {
-    try {
-        $merchantId = $data['merchant_id'] ?? null;
-        $items = $data['items'] ?? [];
-        $deliveryAddress = trim($data['delivery_address'] ?? '');
-        $paymentMethod = $data['payment_method'] ?? 'Cash on Delivery';
-        $specialInstructions = trim($data['special_instructions'] ?? '');
-        $tipAmount = floatval($data['tip_amount'] ?? 0);
-
-        if (!$merchantId || empty($items)) {
-            ob_clean();
-            ResponseHandler::error('Merchant ID and items are required', 400);
-        }
-
-        if (!$deliveryAddress) {
-            ob_clean();
-            ResponseHandler::error('Delivery address is required', 400);
-        }
-
-        // Check merchant
-        $merchantStmt = $conn->prepare(
-            "SELECT id, name, delivery_fee, min_order_amount, is_open, is_active, 
-                    preparation_time, image_url
-             FROM merchants WHERE id = :id"
-        );
-        $merchantStmt->execute([':id' => $merchantId]);
-        $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
-
-        if (!$merchant || !$merchant['is_active']) {
-            ob_clean();
-            ResponseHandler::error('Merchant not found', 404);
-        }
-
-        if (!$merchant['is_open']) {
-            ob_clean();
-            ResponseHandler::error("{$merchant['name']} is currently closed", 400);
-        }
-
-        // Calculate subtotal and validate items with enhanced add-ons
-        $subtotal = 0;
-        $validatedItems = [];
-
-        foreach ($items as $item) {
-            $quickOrderItemId = $item['quick_order_item_id'] ?? null;
-            $quantity = intval($item['quantity'] ?? 1);
-            $variantId = $item['variant_id'] ?? null;
-            $selectedAddOns = $item['selected_add_ons'] ?? [];
-            $itemSpecialInstructions = $item['special_instructions'] ?? '';
-
-            if (!$quickOrderItemId) {
-                ob_clean();
-                ResponseHandler::error('Quick order item ID is required for all items', 400);
-            }
-
-            // Get item details with add-ons
-            $itemStmt = $conn->prepare(
-                "SELECT qoi.*, qo.title as quick_order_title, qo.id as quick_order_id,
-                        qo.has_variants, qo.image_url as quick_order_image,
-                        qo.description as quick_order_description
-                 FROM quick_order_items qoi
-                 JOIN quick_orders qo ON qoi.quick_order_id = qo.id
-                 WHERE qoi.id = :id AND qoi.is_available = 1"
-            );
-            $itemStmt->execute([':id' => $quickOrderItemId]);
-            $dbItem = $itemStmt->fetch(PDO::FETCH_ASSOC);
-
-            if (!$dbItem) {
-                ob_clean();
-                ResponseHandler::error('Item not available', 400);
-            }
-
-            $price = floatval($dbItem['price'] ?? 0);
-            $itemTotal = $price * $quantity;
-
-            // Handle variant pricing
-            $selectedVariant = null;
-            if ($variantId && !empty($dbItem['variants_json'])) {
-                $variants = json_decode($dbItem['variants_json'], true) ?? [];
-                foreach ($variants as $variant) {
-                    if (($variant['id'] ?? null) == $variantId) {
-                        $price = floatval($variant['price'] ?? $price);
-                        $itemTotal = $price * $quantity;
-                        $selectedVariant = $variant;
-                        break;
-                    }
-                }
-            }
-
-            // Get available add-ons for this quick order
-            $addOnsListStmt = $conn->prepare(
-                "SELECT * FROM quick_order_addons 
-                 WHERE quick_order_id = :quick_order_id 
-                 AND is_available = 1
-                 ORDER BY category, price"
-            );
-            $addOnsListStmt->execute([':quick_order_id' => $dbItem['quick_order_id']]);
-            $availableAddOns = $addOnsListStmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            // Create lookup for available add-ons
-            $availableAddOnsMap = [];
-            foreach ($availableAddOns as $addOn) {
-                $availableAddOnsMap[$addOn['id']] = $addOn;
-            }
-
-            // Calculate add-ons total and validate
-            $addOnsTotal = 0;
-            $addOnsData = [];
-            if (!empty($selectedAddOns)) {
-                foreach ($selectedAddOns as $selected) {
-                    $addOnId = $selected['id'] ?? null;
-                    $addOnQty = intval($selected['quantity'] ?? 1);
-                    
-                    if (!$addOnId || !isset($availableAddOnsMap[$addOnId])) {
-                        continue; // Skip invalid add-ons
-                    }
-                    
-                    $addOn = $availableAddOnsMap[$addOnId];
-                    
-                    // Check max quantity
-                    if ($addOnQty > ($addOn['max_quantity'] ?? 1)) {
-                        ob_clean();
-                        ResponseHandler::error("Maximum quantity for {$addOn['name']} is {$addOn['max_quantity']}", 400);
-                    }
-                    
-                    $addOnPrice = floatval($addOn['price']);
-                    
-                    // If add-on is per item, multiply by item quantity
-                    $finalQty = ($addOn['is_per_item'] ?? true) ? $addOnQty * $quantity : $addOnQty;
-                    $addOnTotal = $addOnPrice * $finalQty;
-                    $addOnsTotal += $addOnTotal;
-                    
-                    $addOnsData[] = [
-                        'id' => $addOn['id'],
-                        'name' => $addOn['name'],
-                        'price' => $addOnPrice,
-                        'quantity' => $finalQty,
-                        'original_quantity' => $addOnQty,
-                        'per_item_quantity' => $addOnQty,
-                        'total' => $addOnTotal,
-                        'category' => $addOn['category'] ?? 'addons',
-                        'is_per_item' => (bool)($addOn['is_per_item'] ?? true),
-                        'max_quantity' => (int)($addOn['max_quantity'] ?? 1),
-                        'is_required' => (bool)($addOn['is_required'] ?? false)
-                    ];
-                }
-            }
-
-            // Check required add-ons
-            foreach ($availableAddOns as $addOn) {
-                if (($addOn['is_required'] ?? false)) {
-                    $found = false;
-                    foreach ($addOnsData as $selectedAddOn) {
-                        if ($selectedAddOn['id'] == $addOn['id']) {
-                            $found = true;
-                            break;
-                        }
-                    }
-                    if (!$found) {
-                        ob_clean();
-                        ResponseHandler::error("{$addOn['name']} is required for {$dbItem['name']}", 400);
-                    }
-                }
-            }
-
-            $subtotal += $itemTotal + $addOnsTotal;
-
-            $validatedItems[] = [
-                'quick_order_id' => $dbItem['quick_order_id'],
-                'quick_order_item_id' => $quickOrderItemId,
-                'quick_order_title' => $dbItem['quick_order_title'],
-                'quick_order_image' => $dbItem['quick_order_image'],
-                'quick_order_description' => $dbItem['quick_order_description'],
-                'item_name' => $dbItem['name'],
-                'description' => $dbItem['description'],
-                'price' => $price,
-                'quantity' => $quantity,
-                'item_total' => $itemTotal,
-                'add_ons_total' => $addOnsTotal,
-                'add_ons_data' => $addOnsData,
-                'variant_id' => $variantId,
-                'variant_data' => $selectedVariant,
-                'has_variants' => $dbItem['has_variants'],
-                'special_instructions' => $itemSpecialInstructions
-            ];
-        }
-
-        // Check minimum order
-        if ($subtotal < $merchant['min_order_amount']) {
-            ob_clean();
-            ResponseHandler::error("Minimum order amount is MK " . number_format($merchant['min_order_amount'], 2), 400);
-        }
-
-        $deliveryFee = floatval($merchant['delivery_fee']);
-        $totalAmount = $subtotal + $deliveryFee + $tipAmount;
-
-        // Generate order number
-        $orderNumber = 'ORD-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
-
-        // Begin transaction
-        $conn->beginTransaction();
-
-        // Create order
-        $orderSql = "INSERT INTO orders (
-            order_number, user_id, merchant_id, subtotal, 
-            delivery_fee, tip_amount, discount_amount, total_amount,
-            payment_method, payment_status, delivery_address, 
-            special_instructions, status, created_at, updated_at
-        ) VALUES (
-            :order_number, :user_id, :merchant_id, :subtotal,
-            :delivery_fee, :tip_amount, :discount_amount, :total_amount,
-            :payment_method, 'pending', :delivery_address,
-            :special_instructions, 'pending', NOW(), NOW()
-        )";
-
-        $orderStmt = $conn->prepare($orderSql);
-        $orderStmt->execute([
-            ':order_number' => $orderNumber,
-            ':user_id' => $userId,
-            ':merchant_id' => $merchantId,
-            ':subtotal' => $subtotal,
-            ':delivery_fee' => $deliveryFee,
-            ':tip_amount' => $tipAmount,
-            ':discount_amount' => 0,
-            ':total_amount' => $totalAmount,
-            ':payment_method' => $paymentMethod,
-            ':delivery_address' => $deliveryAddress,
-            ':special_instructions' => $specialInstructions
-        ]);
-
-        $orderId = $conn->lastInsertId();
-
-        // Create order items with enhanced add-ons
-        $itemSql = "INSERT INTO order_items (
-            order_id, quick_order_id, quick_order_item_id,
-            item_name, description, quantity, price, total,
-            variant_id, variant_data, add_ons_json, 
-            special_instructions, created_at
-        ) VALUES (
-            :order_id, :quick_order_id, :quick_order_item_id,
-            :item_name, :description, :quantity, :price, :total,
-            :variant_id, :variant_data, :add_ons_json,
-            :special_instructions, NOW()
-        )";
-
-        $itemStmt = $conn->prepare($itemSql);
-
-        foreach ($validatedItems as $item) {
-            $itemStmt->execute([
-                ':order_id' => $orderId,
-                ':quick_order_id' => $item['quick_order_id'],
-                ':quick_order_item_id' => $item['quick_order_item_id'],
-                ':item_name' => $item['item_name'],
-                ':description' => $item['description'] ?? '',
-                ':quantity' => $item['quantity'],
-                ':price' => $item['price'],
-                ':total' => $item['item_total'] + $item['add_ons_total'],
-                ':variant_id' => $item['variant_id'] ?? null,
-                ':variant_data' => $item['variant_data'] ? json_encode($item['variant_data']) : null,
-                ':add_ons_json' => !empty($item['add_ons_data']) ? json_encode($item['add_ons_data']) : null,
-                ':special_instructions' => $item['special_instructions'] ?? ''
-            ]);
-        }
-
-        // Add to order status history
-        $historySql = "INSERT INTO order_status_history (
-            order_id, old_status, new_status, changed_by, 
-            changed_by_id, created_at
-        ) VALUES (
-            :order_id, :old_status, :new_status, :changed_by,
-            :changed_by_id, NOW()
-        )";
-
-        $historyStmt = $conn->prepare($historySql);
-        $historyStmt->execute([
-            ':order_id' => $orderId,
-            ':old_status' => '',
-            ':new_status' => 'pending',
-            ':changed_by' => 'user',
-            ':changed_by_id' => $userId
-        ]);
-
-        // Create tracking record
-        $trackingSql = "INSERT INTO order_tracking (
-            order_id, status, created_at, updated_at
-        ) VALUES (
-            :order_id, 'pending', NOW(), NOW()
-        )";
-        
-        $trackingStmt = $conn->prepare($trackingSql);
-        $trackingStmt->execute([':order_id' => $orderId]);
-
-        // Update user's total orders
-        $updateUserSql = "UPDATE users SET total_orders = total_orders + 1 WHERE id = :user_id";
-        $updateUserStmt = $conn->prepare($updateUserSql);
-        $updateUserStmt->execute([':user_id' => $userId]);
-
-        $conn->commit();
-
-        // Get created order details to return
-        getOrderDetails($conn, $orderId, $userId);
-
-    } catch (Exception $e) {
-        if ($conn->inTransaction()) {
-            $conn->rollBack();
-        }
-        ob_clean();
-        ResponseHandler::error('Failed to create order: ' . $e->getMessage(), 500);
-    }
-}
-
-/*********************************
- * CREATE ORDER (Legacy - Single Item)
- *********************************/
-function createOrder($conn, $data, $userId) {
-    try {
-        if (!is_array($data)) {
-            ob_clean();
-            ResponseHandler::error('Invalid request data', 400);
-            return;
-        }
-        
-        $requiredFields = [
-            'merchant_id' => 'Merchant ID',
-            'items' => 'Order items',
-            'delivery_address' => 'Delivery address'
-        ];
-        
-        $missingFields = [];
-        foreach ($requiredFields as $field => $label) {
-            if (!isset($data[$field])) {
-                $missingFields[] = $label;
-            } elseif (is_array($data[$field]) && empty($data[$field])) {
-                $missingFields[] = $label . ' (cannot be empty)';
-            } elseif (!is_array($data[$field]) && trim($data[$field]) === '') {
-                $missingFields[] = $label . ' (cannot be empty)';
-            }
-        }
-        
-        if (!empty($missingFields)) {
-            ob_clean();
-            ResponseHandler::error("Missing required fields: " . implode(', ', $missingFields), 400);
-            return;
-        }
-
-        $merchantId = $data['merchant_id'];
-        $items = $data['items'];
-        
-        if (!is_array($items) || empty($items)) {
-            ob_clean();
-            ResponseHandler::error('Items must be a non-empty array', 400);
-            return;
-        }
-
-        $merchantStmt = $conn->prepare(
-            "SELECT id, name, delivery_fee, is_open, minimum_order, 
-                    preparation_time, address, image_url
-             FROM merchants 
-             WHERE id = ? AND is_active = 1"
-        );
-        
-        $merchantStmt->execute([$merchantId]);
-        $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
-
-        if (!$merchant) {
-            ob_clean();
-            ResponseHandler::error("Merchant not found or inactive", 404);
-            return;
-        }
-        
-        if (!$merchant['is_open']) {
-            ob_clean();
-            ResponseHandler::error("Merchant {$merchant['name']} is currently closed", 400);
-            return;
-        }
-
-        $subtotal = 0;
-        $itemsWithDetails = [];
-        foreach ($items as $item) {
-            if (!isset($item['name']) || !isset($item['quantity']) || !isset($item['price'])) {
-                ob_clean();
-                ResponseHandler::error('Invalid item data - each item must have name, quantity, and price', 400);
-                return;
-            }
-            
-            if (empty($item['name']) || $item['quantity'] <= 0 || $item['price'] <= 0) {
-                ob_clean();
-                ResponseHandler::error('Invalid item values - name cannot be empty, quantity and price must be positive', 400);
-                return;
-            }
-            
-            // Handle add-ons if present
-            $addOnsTotal = 0;
-            $addOnsData = [];
-            if (!empty($item['add_ons'])) {
-                foreach ($item['add_ons'] as $addOn) {
-                    $addOnPrice = floatval($addOn['price'] ?? 0);
-                    $addOnQty = intval($addOn['quantity'] ?? 1);
-                    $addOnTotal = $addOnPrice * $addOnQty;
-                    $addOnsTotal += $addOnTotal;
-                    
-                    $addOnsData[] = [
-                        'id' => $addOn['id'] ?? null,
-                        'name' => $addOn['name'] ?? 'Add-on',
-                        'price' => $addOnPrice,
-                        'quantity' => $addOnQty,
-                        'total' => $addOnTotal
-                    ];
-                }
-            }
-            
-            $itemTotal = ($item['price'] * $item['quantity']) + $addOnsTotal;
-            $subtotal += $itemTotal;
-            
-            $itemsWithDetails[] = [
-                'name' => $item['name'],
-                'quantity' => $item['quantity'],
-                'price' => $item['price'],
-                'item_total' => $itemTotal,
-                'add_ons' => $addOnsData,
-                'add_ons_total' => $addOnsTotal,
-                'special_instructions' => $item['special_instructions'] ?? ''
-            ];
-        }
-
-        if ($subtotal < $merchant['minimum_order']) {
-            ob_clean();
-            ResponseHandler::error(
-                "Order must be at least " . number_format($merchant['minimum_order'], 2), 
-                400
-            );
-            return;
-        }
-
-        $deliveryFee = $merchant['delivery_fee'];
-        $tipAmount = floatval($data['tip_amount'] ?? 0);
-        $discountAmount = floatval($data['discount_amount'] ?? 0);
-        $totalAmount = $subtotal + $deliveryFee + $tipAmount - $discountAmount;
-
-        $orderNumber = 'ORD-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
-
-        $conn->beginTransaction();
-
-        $orderSql = "INSERT INTO orders (
-            order_number, user_id, merchant_id, subtotal, 
-            delivery_fee, tip_amount, discount_amount, total_amount,
-            payment_method, payment_status, delivery_address, 
-            special_instructions, status, created_at, updated_at
-        ) VALUES (
-            :order_number, :user_id, :merchant_id, :subtotal,
-            :delivery_fee, :tip_amount, :discount_amount, :total_amount,
-            :payment_method, 'pending', :delivery_address,
-            :special_instructions, 'pending', NOW(), NOW()
-        )";
-
-        $orderStmt = $conn->prepare($orderSql);
-        $orderStmt->execute([
-            ':order_number' => $orderNumber,
-            ':user_id' => $userId,
-            ':merchant_id' => $merchantId,
-            ':subtotal' => $subtotal,
-            ':delivery_fee' => $deliveryFee,
-            ':tip_amount' => $tipAmount,
-            ':discount_amount' => $discountAmount,
-            ':total_amount' => $totalAmount,
-            ':payment_method' => $data['payment_method'] ?? 'Cash on Delivery',
-            ':delivery_address' => $data['delivery_address'],
-            ':special_instructions' => $data['special_instructions'] ?? ''
-        ]);
-
-        $orderId = $conn->lastInsertId();
-
-        // Create order items
-        $itemSql = "INSERT INTO order_items (
-            order_id, item_name, quantity, price, total,
-            add_ons_json, special_instructions, created_at
-        ) VALUES (
-            :order_id, :item_name, :quantity, :price, :total,
-            :add_ons_json, :special_instructions, NOW()
-        )";
-
-        $itemStmt = $conn->prepare($itemSql);
-        foreach ($itemsWithDetails as $item) {
-            $itemStmt->execute([
-                ':order_id' => $orderId,
-                ':item_name' => $item['name'],
-                ':quantity' => $item['quantity'],
-                ':price' => $item['price'],
-                ':total' => $item['item_total'],
-                ':add_ons_json' => !empty($item['add_ons']) ? json_encode($item['add_ons']) : null,
-                ':special_instructions' => $item['special_instructions']
-            ]);
-        }
-
-        $historySql = "INSERT INTO order_status_history (
-            order_id, old_status, new_status, changed_by, 
-            changed_by_id, created_at
-        ) VALUES (
-            :order_id, :old_status, :new_status, :changed_by,
-            :changed_by_id, NOW()
-        )";
-
-        $historyStmt = $conn->prepare($historySql);
-        $historyStmt->execute([
-            ':order_id' => $orderId,
-            ':old_status' => '',
-            ':new_status' => 'pending',
-            ':changed_by' => 'user',
-            ':changed_by_id' => $userId
-        ]);
-
-        // Create tracking record
-        $trackingSql = "INSERT INTO order_tracking (
-            order_id, status, created_at, updated_at
-        ) VALUES (
-            :order_id, 'pending', NOW(), NOW()
-        )";
-        
-        $trackingStmt = $conn->prepare($trackingSql);
-        $trackingStmt->execute([':order_id' => $orderId]);
-
-        $updateUserSql = "UPDATE users SET total_orders = total_orders + 1 WHERE id = :user_id";
-        $updateUserStmt = $conn->prepare($updateUserSql);
-        $updateUserStmt->execute([':user_id' => $userId]);
-
-        $conn->commit();
-
-        // Get created order details to return
-        getOrderDetails($conn, $orderId, $userId);
-
-    } catch (Exception $e) {
-        if ($conn->inTransaction()) {
-            $conn->rollBack();
-        }
-        ob_clean();
-        ResponseHandler::error('Failed to create order: ' . $e->getMessage(), 500);
-    }
-}
-
-/*********************************
- * CANCEL ORDER
+ * CANCEL ORDER - ONLY WITHIN FIRST 2 MINUTES
  *********************************/
 function cancelOrder($conn, $data, $userId) {
     try {
@@ -1703,13 +708,12 @@ function cancelOrder($conn, $data, $userId) {
         $reason = trim($data['reason'] ?? '');
 
         if (!$orderId) {
-            ob_clean();
             ResponseHandler::error('Order ID is required', 400);
             return;
         }
 
         $checkStmt = $conn->prepare(
-            "SELECT id, status FROM orders
+            "SELECT id, status, created_at FROM orders
              WHERE id = :order_id AND user_id = :user_id"
         );
         $checkStmt->execute([
@@ -1720,15 +724,34 @@ function cancelOrder($conn, $data, $userId) {
         $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
 
         if (!$order) {
-            ob_clean();
             ResponseHandler::error('Order not found', 404);
             return;
         }
 
+        // Check if order can be cancelled based on status
         $cancellableStatuses = ['pending', 'confirmed'];
         if (!in_array($order['status'], $cancellableStatuses)) {
-            ob_clean();
             ResponseHandler::error('Order cannot be cancelled at this stage', 400);
+            return;
+        }
+
+        // Check time limit - only within first 2 minutes (120 seconds)
+        $createdAt = new DateTime($order['created_at']);
+        $now = new DateTime();
+        $timeDifference = $now->getTimestamp() - $createdAt->getTimestamp();
+        
+        $cancelTimeLimit = 120; // 2 minutes in seconds
+        
+        if ($timeDifference > $cancelTimeLimit) {
+            $minutesPassed = floor($timeDifference / 60);
+            $secondsPassed = $timeDifference % 60;
+            ResponseHandler::error(
+                "Order can only be cancelled within the first 2 minutes. " . 
+                $minutesPassed . " minute(s) and " . $secondsPassed . " second(s) have passed. " .
+                "Please contact support if you need assistance.",
+                400,
+                'CANCEL_TIME_EXCEEDED'
+            );
             return;
         }
 
@@ -1746,13 +769,6 @@ function cancelOrder($conn, $data, $userId) {
             ':order_id' => $orderId,
             ':reason' => $reason
         ]);
-
-        // Update tracking
-        $trackingStmt = $conn->prepare(
-            "UPDATE order_tracking SET status = 'cancelled', updated_at = NOW()
-             WHERE order_id = :order_id"
-        );
-        $trackingStmt->execute([':order_id' => $orderId]);
 
         $historySql = "INSERT INTO order_status_history (
             order_id, old_status, new_status, changed_by, 
@@ -1774,337 +790,35 @@ function cancelOrder($conn, $data, $userId) {
 
         $conn->commit();
 
-        ob_clean();
+        // Calculate how much time was left for cancellation
+        $timeLeft = $cancelTimeLimit - $timeDifference;
+        
         ResponseHandler::success([
-            'order_id' => (int)$orderId,
-            'message' => 'Order cancelled successfully'
+            'order_id' => intval($orderId),
+            'message' => 'Order cancelled successfully',
+            'cancelled_within' => [
+                'time_limit_seconds' => $cancelTimeLimit,
+                'time_taken_seconds' => $timeDifference,
+                'time_remaining_seconds' => $timeLeft,
+                'time_taken_formatted' => formatTimeDuration($timeDifference),
+                'cancelled_within_limit' => true
+            ]
         ]);
 
     } catch (Exception $e) {
         if ($conn->inTransaction()) {
             $conn->rollBack();
         }
-        ob_clean();
         ResponseHandler::error('Failed to cancel order: ' . $e->getMessage(), 500);
     }
 }
 
 /*********************************
- * REORDER (Enhanced with Add-ons)
- *********************************/
-function reorder($conn, $data, $userId) {
-    try {
-        $orderId = $data['order_id'] ?? null;
-
-        if (!$orderId) {
-            ob_clean();
-            ResponseHandler::error('Order ID is required', 400);
-            return;
-        }
-
-        // Get original order details with items and add-ons
-        $orderSql = "SELECT 
-                        o.merchant_id,
-                        o.delivery_address,
-                        o.special_instructions,
-                        o.payment_method,
-                        oi.quick_order_id,
-                        oi.quick_order_item_id,
-                        oi.item_name,
-                        oi.quantity,
-                        oi.price,
-                        oi.variant_id,
-                        oi.variant_data,
-                        oi.add_ons_json,
-                        oi.special_instructions as item_instructions
-                    FROM orders o
-                    JOIN order_items oi ON o.id = oi.order_id
-                    WHERE o.id = :order_id AND o.user_id = :user_id";
-        
-        $orderStmt = $conn->prepare($orderSql);
-        $orderStmt->execute([
-            ':order_id' => $orderId,
-            ':user_id' => $userId
-        ]);
-        
-        $items = $orderStmt->fetchAll(PDO::FETCH_ASSOC);
-
-        if (empty($items)) {
-            ob_clean();
-            ResponseHandler::error('Order not found', 404);
-            return;
-        }
-
-        // Check if merchant is still active
-        $merchantStmt = $conn->prepare(
-            "SELECT id, is_open, is_active, name FROM merchants WHERE id = ?"
-        );
-        $merchantStmt->execute([$items[0]['merchant_id']]);
-        $merchant = $merchantStmt->fetch(PDO::FETCH_ASSOC);
-
-        if (!$merchant || !$merchant['is_active']) {
-            ob_clean();
-            ResponseHandler::error('Merchant is no longer available', 400);
-            return;
-        }
-
-        if (!$merchant['is_open']) {
-            ob_clean();
-            ResponseHandler::error("{$merchant['name']} is currently closed", 400);
-            return;
-        }
-
-        // Prepare reorder data with add-ons
-        $reorderItems = [];
-        foreach ($items as $item) {
-            $reorderItem = [
-                'quick_order_item_id' => $item['quick_order_item_id'],
-                'quantity' => (int)$item['quantity'],
-                'price' => (float)$item['price'],
-                'special_instructions' => $item['item_instructions'] ?? ''
-            ];
-            
-            if ($item['quick_order_id']) {
-                $reorderItem['quick_order_id'] = $item['quick_order_id'];
-            }
-            
-            if ($item['variant_id']) {
-                $reorderItem['variant_id'] = $item['variant_id'];
-                if ($item['variant_data']) {
-                    $reorderItem['variant_data'] = json_decode($item['variant_data'], true);
-                }
-            }
-            
-            // Include add-ons from original order
-            if ($item['add_ons_json']) {
-                $addOns = json_decode($item['add_ons_json'], true);
-                // Convert to format expected by createQuickOrderFromItems
-                $reorderItem['selected_add_ons'] = array_map(function($addOn) {
-                    return [
-                        'id' => $addOn['id'],
-                        'quantity' => $addOn['original_quantity'] ?? $addOn['quantity'] ?? 1
-                    ];
-                }, $addOns);
-            }
-            
-            $reorderItems[] = $reorderItem;
-        }
-
-        $reorderData = [
-            'merchant_id' => $items[0]['merchant_id'],
-            'items' => $reorderItems,
-            'delivery_address' => $items[0]['delivery_address'],
-            'special_instructions' => $items[0]['special_instructions'],
-            'payment_method' => $items[0]['payment_method']
-        ];
-
-        // Check if any items are quick orders
-        $hasQuickOrders = !empty(array_filter($items, function($item) {
-            return !empty($item['quick_order_id']);
-        }));
-
-        if ($hasQuickOrders) {
-            createQuickOrderFromItems($conn, $reorderData, $userId);
-        } else {
-            createOrder($conn, $reorderData, $userId);
-        }
-        
-    } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Failed to reorder: ' . $e->getMessage(), 500);
-    }
-}
-
-/*********************************
- * TRACK ORDER (Enhanced with Add-ons)
- *********************************/
-function trackOrder($conn, $orderId, $userId) {
-    try {
-        // Get order details
-        $orderStmt = $conn->prepare(
-            "SELECT 
-                o.id,
-                o.order_number,
-                o.status,
-                o.created_at,
-                o.updated_at,
-                o.merchant_id,
-                o.total_amount,
-                o.delivery_address,
-                m.name as merchant_name,
-                m.phone as merchant_phone,
-                m.address as merchant_address,
-                m.image_url as merchant_image
-             FROM orders o
-             LEFT JOIN merchants m ON o.merchant_id = m.id
-             WHERE o.id = :order_id AND o.user_id = :user_id"
-        );
-        
-        $orderStmt->execute([
-            ':order_id' => $orderId,
-            ':user_id' => $userId
-        ]);
-        
-        $order = $orderStmt->fetch(PDO::FETCH_ASSOC);
-
-        if (!$order) {
-            ob_clean();
-            ResponseHandler::error('Order not found', 404);
-        }
-
-        // Get tracking history
-        $trackingStmt = $conn->prepare(
-            "SELECT 
-                status,
-                location,
-                description,
-                created_at as timestamp
-             FROM order_tracking
-             WHERE order_id = :order_id
-             ORDER BY created_at ASC"
-        );
-        
-        $trackingStmt->execute([':order_id' => $orderId]);
-        $tracking = $trackingStmt->fetchAll(PDO::FETCH_ASSOC);
-
-        // Get status history
-        $historyStmt = $conn->prepare(
-            "SELECT 
-                old_status,
-                new_status,
-                reason,
-                created_at as timestamp
-             FROM order_status_history
-             WHERE order_id = :order_id
-             ORDER BY created_at ASC"
-        );
-        
-        $historyStmt->execute([':order_id' => $orderId]);
-        $history = $historyStmt->fetchAll(PDO::FETCH_ASSOC);
-
-        // Get items with add-ons
-        $itemsStmt = $conn->prepare(
-            "SELECT 
-                id,
-                item_name,
-                description,
-                quantity,
-                price,
-                total,
-                add_ons_json,
-                variant_data,
-                special_instructions
-             FROM order_items
-             WHERE order_id = :order_id
-             ORDER BY id ASC"
-        );
-        
-        $itemsStmt->execute([':order_id' => $orderId]);
-        $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
-
-        // Format items with add-ons
-        $formattedItems = [];
-        $totalAddOnsCount = 0;
-        
-        foreach ($items as $item) {
-            $addOns = null;
-            $addOnsTotal = 0;
-            
-            if (!empty($item['add_ons_json'])) {
-                $addOns = json_decode($item['add_ons_json'], true);
-                foreach ($addOns as $addOn) {
-                    $addOnsTotal += ($addOn['price'] * $addOn['quantity']);
-                }
-                $totalAddOnsCount += count($addOns);
-            }
-            
-            $variantData = null;
-            if (!empty($item['variant_data'])) {
-                $variantData = json_decode($item['variant_data'], true);
-            }
-            
-            $formattedItems[] = [
-                'id' => (int)$item['id'],
-                'name' => $item['item_name'],
-                'description' => $item['description'] ?? '',
-                'quantity' => (int)$item['quantity'],
-                'price' => (float)$item['price'],
-                'total' => (float)$item['total'],
-                'add_ons' => $addOns,
-                'add_ons_total' => $addOnsTotal,
-                'has_addons' => !empty($addOns),
-                'addons_count' => $addOns ? count($addOns) : 0,
-                'variant' => $variantData,
-                'special_instructions' => $item['special_instructions'] ?? ''
-            ];
-        }
-
-        // Estimate delivery time based on status
-        $estimatedDelivery = null;
-        $currentTime = new DateTime();
-        
-        if ($order['status'] === 'pending') {
-            $estimatedDelivery = (clone $currentTime)->modify('+45 minutes')->format('Y-m-d H:i:s');
-        } elseif ($order['status'] === 'confirmed') {
-            $estimatedDelivery = (clone $currentTime)->modify('+30 minutes')->format('Y-m-d H:i:s');
-        } elseif ($order['status'] === 'preparing') {
-            $estimatedDelivery = (clone $currentTime)->modify('+20 minutes')->format('Y-m-d H:i:s');
-        } elseif ($order['status'] === 'ready') {
-            $estimatedDelivery = (clone $currentTime)->modify('+10 minutes')->format('Y-m-d H:i:s');
-        } elseif ($order['status'] === 'delivered') {
-            $estimatedDelivery = $order['updated_at'];
-        }
-
-        // Progress steps based on current status
-        $statusProgress = [
-            'pending' => 20,
-            'confirmed' => 40,
-            'preparing' => 60,
-            'ready' => 80,
-            'delivered' => 100,
-            'cancelled' => 0
-        ];
-
-        $progress = $statusProgress[$order['status']] ?? 20;
-
-        ob_clean();
-        ResponseHandler::success([
-            'order' => [
-                'id' => $order['id'],
-                'order_number' => $order['order_number'],
-                'status' => $order['status'],
-                'status_progress' => $progress,
-                'created_at' => $order['created_at'],
-                'estimated_delivery' => $estimatedDelivery,
-                'total_amount' => (float)$order['total_amount'],
-                'delivery_address' => $order['delivery_address'],
-                'merchant' => [
-                    'name' => $order['merchant_name'] ?? 'Restaurant',
-                    'phone' => $order['merchant_phone'] ?? '',
-                    'address' => $order['merchant_address'] ?? '',
-                    'image' => formatImageUrl($order['merchant_image'], 'merchants')
-                ]
-            ],
-            'tracking' => $tracking,
-            'status_history' => $history,
-            'items' => $formattedItems,
-            'total_items' => count($items),
-            'total_addons' => $totalAddOnsCount,
-            'has_addons' => $totalAddOnsCount > 0
-        ]);
-
-    } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Failed to track order: ' . $e->getMessage(), 500);
-    }
-}
-
-/*********************************
- * GET LATEST ACTIVE ORDER (Enhanced with Add-ons)
+ * GET LATEST ACTIVE ORDER
  *********************************/
 function getLatestActiveOrder($conn, $userId) {
     try {
-        $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready'];
+        $activeStatuses = ['pending', 'confirmed', 'preparing', 'ready', 'out_for_delivery'];
         
         $placeholders = implode(',', array_fill(0, count($activeStatuses), '?'));
         
@@ -2114,12 +828,14 @@ function getLatestActiveOrder($conn, $userId) {
                     o.status,
                     o.total_amount,
                     o.created_at,
-                    o.updated_at,
                     o.merchant_id,
-                    o.delivery_address,
-                    o.special_instructions,
                     m.name as merchant_name,
-                    m.image_url as merchant_image
+                    m.image_url as merchant_image,
+                    (
+                        SELECT COUNT(*) 
+                        FROM order_items oi 
+                        WHERE oi.order_id = o.id
+                    ) as item_count
                 FROM orders o
                 LEFT JOIN merchants m ON o.merchant_id = m.id
                 WHERE o.user_id = ? 
@@ -2133,180 +849,132 @@ function getLatestActiveOrder($conn, $userId) {
         $order = $stmt->fetch(PDO::FETCH_ASSOC);
         
         if (!$order) {
-            ob_clean();
-            ResponseHandler::success(['order' => null, 'message' => 'No active orders']);
+            ResponseHandler::success(['order' => null]);
             return;
         }
 
-        // Get items preview with add-ons
-        $previewSql = "SELECT 
-                        item_name, 
-                        quantity,
-                        add_ons_json
-                      FROM order_items 
-                      WHERE order_id = ? 
-                      ORDER BY id ASC 
-                      LIMIT 3";
+        // Check if order can still be cancelled (within 2 minutes)
+        $canCancel = false;
+        $cancelTimeRemaining = 0;
+        $cancelTimeLimit = 120;
         
-        $previewStmt = $conn->prepare($previewSql);
-        $previewStmt->execute([$order['id']]);
-        $previewItems = $previewStmt->fetchAll(PDO::FETCH_ASSOC);
-        
-        $itemsPreview = [];
-        $addOnsCount = 0;
-        
-        foreach ($previewItems as $item) {
-            $hasAddOns = !empty($item['add_ons_json']);
-            if ($hasAddOns) {
-                $addOns = json_decode($item['add_ons_json'], true);
-                $addOnsCount += count($addOns);
-            }
+        if (in_array($order['status'], ['pending', 'confirmed'])) {
+            $createdAt = new DateTime($order['created_at']);
+            $now = new DateTime();
+            $timeDifference = $now->getTimestamp() - $createdAt->getTimestamp();
             
-            $itemsPreview[] = [
-                'name' => $item['item_name'],
-                'quantity' => (int)$item['quantity'],
-                'has_addons' => $hasAddOns
-            ];
+            if ($timeDifference <= $cancelTimeLimit) {
+                $canCancel = true;
+                $cancelTimeRemaining = $cancelTimeLimit - $timeDifference;
+            }
         }
-
-        // Get tracking progress
-        $trackingStmt = $conn->prepare(
-            "SELECT status, created_at 
-             FROM order_tracking 
-             WHERE order_id = :order_id 
-             ORDER BY created_at DESC LIMIT 1"
-        );
-        $trackingStmt->execute([':order_id' => $order['id']]);
-        $tracking = $trackingStmt->fetch(PDO::FETCH_ASSOC);
 
         $statusProgress = [
             'pending' => 20,
             'confirmed' => 40,
             'preparing' => 60,
             'ready' => 80,
+            'out_for_delivery' => 90,
             'delivered' => 100
         ];
         
-        ob_clean();
         ResponseHandler::success([
             'order' => [
-                'id' => (int)$order['id'],
+                'id' => intval($order['id']),
                 'order_number' => $order['order_number'],
                 'status' => $order['status'],
                 'status_label' => ucfirst(str_replace('_', ' ', $order['status'])),
                 'status_progress' => $statusProgress[$order['status']] ?? 20,
+                'total' => floatval($order['total_amount']),
+                'items_count' => intval($order['item_count']),
                 'merchant' => [
                     'name' => !empty($order['merchant_name']) ? $order['merchant_name'] : 'Restaurant',
                     'image' => formatImageUrl($order['merchant_image'], 'merchants')
                 ],
-                'financial' => [
-                    'total_amount' => floatval($order['total_amount'])
-                ],
-                'items' => [
-                    'preview' => $itemsPreview,
-                    'addons_count' => $addOnsCount,
-                    'has_addons' => $addOnsCount > 0
-                ],
-                'delivery_address' => $order['delivery_address'],
-                'special_instructions' => $order['special_instructions'] ?? '',
                 'created_at' => $order['created_at'],
-                'updated_at' => $order['updated_at'],
-                'tracking_status' => $tracking['status'] ?? $order['status'],
-                'last_update' => $tracking['created_at'] ?? $order['updated_at'] ?? $order['created_at']
+                'actions' => [
+                    'can_cancel' => $canCancel,
+                    'cancel_time_remaining' => $cancelTimeRemaining
+                ]
             ]
         ]);
         
     } catch (Exception $e) {
-        ob_clean();
         ResponseHandler::error('Failed to get latest order: ' . $e->getMessage(), 500);
     }
 }
 
 /*********************************
- * UPDATE ORDER
+ * LEGACY HANDLERS
  *********************************/
-function updateOrder($conn, $data, $userId) {
+function handleGetRequest($userId) {
+    $db = new Database();
+    $conn = $db->getConnection();
+    
     try {
-        $orderId = $data['order_id'] ?? null;
-
-        if (!$orderId) {
-            ob_clean();
-            ResponseHandler::error('Order ID is required', 400);
-            return;
-        }
-
-        $checkStmt = $conn->prepare(
-            "SELECT id, status FROM orders
-             WHERE id = :order_id AND user_id = :user_id"
-        );
-        $checkStmt->execute([
-            ':order_id' => $orderId,
-            ':user_id' => $userId
-        ]);
+        $orderId = $_GET['id'] ?? null;
         
-        $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
-
-        if (!$order) {
-            ob_clean();
-            ResponseHandler::error('Order not found', 404);
-            return;
+        if ($orderId) {
+            getOrderDetails($conn, $orderId, $userId);
+        } else {
+            $input = ['page' => $_GET['page'] ?? 1, 'limit' => $_GET['limit'] ?? 20];
+            getOrders($conn, $input, $userId);
         }
-
-        $modifiableStatuses = ['pending'];
-        if (!in_array($order['status'], $modifiableStatuses)) {
-            ob_clean();
-            ResponseHandler::error('Order cannot be modified at this stage', 400);
-            return;
-        }
-
-        $updatableFields = ['special_instructions'];
-        $updates = [];
-        $params = [':order_id' => $orderId];
-
-        foreach ($updatableFields as $field) {
-            if (isset($data[$field])) {
-                $updates[] = "$field = :$field";
-                $params[":$field"] = $data[$field];
-            }
-        }
-
-        if (empty($updates)) {
-            ob_clean();
-            ResponseHandler::error('No fields to update', 400);
-            return;
-        }
-
-        $updates[] = "updated_at = NOW()";
-        $updateSql = "UPDATE orders SET " . implode(', ', $updates) . " WHERE id = :order_id";
-
-        $updateStmt = $conn->prepare($updateSql);
-        $updateStmt->execute($params);
-
-        ob_clean();
-        ResponseHandler::success(['order_id' => (int)$orderId], 'Order updated successfully');
-        
     } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Failed to update order: ' . $e->getMessage(), 500);
+        ResponseHandler::error('Error: ' . $e->getMessage(), 500);
     }
 }
 
-/*********************************
- * UPDATE DELIVERY ADDRESS
- *********************************/
-function updateDeliveryAddress($conn, $data, $userId) {
+function handlePostRequest($userId) {
+    $db = new Database();
+    $conn = $db->getConnection();
+    
     try {
-        $orderId = $data['order_id'] ?? null;
-        $newAddress = trim($data['delivery_address'] ?? '');
+        $input = json_decode(file_get_contents('php://input'), true);
+        if (!$input) {
+            $input = $_POST;
+        }
+        
+        $action = $input['action'] ?? '';
+
+        switch ($action) {
+            case 'create_from_cart':
+                createOrderFromCart($conn, $input, $userId);
+                break;
+            case 'cancel_order':
+                cancelOrder($conn, $input, $userId);
+                break;
+            case 'latest_active':
+                getLatestActiveOrder($conn, $userId);
+                break;
+            default:
+                ResponseHandler::error('Invalid action', 400);
+        }
+    } catch (Exception $e) {
+        ResponseHandler::error('Error: ' . $e->getMessage(), 500);
+    }
+}
+
+function handlePutRequest($userId) {
+    $db = new Database();
+    $conn = $db->getConnection();
+    
+    try {
+        $input = json_decode(file_get_contents('php://input'), true);
+        if (!$input) {
+            parse_str(file_get_contents('php://input'), $input);
+        }
+        
+        $orderId = $input['order_id'] ?? null;
+        $newAddress = trim($input['delivery_address'] ?? '');
 
         if (!$orderId || !$newAddress) {
-            ob_clean();
             ResponseHandler::error('Order ID and new address are required', 400);
             return;
         }
 
         $checkStmt = $conn->prepare(
-            "SELECT id, status FROM orders
+            "SELECT id, status, created_at FROM orders
              WHERE id = :order_id AND user_id = :user_id"
         );
         $checkStmt->execute([
@@ -2317,19 +985,30 @@ function updateDeliveryAddress($conn, $data, $userId) {
         $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
 
         if (!$order) {
-            ob_clean();
             ResponseHandler::error('Order not found', 404);
             return;
         }
 
         $addressChangeableStatuses = ['pending', 'confirmed'];
         if (!in_array($order['status'], $addressChangeableStatuses)) {
-            ob_clean();
             ResponseHandler::error('Delivery address cannot be changed at this stage', 400);
             return;
         }
 
-        $conn->beginTransaction();
+        // Check time limit for address change (also within first 2 minutes)
+        $createdAt = new DateTime($order['created_at']);
+        $now = new DateTime();
+        $timeDifference = $now->getTimestamp() - $createdAt->getTimestamp();
+        $addressChangeTimeLimit = 120; // 2 minutes
+        
+        if ($timeDifference > $addressChangeTimeLimit) {
+            ResponseHandler::error(
+                "Delivery address can only be changed within the first 2 minutes after order creation",
+                400,
+                'ADDRESS_CHANGE_TIME_EXCEEDED'
+            );
+            return;
+        }
 
         $updateStmt = $conn->prepare(
             "UPDATE orders SET 
@@ -2343,175 +1022,31 @@ function updateDeliveryAddress($conn, $data, $userId) {
             ':address' => $newAddress
         ]);
 
-        // Add to history
-        $historySql = "INSERT INTO order_status_history (
-            order_id, old_status, new_status, changed_by, 
-            changed_by_id, notes, created_at
-        ) VALUES (
-            :order_id, :old_status, :new_status, :changed_by,
-            :changed_by_id, :notes, NOW()
-        )";
-
-        $historyStmt = $conn->prepare($historySql);
-        $historyStmt->execute([
-            ':order_id' => $orderId,
-            ':old_status' => $order['status'],
-            ':new_status' => $order['status'],
-            ':changed_by' => 'user',
-            ':changed_by_id' => $userId,
-            ':notes' => "Delivery address updated to: $newAddress"
-        ]);
-
-        $conn->commit();
-
-        ob_clean();
         ResponseHandler::success([
-            'order_id' => (int)$orderId,
+            'order_id' => intval($orderId),
             'new_address' => $newAddress
         ], 'Delivery address updated successfully');
 
     } catch (Exception $e) {
-        if ($conn->inTransaction()) {
-            $conn->rollBack();
-        }
-        ob_clean();
         ResponseHandler::error('Failed to update address: ' . $e->getMessage(), 500);
-    }
-}
-
-/*********************************
- * GET ORDERS LIST (Legacy - Enhanced with Add-ons)
- *********************************/
-function getOrdersList($conn, $userId) {
-    try {
-        $page = max(1, intval($_GET['page'] ?? 1));
-        $limit = min(50, max(1, intval($_GET['limit'] ?? 20)));
-        $offset = ($page - 1) * $limit;
-        
-        $status = $_GET['status'] ?? 'all';
-        $orderNumber = $_GET['order_number'] ?? '';
-
-        $whereConditions = ["o.user_id = :user_id"];
-        $params = [':user_id' => $userId];
-
-        if ($status !== 'all') {
-            $whereConditions[] = "o.status = :status";
-            $params[':status'] = $status;
-        }
-
-        if ($orderNumber) {
-            $whereConditions[] = "o.order_number LIKE :order_number";
-            $params[':order_number'] = "%$orderNumber%";
-        }
-
-        $whereClause = "WHERE " . implode(" AND ", $whereConditions);
-
-        $countSql = "SELECT COUNT(DISTINCT o.id) as total FROM orders o $whereClause";
-        $countStmt = $conn->prepare($countSql);
-        $countStmt->execute($params);
-        $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
-
-        $sql = "SELECT 
-                    o.id,
-                    o.order_number,
-                    o.status,
-                    o.total_amount,
-                    o.created_at,
-                    o.merchant_id,
-                    m.name as merchant_name,
-                    m.image_url as merchant_image
-                FROM orders o
-                LEFT JOIN merchants m ON o.merchant_id = m.id
-                $whereClause
-                ORDER BY o.created_at DESC
-                LIMIT :limit OFFSET :offset";
-
-        $stmt = $conn->prepare($sql);
-        
-        foreach ($params as $key => $value) {
-            $stmt->bindValue($key, $value);
-        }
-        
-        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-        $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
-        $stmt->execute();
-        
-        $orders = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-        $formattedOrders = [];
-        foreach ($orders as $order) {
-            // Get item count and add-ons info
-            $itemSql = "SELECT 
-                        COUNT(*) as item_count,
-                        SUM(CASE WHEN add_ons_json IS NOT NULL AND add_ons_json != '' THEN 1 ELSE 0 END) as items_with_addons
-                       FROM order_items 
-                       WHERE order_id = :order_id";
-            
-            $itemStmt = $conn->prepare($itemSql);
-            $itemStmt->execute([':order_id' => $order['id']]);
-            $itemInfo = $itemStmt->fetch(PDO::FETCH_ASSOC);
-            
-            // Get preview items
-            $previewSql = "SELECT 
-                            item_name, 
-                            quantity,
-                            add_ons_json
-                          FROM order_items 
-                          WHERE order_id = :order_id 
-                          ORDER BY id ASC 
-                          LIMIT 2";
-            
-            $previewStmt = $conn->prepare($previewSql);
-            $previewStmt->execute([':order_id' => $order['id']]);
-            $previewItems = $previewStmt->fetchAll(PDO::FETCH_ASSOC);
-            
-            $itemsPreview = [];
-            foreach ($previewItems as $item) {
-                $itemsPreview[] = [
-                    'name' => $item['item_name'],
-                    'quantity' => (int)$item['quantity'],
-                    'has_addons' => !empty($item['add_ons_json'])
-                ];
-            }
-            
-            $formattedOrders[] = [
-                'id' => (int)$order['id'],
-                'order_number' => $order['order_number'],
-                'status' => $order['status'],
-                'total_amount' => (float)$order['total_amount'],
-                'created_at' => $order['created_at'],
-                'merchant' => [
-                    'name' => !empty($order['merchant_name']) ? $order['merchant_name'] : 'Restaurant',
-                    'image' => formatImageUrl($order['merchant_image'], 'merchants')
-                ],
-                'items' => [
-                    'count' => (int)($itemInfo['item_count'] ?? 0),
-                    'preview' => $itemsPreview,
-                    'has_addons' => ($itemInfo['items_with_addons'] ?? 0) > 0
-                ]
-            ];
-        }
-
-        ob_clean();
-        ResponseHandler::success([
-            'orders' => $formattedOrders,
-            'pagination' => [
-                'current_page' => $page,
-                'per_page' => $limit,
-                'total_items' => (int)$totalCount,
-                'total_pages' => ceil($totalCount / $limit)
-            ]
-        ]);
-        
-    } catch (Exception $e) {
-        ob_clean();
-        ResponseHandler::error('Failed to get orders: ' . $e->getMessage(), 500);
     }
 }
 
 /*********************************
  * HELPER FUNCTIONS
  *********************************/
+function formatTimeDuration($seconds) {
+    if ($seconds < 60) {
+        return $seconds . ' second(s)';
+    }
+    $minutes = floor($seconds / 60);
+    $remainingSeconds = $seconds % 60;
+    if ($remainingSeconds > 0) {
+        return $minutes . ' minute(s) and ' . $remainingSeconds . ' second(s)';
+    }
+    return $minutes . ' minute(s)';
+}
+
 function formatImageUrl($path, $type = '') {
     global $baseUrl;
     
@@ -2530,9 +1065,6 @@ function formatImageUrl($path, $type = '') {
             break;
         case 'menu_items':
             $folder = 'uploads/menu_items';
-            break;
-        case 'quick_orders':
-            $folder = 'uploads/quick_orders';
             break;
         default:
             $folder = 'uploads';
