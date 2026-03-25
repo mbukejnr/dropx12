@@ -274,9 +274,6 @@ function getMerchantsList($conn, $baseUrl) {
     $isFeatured = $_GET['is_featured'] ?? null;
     $businessType = $_GET['business_type'] ?? '';
     $cuisineType = $_GET['cuisine_type'] ?? '';
-    $deliveryFee = $_GET['delivery_fee'] ?? null;
-    $minDeliveryFee = isset($_GET['min_delivery_fee']) ? floatval($_GET['min_delivery_fee']) : null;
-    $maxDeliveryFee = isset($_GET['max_delivery_fee']) ? floatval($_GET['max_delivery_fee']) : null;
     $acceptsMpamba = $_GET['accepts_mpamba'] ?? null;
     $acceptsCard = $_GET['accepts_card'] ?? null;
     $acceptsCash = $_GET['accepts_cash'] ?? null;
@@ -323,24 +320,6 @@ function getMerchantsList($conn, $baseUrl) {
     if ($isFeatured !== null) {
         $whereConditions[] = "m.is_featured = :is_featured";
         $params[':is_featured'] = $isFeatured === 'true' ? 1 : 0;
-    }
-
-    if ($deliveryFee !== null) {
-        if ($deliveryFee === 'free') {
-            $whereConditions[] = "m.delivery_fee = 0";
-        } elseif ($deliveryFee === 'paid') {
-            $whereConditions[] = "m.delivery_fee > 0";
-        }
-    }
-
-    if ($minDeliveryFee !== null) {
-        $whereConditions[] = "m.delivery_fee >= :min_delivery_fee";
-        $params[':min_delivery_fee'] = $minDeliveryFee;
-    }
-
-    if ($maxDeliveryFee !== null) {
-        $whereConditions[] = "m.delivery_fee <= :max_delivery_fee";
-        $params[':max_delivery_fee'] = $maxDeliveryFee;
     }
 
     if ($acceptsMpamba !== null) {
@@ -392,7 +371,7 @@ function getMerchantsList($conn, $baseUrl) {
 
     $whereClause = count($whereConditions) > 0 ? "WHERE " . implode(" AND ", $whereConditions) : "";
 
-    $allowedSortColumns = ['rating', 'review_count', 'name', 'delivery_fee', 'created_at', 'distance'];
+    $allowedSortColumns = ['rating', 'review_count', 'name', 'created_at', 'distance'];
     $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'rating';
     $sortOrder = $sortOrder === 'ASC' ? 'ASC' : 'DESC';
 
@@ -410,12 +389,11 @@ function getMerchantsList($conn, $baseUrl) {
                 m.cuisine_type,
                 m.rating,
                 m.review_count,
-                CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
+                CONCAT(m.delivery_time) as delivery_info,
                 m.image_url,
                 m.logo_url,
                 m.is_open,
                 m.is_featured,
-                m.delivery_fee,
                 m.min_order_amount,
                 m.free_delivery_threshold,
                 m.delivery_radius,
@@ -566,12 +544,11 @@ function getNearbyMerchants($conn, $baseUrl) {
                 m.cuisine_type,
                 m.rating,
                 m.review_count,
-                CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
+                CONCAT(m.delivery_time) as delivery_info,
                 m.image_url,
                 m.logo_url,
                 m.is_open,
                 m.is_featured,
-                m.delivery_fee,
                 m.min_order_amount,
                 m.free_delivery_threshold,
                 m.delivery_radius,
@@ -663,12 +640,11 @@ function getMerchantsByCategory($conn, $baseUrl) {
                 m.cuisine_type,
                 m.rating,
                 m.review_count,
-                CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
+                CONCAT(m.delivery_time) as delivery_info,
                 m.image_url,
                 m.logo_url,
                 m.is_open,
                 m.is_featured,
-                m.delivery_fee,
                 m.min_order_amount,
                 m.free_delivery_threshold,
                 m.delivery_radius,
@@ -767,7 +743,6 @@ function getMerchantDetails($conn, $merchantId, $baseUrl) {
             m.opening_hours,
             m.tags,
             m.payment_methods,
-            m.delivery_fee,
             m.min_order_amount,
             m.free_delivery_threshold,
             m.delivery_radius,
@@ -1401,12 +1376,11 @@ function getFavoriteMerchants($conn, $baseUrl) {
                 m.cuisine_type,
                 m.rating,
                 m.review_count,
-                CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
+                CONCAT(m.delivery_time) as delivery_info,
                 m.image_url,
                 m.logo_url,
                 m.is_open,
                 m.is_featured,
-                m.delivery_fee,
                 m.min_order_amount,
                 m.distance,
                 m.created_at,
@@ -1472,12 +1446,11 @@ function getMultipleMerchants($conn, $data, $baseUrl) {
                 m.cuisine_type,
                 m.rating,
                 m.review_count,
-                CONCAT(m.delivery_time, ' • MK ', FORMAT(m.delivery_fee, 0), ' fee') as delivery_info,
+                CONCAT(m.delivery_time) as delivery_info,
                 m.image_url,
                 m.logo_url,
                 m.is_open,
                 m.is_featured,
-                m.delivery_fee,
                 m.min_order_amount,
                 m.distance,
                 m.created_at
@@ -1845,7 +1818,7 @@ function checkDeliveryAvailability($conn, $data) {
     }
 
     $stmt = $conn->prepare(
-        "SELECT delivery_radius, delivery_fee, min_order_amount, free_delivery_threshold 
+        "SELECT delivery_radius, min_order_amount, free_delivery_threshold 
          FROM merchants WHERE id = :id AND is_active = 1"
     );
     $stmt->execute([':id' => $merchantId]);
@@ -1857,7 +1830,6 @@ function checkDeliveryAvailability($conn, $data) {
 
     $available = true;
     $reasons = [];
-    $deliveryFee = floatval($merchant['delivery_fee']);
 
     // Check if address is within delivery radius
     if ($latitude && $longitude) {
@@ -1886,8 +1858,6 @@ function checkDeliveryAvailability($conn, $data) {
         'available' => $available,
         'reasons' => $reasons,
         'merchant_id' => $merchantId,
-        'delivery_fee' => $deliveryFee,
-        'formatted_delivery_fee' => 'MK ' . number_format($deliveryFee, 2),
         'min_order_amount' => floatval($merchant['min_order_amount']),
         'free_delivery_threshold' => floatval($merchant['free_delivery_threshold']),
         'delivery_radius' => intval($merchant['delivery_radius'])
@@ -2011,8 +1981,6 @@ function formatMerchantListData($m, $baseUrl) {
         'logo_url' => $logoUrl,
         'is_open' => boolval($m['is_open'] ?? false),
         'is_featured' => boolval($m['is_featured'] ?? false),
-        'delivery_fee' => floatval($m['delivery_fee'] ?? 0),
-        'formatted_delivery_fee' => 'MK ' . number_format(floatval($m['delivery_fee'] ?? 0), 2),
         'min_order_amount' => floatval($m['min_order_amount'] ?? 0),
         'free_delivery_threshold' => floatval($m['free_delivery_threshold'] ?? 0),
         'delivery_radius' => intval($m['delivery_radius'] ?? 5),
@@ -2104,8 +2072,6 @@ function formatMerchantDetailData($m, $baseUrl) {
         'operating_hours' => $operatingHours,
         'tags' => $tags,
         'payment_methods' => $paymentMethods,
-        'delivery_fee' => floatval($m['delivery_fee'] ?? 0),
-        'formatted_delivery_fee' => 'MK ' . number_format(floatval($m['delivery_fee'] ?? 0), 2),
         'min_order_amount' => floatval($m['min_order_amount'] ?? 0),
         'free_delivery_threshold' => floatval($m['free_delivery_threshold'] ?? 0),
         'delivery_radius' => intval($m['delivery_radius'] ?? 5),

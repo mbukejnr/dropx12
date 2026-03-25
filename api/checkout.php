@@ -4,17 +4,16 @@
  * Aggregator Model: Customer pays Dropx, Dropx pays merchants later
  * Malawi market - no tips, no tax, no service fees
  * Payment-first flow: Process payment before creating order
+ * UPDATED: Dynamic delivery fee calculation based on distance from merchant branch to customer
  *********************************/
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Credentials: true");
 header("Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Device-ID, X-Platform, X-App-Version, X-Timestamp");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Device-ID, X-Platform, X-App-Version, X-Timestamp, X-Session-Token");
 header("Content-Type: application/json; charset=UTF-8");
 
-// Debug logging for status constants
+// Debug logging
 error_log("=== CHECKOUT.PHP INITIALIZED ===");
-error_log("ORDER_STATUS_SUCCESS = '" . (defined('ORDER_STATUS_SUCCESS') ? ORDER_STATUS_SUCCESS : 'not defined') . "'");
-error_log("PAYMENT_STATUS_PAID = '" . (defined('PAYMENT_STATUS_PAID') ? PAYMENT_STATUS_PAID : 'not defined') . "'");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -73,7 +72,18 @@ define('DROPX_AIRTEL_MONEY_NUMBER', '0999000000');
 define('DROPX_TNM_MPAMBA_NUMBER', '0888000000');
 
 /*********************************
- * ORDER STATUS CONSTANTS - EXACTLY matching your ENUM
+ * DELIVERY FEE CONFIGURATION
+ *********************************/
+define('DELIVERY_BASE_FEE', 1500.00);
+define('DELIVERY_BASE_DISTANCE', 2.0);
+define('DELIVERY_FEE_PER_KM', 250.00);
+define('DELIVERY_FEE_MINIMUM', 1500.00);
+define('DELIVERY_FEE_MAXIMUM', 20000.00);
+define('MAX_DELIVERY_DISTANCE', 50);
+define('DELIVERY_FEE_API_URL', 'https://dropx12-production.up.railway.app/api/delivery_fee.php');
+
+/*********************************
+ * ORDER STATUS CONSTANTS
  *********************************/
 if (!defined('ORDER_STATUS_PENDING')) {
     define('ORDER_STATUS_PENDING', 'pending');
@@ -89,7 +99,7 @@ if (!defined('ORDER_STATUS_SUCCESS')) {
 }
 
 /*********************************
- * PAYMENT STATUS CONSTANTS - EXACTLY matching your ENUM
+ * PAYMENT STATUS CONSTANTS
  *********************************/
 if (!defined('PAYMENT_STATUS_PENDING')) {
     define('PAYMENT_STATUS_PENDING', 'pending');
@@ -103,12 +113,6 @@ if (!defined('PAYMENT_STATUS_FAILED')) {
 if (!defined('PAYMENT_STATUS_REFUNDED')) {
     define('PAYMENT_STATUS_REFUNDED', 'refunded');
 }
-
-// Debug after defining constants
-error_log("After definition - ORDER_STATUS_SUCCESS = '" . ORDER_STATUS_SUCCESS . "' (length: " . strlen(ORDER_STATUS_SUCCESS) . ")");
-error_log("After definition - PAYMENT_STATUS_PAID = '" . PAYMENT_STATUS_PAID . "' (length: " . strlen(PAYMENT_STATUS_PAID) . ")");
-error_log("Hex of ORDER_STATUS_SUCCESS: " . bin2hex(ORDER_STATUS_SUCCESS));
-error_log("Hex of PAYMENT_STATUS_PAID: " . bin2hex(PAYMENT_STATUS_PAID));
 
 /*********************************
  * AUTHENTICATION
@@ -181,9 +185,83 @@ function getCartItemsWithMerchant($conn, $cartId) {
 }
 
 /*********************************
- * CALCULATE CART TOTALS
+ * GET DYNAMIC DELIVERY FEE FROM API
  *********************************/
-function calculateCartTotals($conn, $cartId, $userId, $items) {
+function getDynamicDeliveryFee($conn, $merchantId, $customerLat, $customerLng, $promoCode = null) {
+    try {
+        // Build URL with parameters
+        $url = DELIVERY_FEE_API_URL . '?' . http_build_query([
+            'merchant_id' => $merchantId,
+            'customer_lat' => $customerLat,
+            'customer_lng' => $customerLng,
+            'promo_code' => $promoCode
+        ]);
+        
+        // Make API call
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+        
+        if ($curlError) {
+            error_log("Delivery fee API curl error: " . $curlError);
+            return [
+                'success' => false,
+                'fee' => 1500.00,
+                'error' => $curlError
+            ];
+        }
+        
+        if ($httpCode !== 200) {
+            error_log("Delivery fee API returned HTTP $httpCode");
+            return [
+                'success' => false,
+                'fee' => 1500.00,
+                'error' => "HTTP $httpCode"
+            ];
+        }
+        
+        $data = json_decode($response, true);
+        
+        if ($data && isset($data['success']) && $data['success'] === true) {
+            return [
+                'success' => true,
+                'fee' => $data['data']['delivery_fee']['final_fee'],
+                'base_fee' => $data['data']['delivery_fee']['base_fee'],
+                'discount' => $data['data']['delivery_fee']['discount'],
+                'distance' => $data['data']['distance']['km'],
+                'branch' => $data['data']['nearest_branch'] ?? null,
+                'breakdown' => $data['data']['delivery_fee']['breakdown'] ?? [],
+                'full_response' => $data['data']
+            ];
+        }
+        
+        return [
+            'success' => false,
+            'fee' => 1500.00,
+            'error' => 'Invalid response from delivery fee API'
+        ];
+        
+    } catch (Exception $e) {
+        error_log("Error getting dynamic delivery fee: " . $e->getMessage());
+        return [
+            'success' => false,
+            'fee' => 1500.00,
+            'error' => $e->getMessage()
+        ];
+    }
+}
+
+/*********************************
+ * CALCULATE CART TOTALS WITH DYNAMIC DELIVERY FEE
+ *********************************/
+function calculateCartTotals($conn, $cartId, $userId, $items, $dynamicDeliveryFee = null) {
     if (empty($items)) {
         return null;
     }
@@ -191,7 +269,9 @@ function calculateCartTotals($conn, $cartId, $userId, $items) {
     // Get merchant info from first item
     $merchantId = $items[0]['merchant_id'];
     $merchantName = $items[0]['merchant_name'];
-    $deliveryFee = floatval($items[0]['merchant_delivery_fee'] ?? 1500.00);
+    
+    // Use dynamic delivery fee if provided, otherwise use merchant's default
+    $deliveryFee = $dynamicDeliveryFee !== null ? $dynamicDeliveryFee : floatval($items[0]['merchant_delivery_fee'] ?? 1500.00);
     $minimumOrder = floatval($items[0]['merchant_minimum'] ?? 0);
     $prepTime = $items[0]['preparation_time'] ?? 20;
     
@@ -286,7 +366,6 @@ function getUserDefaultAddress($conn, $userId) {
  *********************************/
 function getWalletBalance($conn, $userId) {
     try {
-        // Check if dropx_wallets table exists
         $tableCheck = $conn->query("SHOW TABLES LIKE 'dropx_wallets'");
         if ($tableCheck->rowCount() == 0) {
             return [
@@ -324,11 +403,10 @@ function getWalletBalance($conn, $userId) {
 }
 
 /*********************************
- * PROCESS PAYMENT - SIMULATED FOR TESTING
+ * PROCESS PAYMENT
  *********************************/
 function processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails) {
     try {
-        // Get cart items to calculate total
         $items = getCartItemsWithMerchant($conn, $cartId);
         if (empty($items)) {
             return ['success' => false, 'message' => 'Cart is empty'];
@@ -337,14 +415,11 @@ function processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails
         $totals = calculateCartTotals($conn, $cartId, $userId, $items);
         $amount = $totals['total_amount'];
         
-        // Generate transaction reference
         $transactionId = 'TXN-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
         $reference = 'REF-' . date('Ymd') . '-' . str_pad(mt_rand(1, 99999), 5, '0', STR_PAD_LEFT);
         
-        // Check if payment_logs table exists
         $tableCheck = $conn->query("SHOW TABLES LIKE 'payment_logs'");
         if ($tableCheck->rowCount() > 0) {
-            // Log payment attempt
             $logStmt = $conn->prepare(
                 "INSERT INTO payment_logs 
                  (user_id, cart_id, amount, payment_method, transaction_id, reference, status, created_at)
@@ -360,7 +435,6 @@ function processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails
             ]);
         }
         
-        // Simulate successful payment
         return [
             'success' => true,
             'message' => 'Payment processed successfully',
@@ -383,39 +457,27 @@ function processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails
 }
 
 /*********************************
- * CREATE ORDER AFTER PAYMENT - FIXED for your ENUM values
+ * CREATE ORDER AFTER PAYMENT
  *********************************/
 function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $paymentMethod, $transactionId, $reference) {
-    // Generate order number
     $orderNumber = 'ORD-' . date('Ymd') . '-' . str_pad(mt_rand(1, 9999), 4, '0', STR_PAD_LEFT);
     
-    // Start transaction
     $conn->beginTransaction();
     
     try {
-        // VALIDATE STATUS VALUES - ONLY use values from your ENUM
         $validPaymentStatuses = ['pending', 'paid', 'failed', 'refunded'];
         $validOrderStatuses = ['pending', 'paid', 'failed', 'success'];
         
-        $paymentStatus = PAYMENT_STATUS_PAID; // Should be 'paid'
-        $orderStatus = ORDER_STATUS_SUCCESS; // Should be 'success'
+        $paymentStatus = PAYMENT_STATUS_PAID;
+        $orderStatus = ORDER_STATUS_SUCCESS;
         
-        // Debug logging
-        error_log("=== ORDER CREATION DEBUG ===");
-        error_log("Creating order - payment_status: '" . $paymentStatus . "' (length: " . strlen($paymentStatus) . ")");
-        error_log("Creating order - status: '" . $orderStatus . "' (length: " . strlen($orderStatus) . ")");
-        error_log("payment_status hex: " . bin2hex($paymentStatus));
-        error_log("status hex: " . bin2hex($orderStatus));
-        
-        // Double-check they're valid
         if (!in_array($paymentStatus, $validPaymentStatuses)) {
-            throw new Exception("Invalid payment status: '$paymentStatus' (hex: " . bin2hex($paymentStatus) . ") - must be one of: " . implode(', ', $validPaymentStatuses));
+            throw new Exception("Invalid payment status: '$paymentStatus'");
         }
         if (!in_array($orderStatus, $validOrderStatuses)) {
-            throw new Exception("Invalid order status: '$orderStatus' (hex: " . bin2hex($orderStatus) . ") - must be one of: " . implode(', ', $validOrderStatuses));
+            throw new Exception("Invalid order status: '$orderStatus'");
         }
         
-        // Create order - with explicit status values from constants
         $stmt = $conn->prepare(
             "INSERT INTO orders 
                 (order_number, user_id, merchant_id, merchant_name,
@@ -435,7 +497,6 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
         $deliveryAddressId = $address ? $address['id'] : null;
         $merchantName = $totals['merchant']['name'] ?? '';
         
-        // Collect special instructions from items
         $specialInstructions = '';
         foreach ($totals['items'] as $item) {
             if (!empty($item['notes'])) {
@@ -443,7 +504,7 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
             }
         }
         
-        $params = [
+        $stmt->execute([
             ':order_number' => $orderNumber,
             ':user_id' => $userId,
             ':merchant_id' => $totals['merchant']['id'],
@@ -457,19 +518,14 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
             ':payment_method' => $paymentMethod,
             ':transaction_id' => $transactionId,
             ':reference' => $reference,
-            ':payment_status' => PAYMENT_STATUS_PAID, // Use constant: 'paid'
-            ':status' => ORDER_STATUS_SUCCESS,        // Use constant: 'success'
+            ':payment_status' => PAYMENT_STATUS_PAID,
+            ':status' => ORDER_STATUS_SUCCESS,
             ':special_instructions' => $specialInstructions,
             ':preparation_time' => $totals['merchant']['preparation_time'] ?? null
-        ];
+        ]);
         
-        // Log the params for debugging
-        error_log("Creating order with params: " . json_encode($params));
-        
-        $stmt->execute($params);
         $orderId = $conn->lastInsertId();
         
-        // Add order items
         $itemStmt = $conn->prepare(
             "INSERT INTO order_items 
                 (order_id, item_name, quantity, price, total,
@@ -497,21 +553,18 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
             ]);
         }
         
-        // Create tracking
         $trackStmt = $conn->prepare(
             "INSERT INTO order_tracking (order_id, status, created_at)
              VALUES (:order_id, 'Order placed', NOW())"
         );
         $trackStmt->execute([':order_id' => $orderId]);
         
-        // Clear cart
         $clearStmt = $conn->prepare("UPDATE cart_items SET is_active = 0 WHERE cart_id = :cart_id");
         $clearStmt->execute([':cart_id' => $cartId]);
         
         $updateCartStmt = $conn->prepare("UPDATE carts SET status = 'completed' WHERE id = :cart_id");
         $updateCartStmt->execute([':cart_id' => $cartId]);
         
-        // Update payment log if table exists
         $tableCheck = $conn->query("SHOW TABLES LIKE 'payment_logs'");
         if ($tableCheck->rowCount() > 0) {
             $updateLogStmt = $conn->prepare(
@@ -536,7 +589,6 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
     } catch (Exception $e) {
         $conn->rollBack();
         error_log("❌ Order creation error: " . $e->getMessage());
-        error_log("Error trace: " . $e->getTraceAsString());
         return [
             'success' => false,
             'message' => $e->getMessage()
@@ -550,7 +602,6 @@ function createOrderAfterPayment($conn, $userId, $cartId, $totals, $address, $pa
 try {
     $method = $_SERVER['REQUEST_METHOD'];
     
-    // Connect to database
     $db = new Database();
     $conn = $db->getConnection();
     
@@ -558,44 +609,68 @@ try {
         ResponseHandler::error('Database connection failed', 500);
     }
     
-    // Authenticate user
     $userId = authenticateUser($conn);
     if (!$userId) {
         ResponseHandler::error('Authentication required', 401);
     }
     
-    // Parse input based on method
     $input = [];
     if ($method === 'POST' || $method === 'PUT') {
         $input = json_decode(file_get_contents('php://input'), true) ?? [];
     }
     
     /*********************************
-     * GET CHECKOUT DATA (GET)
+     * GET CHECKOUT DATA (GET) - WITH DYNAMIC DELIVERY FEE
      *********************************/
     if ($method === 'GET') {
-        // Get active cart
         $cart = getActiveCart($conn, $userId);
         if (!$cart) {
             ResponseHandler::error('No active cart found', 404);
         }
         
-        // Get cart items
         $items = getCartItemsWithMerchant($conn, $cart['id']);
         if (empty($items)) {
             ResponseHandler::error('Cart is empty', 400);
         }
         
-        // Check if all items are from same merchant
         $merchantIds = array_unique(array_column($items, 'merchant_id'));
         if (count($merchantIds) > 1) {
-            ResponseHandler::error('Cart contains items from multiple merchants', 400);
+            ResponseHandler::error('Cart contains items from multiple merchants. Please checkout each merchant separately.', 400);
         }
         
-        // Calculate totals
-        $totals = calculateCartTotals($conn, $cart['id'], $userId, $items);
+        $merchantId = $merchantIds[0];
         
-        // Check minimum order
+        // Get user address
+        $address = getUserDefaultAddress($conn, $userId);
+        
+        // Calculate dynamic delivery fee if address has coordinates
+        $dynamicDeliveryFeeData = null;
+        $deliveryFeeCalculated = false;
+        
+        if ($address && !empty($address['latitude']) && !empty($address['longitude'])) {
+            error_log("Calculating dynamic delivery fee for merchant $merchantId at lat: {$address['latitude']}, lng: {$address['longitude']}");
+            
+            $deliveryFeeResult = getDynamicDeliveryFee(
+                $conn,
+                $merchantId,
+                $address['latitude'],
+                $address['longitude'],
+                null // promo code can be added later
+            );
+            
+            if ($deliveryFeeResult['success']) {
+                $dynamicDeliveryFeeData = $deliveryFeeResult;
+                $deliveryFeeCalculated = true;
+                error_log("Dynamic delivery fee calculated: MK" . $deliveryFeeResult['fee']);
+            } else {
+                error_log("Failed to get dynamic delivery fee: " . ($deliveryFeeResult['error'] ?? 'Unknown error'));
+            }
+        }
+        
+        // Calculate totals with dynamic delivery fee if available
+        $deliveryFee = $deliveryFeeCalculated ? $dynamicDeliveryFeeData['fee'] : null;
+        $totals = calculateCartTotals($conn, $cart['id'], $userId, $items, $deliveryFee);
+        
         if (!$totals['merchant']['minimum_met']) {
             ResponseHandler::error([
                 'message' => 'Minimum order requirement not met',
@@ -604,14 +679,10 @@ try {
             ], 400);
         }
         
-        // Get user address
-        $address = getUserDefaultAddress($conn, $userId);
-        
-        // Get wallet balance safely
         $wallet = getWalletBalance($conn, $userId);
         
-        // Return checkout data
-        ResponseHandler::success([
+        // Prepare response with delivery fee details
+        $responseData = [
             'cart_id' => $cart['id'],
             'order_data' => [
                 'merchant' => $totals['merchant'],
@@ -646,7 +717,8 @@ try {
                     'name' => 'DropX Wallet',
                     'type' => 'wallet',
                     'icon' => 'wallet',
-                    'description' => 'Pay using your DropX Wallet balance'
+                    'description' => 'Pay using your DropX Wallet balance',
+                    'is_enabled' => $wallet['exists'] && $wallet['balance'] >= $totals['total_amount']
                 ],
                 [
                     'id' => PAYMENT_METHOD_AIRTEL_MONEY,
@@ -685,7 +757,20 @@ try {
                     ]
                 ]
             ]
-        ]);
+        ];
+        
+        // Add delivery fee calculation details if available
+        if ($deliveryFeeCalculated && $dynamicDeliveryFeeData) {
+            $responseData['delivery_calculation'] = [
+                'distance_km' => $dynamicDeliveryFeeData['distance'],
+                'base_fee' => $dynamicDeliveryFeeData['base_fee'],
+                'discount' => $dynamicDeliveryFeeData['discount'],
+                'branch_used' => $dynamicDeliveryFeeData['branch'],
+                'breakdown' => $dynamicDeliveryFeeData['breakdown']
+            ];
+        }
+        
+        ResponseHandler::success($responseData);
     }
     
     /*********************************
@@ -696,6 +781,7 @@ try {
         $cartId = $input['cart_id'] ?? null;
         $paymentMethod = $input['payment_method'] ?? null;
         $paymentDetails = $input['payment_details'] ?? [];
+        $promoCode = $input['promo_code'] ?? null;
         
         if (!$cartId) {
             ResponseHandler::error('Cart ID required', 400);
@@ -705,7 +791,6 @@ try {
             ResponseHandler::error('Payment method required', 400);
         }
         
-        // Verify cart belongs to user
         $cartStmt = $conn->prepare("SELECT id FROM carts WHERE id = :id AND user_id = :user_id AND status = 'active'");
         $cartStmt->execute([':id' => $cartId, ':user_id' => $userId]);
         
@@ -713,7 +798,6 @@ try {
             ResponseHandler::error('Cart not found or not active', 404);
         }
         
-        // Process payment
         $result = processPayment($conn, $userId, $cartId, $paymentMethod, $paymentDetails);
         
         if ($result['success']) {
@@ -724,7 +808,7 @@ try {
     }
     
     /*********************************
-     * CREATE ORDER AFTER PAYMENT (POST with action) - FIXED
+     * CREATE ORDER AFTER PAYMENT (POST with action)
      *********************************/
     elseif ($method === 'POST' && isset($input['action']) && $input['action'] === 'create_order') {
         
@@ -732,6 +816,7 @@ try {
         $transactionId = $input['transaction_id'] ?? null;
         $reference = $input['reference'] ?? null;
         $paymentMethod = $input['payment_method'] ?? null;
+        $promoCode = $input['promo_code'] ?? null;
         
         if (!$cartId || !$transactionId || !$reference || !$paymentMethod) {
             ResponseHandler::error('Cart ID, transaction ID, reference and payment method required', 400);
@@ -743,22 +828,38 @@ try {
         error_log("Reference: $reference");
         error_log("Payment Method: $paymentMethod");
         
-        // Get cart items
         $items = getCartItemsWithMerchant($conn, $cartId);
         if (empty($items)) {
             ResponseHandler::error('Cart is empty', 400);
         }
         
-        // Calculate totals
-        $totals = calculateCartTotals($conn, $cartId, $userId, $items);
-        
-        // Get address
+        $merchantId = $items[0]['merchant_id'];
         $address = getUserDefaultAddress($conn, $userId);
+        
         if (!$address) {
             ResponseHandler::error('Please set a delivery address first', 400);
         }
         
-        // Create order
+        // Calculate dynamic delivery fee
+        $dynamicDeliveryFee = null;
+        if (!empty($address['latitude']) && !empty($address['longitude'])) {
+            $deliveryFeeResult = getDynamicDeliveryFee(
+                $conn,
+                $merchantId,
+                $address['latitude'],
+                $address['longitude'],
+                $promoCode
+            );
+            
+            if ($deliveryFeeResult['success']) {
+                $dynamicDeliveryFee = $deliveryFeeResult['fee'];
+                error_log("Using dynamic delivery fee: MK" . $dynamicDeliveryFee);
+            }
+        }
+        
+        // Calculate totals with dynamic delivery fee
+        $totals = calculateCartTotals($conn, $cartId, $userId, $items, $dynamicDeliveryFee);
+        
         $order = createOrderAfterPayment(
             $conn, $userId, $cartId, $totals, $address, 
             $paymentMethod, $transactionId, $reference
@@ -774,8 +875,10 @@ try {
                     'id' => $totals['merchant']['id'],
                     'name' => $totals['merchant']['name']
                 ],
-                'status' => ORDER_STATUS_SUCCESS, // 'success'
-                'payment_status' => PAYMENT_STATUS_PAID // 'paid'
+                'delivery_fee' => $totals['delivery_fee'],
+                'delivery_fee_formatted' => $totals['delivery_fee_formatted'],
+                'status' => ORDER_STATUS_SUCCESS,
+                'payment_status' => PAYMENT_STATUS_PAID
             ], 'Order created successfully');
         } else {
             ResponseHandler::error('Failed to create order: ' . $order['message'], 500);
@@ -783,7 +886,7 @@ try {
     }
     
     /*********************************
-     * UPDATE PAYMENT STATUS (PUT) - FIXED for your ENUMs
+     * UPDATE PAYMENT STATUS (PUT)
      *********************************/
     elseif ($method === 'PUT' && isset($input['action']) && $input['action'] === 'payment_status') {
         
@@ -795,7 +898,6 @@ try {
             ResponseHandler::error('Order ID and payment method required', 400);
         }
         
-        // Verify order belongs to user
         $checkStmt = $conn->prepare("SELECT id FROM orders WHERE id = :id AND user_id = :user_id");
         $checkStmt->execute([':id' => $orderId, ':user_id' => $userId]);
         
@@ -803,16 +905,13 @@ try {
             ResponseHandler::error('Order not found', 404);
         }
         
-        // Validate payment status
         $validPaymentStatuses = ['pending', 'paid', 'failed', 'refunded'];
-        $validOrderStatuses = ['pending', 'paid', 'failed', 'success'];
         
         if (!in_array($paymentStatus, $validPaymentStatuses)) {
             ResponseHandler::error("Invalid payment status. Must be one of: " . implode(', ', $validPaymentStatuses), 400);
         }
         
         if ($paymentStatus === 'paid') {
-            // Update order to paid
             $stmt = $conn->prepare(
                 "UPDATE orders 
                  SET payment_status = :payment_status, 
@@ -822,8 +921,8 @@ try {
             );
             $stmt->execute([
                 ':id' => $orderId,
-                ':payment_status' => PAYMENT_STATUS_PAID, // 'paid'
-                ':status' => ORDER_STATUS_SUCCESS // 'success'
+                ':payment_status' => PAYMENT_STATUS_PAID,
+                ':status' => ORDER_STATUS_SUCCESS
             ]);
             
             ResponseHandler::success([
@@ -834,7 +933,6 @@ try {
             ], 'Payment confirmed');
             
         } elseif ($paymentStatus === 'failed') {
-            // Payment failed
             $stmt = $conn->prepare(
                 "UPDATE orders 
                  SET payment_status = :payment_status, 
@@ -844,8 +942,8 @@ try {
             );
             $stmt->execute([
                 ':id' => $orderId,
-                ':payment_status' => PAYMENT_STATUS_FAILED, // 'failed'
-                ':status' => ORDER_STATUS_FAILED // 'failed'
+                ':payment_status' => PAYMENT_STATUS_FAILED,
+                ':status' => ORDER_STATUS_FAILED
             ]);
             
             ResponseHandler::success([
@@ -855,7 +953,6 @@ try {
             ], 'Payment failed');
             
         } elseif ($paymentStatus === 'refunded') {
-            // Payment refunded
             $stmt = $conn->prepare(
                 "UPDATE orders 
                  SET payment_status = :payment_status, 
@@ -865,8 +962,8 @@ try {
             );
             $stmt->execute([
                 ':id' => $orderId,
-                ':payment_status' => PAYMENT_STATUS_REFUNDED, // 'refunded'
-                ':status' => ORDER_STATUS_FAILED // or could be 'pending' - adjust as needed
+                ':payment_status' => PAYMENT_STATUS_REFUNDED,
+                ':status' => ORDER_STATUS_FAILED
             ]);
             
             ResponseHandler::success([
@@ -874,9 +971,7 @@ try {
                 'payment_status' => PAYMENT_STATUS_REFUNDED,
                 'status' => ORDER_STATUS_FAILED
             ], 'Payment refunded');
-            
         } else {
-            // Just update payment status
             $stmt = $conn->prepare(
                 "UPDATE orders 
                  SET payment_status = :payment_status, 
@@ -895,9 +990,6 @@ try {
         }
     }
     
-    /*********************************
-     * FALLBACK - METHOD NOT ALLOWED
-     *********************************/
     else {
         ResponseHandler::error('Method not allowed', 405);
     }
