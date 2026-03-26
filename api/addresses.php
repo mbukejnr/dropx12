@@ -135,7 +135,7 @@ function authenticateUser() {
 try {
     $method = $_SERVER['REQUEST_METHOD'];
     $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-    $path = str_replace('/api/addresses', '', $path);
+    $path = str_replace('/api/addresses.php', '', $path);
     
     $locationId = null;
     if (preg_match('/\/(\d+)$/', $path, $matches)) {
@@ -177,7 +177,13 @@ try {
 function reverseGeocode($lat, $lng) {
     $url = "https://maps.googleapis.com/maps/api/geocode/json?latlng={$lat},{$lng}&key=" . GOOGLE_MAPS_API_KEY . "&location_type=ROOFTOP&result_type=street_address";
     
-    $response = file_get_contents($url);
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
     $data = json_decode($response, true);
     
     if ($data['status'] == 'OK') {
@@ -194,7 +200,9 @@ function reverseGeocode($lat, $lng) {
             'country' => $components['country'],
             'postal_code' => $components['postal_code'],
             'place_id' => $result['place_id'],
-            'plus_code' => $result['plus_code']['global_code'] ?? null
+            'plus_code' => $result['plus_code']['global_code'] ?? null,
+            'latitude' => $lat,
+            'longitude' => $lng
         ];
     }
     
@@ -204,7 +212,13 @@ function reverseGeocode($lat, $lng) {
 function geocodeAddress($address) {
     $url = "https://maps.googleapis.com/maps/api/geocode/json?address=" . urlencode($address) . "&key=" . GOOGLE_MAPS_API_KEY;
     
-    $response = file_get_contents($url);
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
     $data = json_decode($response, true);
     
     if ($data['status'] == 'OK') {
@@ -225,7 +239,13 @@ function getAddressSuggestions($input) {
     
     $url = "https://maps.googleapis.com/maps/api/place/autocomplete/json?input=" . urlencode($input) . "&types=address&components=country:mw&key=" . GOOGLE_MAPS_API_KEY;
     
-    $response = file_get_contents($url);
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+    $response = curl_exec($ch);
+    curl_close($ch);
+    
     $data = json_decode($response, true);
     
     $suggestions = [];
@@ -300,7 +320,6 @@ function getLocationsList() {
     $page = max(1, intval($params['page'] ?? 1));
     $offset = ($page - 1) * $limit;
     
-    // Get nearby locations if coordinates provided
     $lat = $params['lat'] ?? null;
     $lng = $params['lng'] ?? null;
     $radius = $params['radius'] ?? null;
@@ -329,7 +348,6 @@ function getLocationsList() {
     $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'last_used';
     $sortOrder = $sortOrder === 'ASC' ? 'ASC' : 'DESC';
 
-    // Calculate distance if coordinates provided
     $selectFields = "id, user_id, label, full_name, phone, address_line1, address_line2, street, city, neighborhood, area, sector, location_type, landmark, latitude, longitude, is_default, last_used, created_at, updated_at, formatted_address, street_number, route, place_id";
     
     if ($lat && $lng && $radius) {
@@ -559,13 +577,11 @@ function createLocation() {
     $longitude = isset($input['longitude']) ? floatval($input['longitude']) : null;
     $isDefault = boolval($input['is_default'] ?? false);
     
-    // Google Maps data
     $formattedAddress = $input['formatted_address'] ?? null;
     $streetNumber = $input['street_number'] ?? null;
     $route = $input['route'] ?? null;
     $placeId = $input['place_id'] ?? null;
     
-    // If coordinates provided but no address, reverse geocode
     if ($latitude && $longitude && !$formattedAddress) {
         $geoData = reverseGeocode($latitude, $longitude);
         if ($geoData) {
@@ -578,7 +594,6 @@ function createLocation() {
         }
     }
     
-    // If address provided but no coordinates, geocode
     if (!$latitude && !$longitude && $formattedAddress) {
         $geoData = geocodeAddress($formattedAddress);
         if ($geoData) {
@@ -689,9 +704,7 @@ function createLocation() {
 
         $conn->commit();
 
-        $locationStmt = $conn->prepare(
-            "SELECT * FROM addresses WHERE id = :id"
-        );
+        $locationStmt = $conn->prepare("SELECT * FROM addresses WHERE id = :id");
         $locationStmt->execute([':id' => $locationId]);
         $location = $locationStmt->fetch(PDO::FETCH_ASSOC);
 
@@ -700,7 +713,8 @@ function createLocation() {
         logUserActivity($conn, $userId, 'location_created', "Created location: $label", [
             'location_id' => $locationId,
             'location_type' => $locationType,
-            'has_coordinates' => !empty($latitude)
+            'has_coordinates' => !empty($latitude),
+            'place_id' => $placeId
         ]);
 
         ResponseHandler::success([
