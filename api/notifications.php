@@ -337,6 +337,12 @@ function handlePostRequest($conn, $userId, $input) {
         case 'trigger_event':
             handleTriggerEvent($conn, $userId, $input);
             break;
+        case 'register_device':
+            registerDeviceToken($conn, $userId, $input);
+            break;
+        case 'unregister_device':
+            unregisterDeviceToken($conn, $userId, $input);
+            break;
         default:
             ResponseHandler::error('Invalid action: ' . $action, 400);
     }
@@ -679,6 +685,13 @@ function createNotificationForEvent($conn, $userId, $eventName, $eventData) {
             ':sent_via' => 'in_app'
         ]);
         
+        $notificationId = $conn->lastInsertId();
+        
+        // Send push notification if enabled
+        if ($result && $notificationConfig['send_push'] ?? true) {
+            sendPushNotification($conn, $userId, $notificationConfig['title'], $notificationConfig['message'], $notificationConfig['type'], $eventData, $notificationId);
+        }
+        
         return $result;
     } catch (Exception $e) {
         error_log("Failed to create notification for event: " . $e->getMessage());
@@ -694,7 +707,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
         'should_create' => false,
         'type' => 'system',
         'title' => '',
-        'message' => ''
+        'message' => '',
+        'send_push' => true
     ];
     
     switch ($eventName) {
@@ -703,7 +717,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'system',
                 'title' => 'Welcome to DropX! 🎉',
-                'message' => 'Thank you for joining DropX. Get started by exploring our restaurants.'
+                'message' => 'Thank you for joining DropX. Get started by exploring our restaurants.',
+                'send_push' => true
             ];
             
         case 'user_logged_in':
@@ -716,7 +731,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'order',
                 'title' => 'Order Confirmed! ✅',
-                'message' => "Your order #$orderNumber has been placed successfully."
+                'message' => "Your order #$orderNumber has been placed successfully.",
+                'send_push' => true
             ];
             
         case 'order_status_changed':
@@ -737,7 +753,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'order',
                 'title' => 'Order Status Updated',
-                'message' => $message
+                'message' => $message,
+                'send_push' => true
             ];
             
         case 'payment_success':
@@ -747,7 +764,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'payment',
                 'title' => 'Payment Successful! 💳',
-                'message' => "Payment of ₹$amount for order #$orderId was successful."
+                'message' => "Payment of ₹$amount for order #$orderId was successful.",
+                'send_push' => true
             ];
             
         case 'delivery_assigned':
@@ -756,7 +774,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'delivery',
                 'title' => 'Delivery Partner Assigned',
-                'message' => "$driverName will be delivering your order."
+                'message' => "$driverName will be delivering your order.",
+                'send_push' => true
             ];
             
         case 'order_delivered':
@@ -764,7 +783,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'delivery',
                 'title' => 'Order Delivered! 🎊',
-                'message' => 'Your order has been delivered. Enjoy your meal!'
+                'message' => 'Your order has been delivered. Enjoy your meal!',
+                'send_push' => true
             ];
             
         case 'promotion_applied':
@@ -774,7 +794,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'promotion',
                 'title' => 'Promotion Applied! 🎁',
-                'message' => "Promo code '$promoCode' applied. You saved ₹$discount!"
+                'message' => "Promo code '$promoCode' applied. You saved ₹$discount!",
+                'send_push' => true
             ];
             
         case 'review_added':
@@ -791,7 +812,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'update',
                 'title' => 'Review Submitted',
-                'message' => $messages[$targetType] ?? "Thanks for your {$rating}⭐ review!"
+                'message' => $messages[$targetType] ?? "Thanks for your {$rating}⭐ review!",
+                'send_push' => false // Don't send push for reviews
             ];
             
         case 'cart_threshold':
@@ -803,14 +825,16 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                     'should_create' => true,
                     'type' => 'promotion',
                     'title' => 'Free Delivery! 🚚',
-                    'message' => 'Your cart qualifies for free delivery!'
+                    'message' => 'Your cart qualifies for free delivery!',
+                    'send_push' => false
                 ];
             } else {
                 return [
                     'should_create' => true,
                     'type' => 'promotion',
                     'title' => 'Cart Reminder',
-                    'message' => "Your cart total is ₹$cartTotal. Add more items to qualify for free delivery!"
+                    'message' => "Your cart total is ₹$cartTotal. Add more items to qualify for free delivery!",
+                    'send_push' => false
                 ];
             }
             
@@ -819,7 +843,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'update',
                 'title' => 'Address Saved',
-                'message' => 'Your new address has been saved successfully.'
+                'message' => 'Your new address has been saved successfully.',
+                'send_push' => false
             ];
             
         case 'profile_updated':
@@ -827,7 +852,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'update',
                 'title' => 'Profile Updated',
-                'message' => 'Your profile has been updated successfully.'
+                'message' => 'Your profile has been updated successfully.',
+                'send_push' => false
             ];
             
         case 'merchant_favorite':
@@ -838,7 +864,8 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'title' => $isFavorite ? 'Added to Favorites' : 'Removed from Favorites',
                 'message' => $isFavorite 
                     ? 'Restaurant added to your favorites!' 
-                    : 'Restaurant removed from your favorites.'
+                    : 'Restaurant removed from your favorites.',
+                'send_push' => false
             ];
             
         case 'quick_order_created':
@@ -847,12 +874,350 @@ function getNotificationConfigForEvent($eventName, $eventData) {
                 'should_create' => true,
                 'type' => 'order',
                 'title' => 'Quick Order Confirmed! ⚡',
-                'message' => "Your quick order #$orderNumber has been placed successfully."
+                'message' => "Your quick order #$orderNumber has been placed successfully.",
+                'send_push' => true
             ];
             
         default:
             return $defaultConfig;
     }
+}
+
+/*********************************
+ * SEND PUSH NOTIFICATION (Production Function)
+ *********************************/
+function sendPushNotification($conn, $userId, $title, $message, $type, $data = [], $notificationId = null) {
+    try {
+        // Check if user has push notifications enabled
+        $prefStmt = $conn->prepare(
+            "SELECT push_enabled FROM user_notification_settings WHERE user_id = :user_id"
+        );
+        $prefStmt->execute([':user_id' => $userId]);
+        $preferences = $prefStmt->fetch(PDO::FETCH_ASSOC);
+        
+        // If push notifications are disabled, don't send
+        if ($preferences && $preferences['push_enabled'] == 0) {
+            return [
+                'success' => false,
+                'devices' => 0,
+                'error' => 'Push notifications disabled by user'
+            ];
+        }
+        
+        // Create user_devices table if not exists
+        $createDevicesTable = "
+            CREATE TABLE IF NOT EXISTS user_devices (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                user_id INT NOT NULL,
+                fcm_token VARCHAR(255) NOT NULL,
+                device_type ENUM('android', 'ios') NOT NULL,
+                device_name VARCHAR(255),
+                is_active TINYINT DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                last_active TIMESTAMP NULL,
+                UNIQUE KEY unique_user_token (user_id, fcm_token),
+                INDEX idx_user_id (user_id),
+                INDEX idx_is_active (is_active)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ";
+        $conn->exec($createDevicesTable);
+        
+        // Create push_logs table if not exists
+        $createLogsTable = "
+            CREATE TABLE IF NOT EXISTS push_notification_logs (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                user_id INT NOT NULL,
+                notification_id INT NULL,
+                type VARCHAR(50) NOT NULL,
+                device_count INT NOT NULL,
+                http_code INT NOT NULL,
+                response TEXT,
+                status ENUM('sent', 'failed', 'partial') DEFAULT 'sent',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_user_id (user_id),
+                INDEX idx_created_at (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        ";
+        $conn->exec($createLogsTable);
+        
+        // Get user's active FCM tokens
+        $stmt = $conn->prepare(
+            "SELECT fcm_token, device_type 
+             FROM user_devices 
+             WHERE user_id = :user_id 
+             AND is_active = 1
+             AND fcm_token IS NOT NULL
+             AND fcm_token != ''"
+        );
+        $stmt->execute([':user_id' => $userId]);
+        $devices = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        
+        if (empty($devices)) {
+            // Log attempt with no devices
+            logPushNotificationAttempt($conn, $userId, $notificationId, $type, 0, 404, 'No active devices');
+            return [
+                'success' => false,
+                'devices' => 0,
+                'error' => 'No active devices with valid tokens found'
+            ];
+        }
+        
+        $tokens = array_column($devices, 'fcm_token');
+        
+        // Get Firebase Server Key from environment or config
+        $fcmServerKey = getFirebaseServerKey();
+        
+        if (empty($fcmServerKey)) {
+            error_log("Firebase Server Key not configured");
+            return [
+                'success' => false,
+                'devices' => count($tokens),
+                'error' => 'Push notification service not configured'
+            ];
+        }
+        
+        // Prepare notification payload
+        $payload = [
+            'registration_ids' => $tokens,
+            'notification' => [
+                'title' => $title,
+                'body' => $message,
+                'sound' => 'default',
+                'badge' => 1,
+                'click_action' => 'FLUTTER_NOTIFICATION_CLICK'
+            ],
+            'data' => [
+                'type' => $type,
+                'notification_id' => $notificationId ?? '',
+                'title' => $title,
+                'message' => $message,
+                'click_action' => 'FLUTTER_NOTIFICATION_CLICK',
+                'timestamp' => date('Y-m-d H:i:s')
+            ],
+            'priority' => 'high',
+            'content_available' => true
+        ];
+        
+        // Merge additional data
+        if (!empty($data)) {
+            $payload['data'] = array_merge($payload['data'], $data);
+        }
+        
+        // Send to FCM
+        $headers = [
+            'Authorization: key=' . $fcmServerKey,
+            'Content-Type: application/json'
+        ];
+        
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, 'https://fcm.googleapis.com/fcm/send');
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        
+        $result = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlError = curl_error($ch);
+        curl_close($ch);
+        
+        $response = json_decode($result, true);
+        
+        // Log push notification attempt
+        logPushNotificationAttempt($conn, $userId, $notificationId, $type, count($tokens), $httpCode, $result);
+        
+        if ($httpCode === 200 && isset($response['success']) && $response['success'] > 0) {
+            // Update notification record with push sent status
+            if ($notificationId) {
+                $updateStmt = $conn->prepare(
+                    "UPDATE notifications 
+                     SET sent_via = CONCAT(IFNULL(sent_via, ''), ',push'),
+                         sent_at = NOW()
+                     WHERE id = :id"
+                );
+                $updateStmt->execute([':id' => $notificationId]);
+            }
+            
+            return [
+                'success' => true,
+                'devices' => count($tokens),
+                'successful' => $response['success'],
+                'failed' => $response['failure'] ?? 0
+            ];
+        } else {
+            return [
+                'success' => false,
+                'devices' => count($tokens),
+                'error' => $response['results'][0]['error'] ?? 'FCM error',
+                'http_code' => $httpCode,
+                'curl_error' => $curlError
+            ];
+        }
+        
+    } catch (Exception $e) {
+        error_log("Push notification error: " . $e->getMessage());
+        return [
+            'success' => false,
+            'devices' => 0,
+            'error' => $e->getMessage()
+        ];
+    }
+}
+
+/*********************************
+ * GET FIREBASE SERVER KEY
+ *********************************/
+function getFirebaseServerKey() {
+    // Try environment variable first
+    $key = getenv('FIREBASE_SERVER_KEY');
+    
+    // Try config file (make sure this file is not in version control)
+    if (empty($key) && file_exists(__DIR__ . '/../config/firebase_config.php')) {
+        $config = include __DIR__ . '/../config/firebase_config.php';
+        $key = $config['server_key'] ?? '';
+    }
+    
+    // For production, you should use environment variable
+    // For development only, you can hardcode (NOT RECOMMENDED for production)
+    // $key = 'YOUR_FIREBASE_SERVER_KEY_HERE';
+    
+    return $key;
+}
+
+/*********************************
+ * LOG PUSH NOTIFICATION ATTEMPT
+ *********************************/
+function logPushNotificationAttempt($conn, $userId, $notificationId, $type, $deviceCount, $httpCode, $response) {
+    try {
+        $stmt = $conn->prepare(
+            "INSERT INTO push_notification_logs 
+                (user_id, notification_id, type, device_count, http_code, response, status)
+             VALUES 
+                (:user_id, :notification_id, :type, :device_count, :http_code, :response, :status)"
+        );
+        
+        $status = ($httpCode === 200) ? 'sent' : 'failed';
+        
+        $stmt->execute([
+            ':user_id' => $userId,
+            ':notification_id' => $notificationId,
+            ':type' => $type,
+            ':device_count' => $deviceCount,
+            ':http_code' => $httpCode,
+            ':response' => is_array($response) ? json_encode($response) : $response,
+            ':status' => $status
+        ]);
+    } catch (Exception $e) {
+        error_log("Failed to log push notification: " . $e->getMessage());
+    }
+}
+
+/*********************************
+ * REGISTER DEVICE TOKEN
+ *********************************/
+function registerDeviceToken($conn, $userId, $input) {
+    $fcmToken = $input['fcm_token'] ?? '';
+    $deviceType = $input['device_type'] ?? (stripos($_SERVER['HTTP_USER_AGENT'], 'Android') !== false ? 'android' : 'ios');
+    $deviceName = $input['device_name'] ?? $_SERVER['HTTP_USER_AGENT'] ?? 'unknown';
+    
+    if (empty($fcmToken)) {
+        ResponseHandler::error('FCM token is required', 400);
+    }
+    
+    // Create user_devices table if not exists
+    $createTable = "
+        CREATE TABLE IF NOT EXISTS user_devices (
+            id INT PRIMARY KEY AUTO_INCREMENT,
+            user_id INT NOT NULL,
+            fcm_token VARCHAR(255) NOT NULL,
+            device_type ENUM('android', 'ios') NOT NULL,
+            device_name VARCHAR(255),
+            is_active TINYINT DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            last_active TIMESTAMP NULL,
+            UNIQUE KEY unique_user_token (user_id, fcm_token),
+            INDEX idx_user_id (user_id),
+            INDEX idx_is_active (is_active)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ";
+    $conn->exec($createTable);
+    
+    // Check if token already exists
+    $checkStmt = $conn->prepare(
+        "SELECT id FROM user_devices 
+         WHERE user_id = :user_id AND fcm_token = :fcm_token"
+    );
+    $checkStmt->execute([
+        ':user_id' => $userId,
+        ':fcm_token' => $fcmToken
+    ]);
+    
+    if ($checkStmt->fetch()) {
+        // Update existing
+        $updateStmt = $conn->prepare(
+            "UPDATE user_devices 
+             SET is_active = 1, 
+                 device_type = :device_type,
+                 device_name = :device_name,
+                 last_active = NOW(),
+                 updated_at = NOW()
+             WHERE user_id = :user_id AND fcm_token = :fcm_token"
+        );
+        $updateStmt->execute([
+            ':user_id' => $userId,
+            ':fcm_token' => $fcmToken,
+            ':device_type' => $deviceType,
+            ':device_name' => $deviceName
+        ]);
+    } else {
+        // Insert new
+        $insertStmt = $conn->prepare(
+            "INSERT INTO user_devices 
+                (user_id, fcm_token, device_type, device_name, is_active, created_at, updated_at, last_active)
+             VALUES 
+                (:user_id, :fcm_token, :device_type, :device_name, 1, NOW(), NOW(), NOW())"
+        );
+        $insertStmt->execute([
+            ':user_id' => $userId,
+            ':fcm_token' => $fcmToken,
+            ':device_type' => $deviceType,
+            ':device_name' => $deviceName
+        ]);
+    }
+    
+    ResponseHandler::success([
+        'message' => 'Device registered successfully',
+        'token' => $fcmToken
+    ]);
+}
+
+/*********************************
+ * UNREGISTER DEVICE TOKEN
+ *********************************/
+function unregisterDeviceToken($conn, $userId, $input) {
+    $fcmToken = $input['fcm_token'] ?? '';
+    
+    if (empty($fcmToken)) {
+        ResponseHandler::error('FCM token is required', 400);
+    }
+    
+    $stmt = $conn->prepare(
+        "UPDATE user_devices 
+         SET is_active = 0, updated_at = NOW()
+         WHERE user_id = :user_id AND fcm_token = :fcm_token"
+    );
+    $stmt->execute([
+        ':user_id' => $userId,
+        ':fcm_token' => $fcmToken
+    ]);
+    
+    ResponseHandler::success([
+        'message' => 'Device unregistered successfully'
+    ]);
 }
 
 /*********************************
