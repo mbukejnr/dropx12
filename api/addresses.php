@@ -32,6 +32,11 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
 /*********************************
+ * GOOGLE MAPS API KEY
+ *********************************/
+define('GOOGLE_MAPS_API_KEY', 'YOUR_GOOGLE_MAPS_API_KEY');
+
+/*********************************
  * GET USER FROM SESSION/AUTH
  *********************************/
 function getUserFromSession() {
@@ -72,12 +77,10 @@ function getUserFromSession() {
  * AUTHENTICATION MIDDLEWARE
  *********************************/
 function authenticateUser() {
-    // Check session authentication first
     if (!empty($_SESSION['user_id'])) {
         return $_SESSION['user_id'];
     }
     
-    // Check for API token/header authentication
     $headers = getallheaders();
     $userId = $headers['X-User-Id'] ?? $headers['x-user-id'] ?? null;
     $sessionToken = $headers['X-Session-Token'] ?? $headers['x-session-token'] ?? null;
@@ -104,7 +107,6 @@ function authenticateUser() {
         }
     }
     
-    // Check for Bearer token
     $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
     if (strpos($authHeader, 'Bearer ') === 0) {
         $token = substr($authHeader, 7);
@@ -135,7 +137,6 @@ try {
     $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
     $path = str_replace('/api/addresses', '', $path);
     
-    // Extract location ID from path if present
     $locationId = null;
     if (preg_match('/\/(\d+)$/', $path, $matches)) {
         $locationId = $matches[1];
@@ -171,6 +172,111 @@ try {
 }
 
 /*********************************
+ * GOOGLE MAPS FUNCTIONS
+ *********************************/
+function reverseGeocode($lat, $lng) {
+    $url = "https://maps.googleapis.com/maps/api/geocode/json?latlng={$lat},{$lng}&key=" . GOOGLE_MAPS_API_KEY . "&location_type=ROOFTOP&result_type=street_address";
+    
+    $response = file_get_contents($url);
+    $data = json_decode($response, true);
+    
+    if ($data['status'] == 'OK') {
+        $result = $data['results'][0];
+        $components = parseAddressComponents($result['address_components']);
+        
+        return [
+            'formatted_address' => $result['formatted_address'],
+            'street_number' => $components['street_number'],
+            'route' => $components['route'],
+            'neighborhood' => $components['neighborhood'],
+            'locality' => $components['locality'],
+            'administrative_area' => $components['administrative_area_level_1'],
+            'country' => $components['country'],
+            'postal_code' => $components['postal_code'],
+            'place_id' => $result['place_id'],
+            'plus_code' => $result['plus_code']['global_code'] ?? null
+        ];
+    }
+    
+    return null;
+}
+
+function geocodeAddress($address) {
+    $url = "https://maps.googleapis.com/maps/api/geocode/json?address=" . urlencode($address) . "&key=" . GOOGLE_MAPS_API_KEY;
+    
+    $response = file_get_contents($url);
+    $data = json_decode($response, true);
+    
+    if ($data['status'] == 'OK') {
+        $result = $data['results'][0];
+        return [
+            'latitude' => $result['geometry']['location']['lat'],
+            'longitude' => $result['geometry']['location']['lng'],
+            'formatted_address' => $result['formatted_address'],
+            'place_id' => $result['place_id']
+        ];
+    }
+    
+    return null;
+}
+
+function getAddressSuggestions($input) {
+    if (strlen($input) < 3) return [];
+    
+    $url = "https://maps.googleapis.com/maps/api/place/autocomplete/json?input=" . urlencode($input) . "&types=address&components=country:mw&key=" . GOOGLE_MAPS_API_KEY;
+    
+    $response = file_get_contents($url);
+    $data = json_decode($response, true);
+    
+    $suggestions = [];
+    if ($data['status'] == 'OK') {
+        foreach ($data['predictions'] as $prediction) {
+            $suggestions[] = [
+                'description' => $prediction['description'],
+                'place_id' => $prediction['place_id'],
+                'main_text' => $prediction['structured_formatting']['main_text'],
+                'secondary_text' => $prediction['structured_formatting']['secondary_text']
+            ];
+        }
+    }
+    
+    return $suggestions;
+}
+
+function parseAddressComponents($components) {
+    $result = [
+        'street_number' => null,
+        'route' => null,
+        'neighborhood' => null,
+        'locality' => null,
+        'administrative_area_level_1' => null,
+        'country' => null,
+        'postal_code' => null
+    ];
+    
+    foreach ($components as $component) {
+        $types = $component['types'];
+        if (in_array('street_number', $types)) {
+            $result['street_number'] = $component['long_name'];
+        } elseif (in_array('route', $types)) {
+            $result['route'] = $component['long_name'];
+        } elseif (in_array('neighborhood', $types)) {
+            $result['neighborhood'] = $component['long_name'];
+        } elseif (in_array('locality', $types)) {
+            $result['locality'] = $component['long_name'];
+        } elseif (in_array('administrative_area_level_1', $types)) {
+            $result['administrative_area_level_1'] = $component['long_name'];
+        } elseif (in_array('country', $types)) {
+            $result['country'] = $component['long_name'];
+        } elseif (in_array('postal_code', $types)) {
+            $result['postal_code'] = $component['long_name'];
+        }
+    }
+    
+    return $result;
+}
+
+/*********************************
  * GET LOCATIONS LIST
  *********************************/
 function getLocationsList() {
@@ -179,13 +285,11 @@ function getLocationsList() {
         ResponseHandler::error('Authentication required', 401);
     }
     
-    // Get user details from auth for pre-filling
     $user = getUserFromSession();
     
     $db = new Database();
     $conn = $db->getConnection();
     
-    // Get query parameters
     $params = $_GET;
     $type = $params['type'] ?? '';
     $isDefault = $params['is_default'] ?? null;
@@ -195,8 +299,12 @@ function getLocationsList() {
     $limit = min(100, max(1, intval($params['limit'] ?? 20)));
     $page = max(1, intval($params['page'] ?? 1));
     $offset = ($page - 1) * $limit;
+    
+    // Get nearby locations if coordinates provided
+    $lat = $params['lat'] ?? null;
+    $lng = $params['lng'] ?? null;
+    $radius = $params['radius'] ?? null;
 
-    // Build WHERE clause
     $whereConditions = ["user_id = :user_id"];
     $queryParams = [':user_id' => $userId];
 
@@ -211,53 +319,47 @@ function getLocationsList() {
     }
 
     if ($search) {
-        $whereConditions[] = "(label LIKE :search OR address_line1 LIKE :search OR street LIKE :search OR area LIKE :search OR sector LIKE :search OR landmark LIKE :search)";
+        $whereConditions[] = "(label LIKE :search OR address_line1 LIKE :search OR street LIKE :search OR area LIKE :search OR sector LIKE :search OR landmark LIKE :search OR formatted_address LIKE :search)";
         $queryParams[':search'] = "%$search%";
     }
 
     $whereClause = "WHERE " . implode(" AND ", $whereConditions);
 
-    // Validate sort options
-    $allowedSortColumns = ['last_used', 'created_at', 'label', 'is_default', 'updated_at'];
+    $allowedSortColumns = ['last_used', 'created_at', 'label', 'is_default', 'updated_at', 'distance'];
     $sortBy = in_array($sortBy, $allowedSortColumns) ? $sortBy : 'last_used';
     $sortOrder = $sortOrder === 'ASC' ? 'ASC' : 'DESC';
 
-    // Get total count for pagination
+    // Calculate distance if coordinates provided
+    $selectFields = "id, user_id, label, full_name, phone, address_line1, address_line2, street, city, neighborhood, area, sector, location_type, landmark, latitude, longitude, is_default, last_used, created_at, updated_at, formatted_address, street_number, route, place_id";
+    
+    if ($lat && $lng && $radius) {
+        $selectFields .= ", (6371 * acos(cos(radians(:lat)) * cos(radians(latitude)) * cos(radians(longitude) - radians(:lng)) + sin(radians(:lat)) * sin(radians(latitude)))) AS distance";
+        $queryParams[':lat'] = $lat;
+        $queryParams[':lng'] = $lng;
+        
+        if ($sortBy == 'distance') {
+            $whereClause .= " HAVING distance <= :radius";
+            $queryParams[':radius'] = $radius;
+        }
+    }
+
     $countSql = "SELECT COUNT(*) as total FROM addresses $whereClause";
     $countStmt = $conn->prepare($countSql);
     $countStmt->execute($queryParams);
     $totalCount = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
-    // Get locations with pagination
-    $sql = "SELECT 
-                id,
-                user_id,
-                label,
-                full_name,
-                phone,
-                address_line1,
-                address_line2,
-                street,
-                city,
-                neighborhood,
-                area,
-                sector,
-                location_type,
-                landmark,
-                latitude,
-                longitude,
-                is_default,
-                last_used,
-                created_at,
-                updated_at
-            FROM addresses
-            $whereClause
-            ORDER BY is_default DESC, $sortBy $sortOrder
-            LIMIT :limit OFFSET :offset";
+    $sql = "SELECT $selectFields FROM addresses $whereClause";
+    
+    if ($sortBy == 'distance' && $lat && $lng) {
+        $sql .= " ORDER BY distance $sortOrder";
+    } else {
+        $sql .= " ORDER BY is_default DESC, $sortBy $sortOrder";
+    }
+    
+    $sql .= " LIMIT :limit OFFSET :offset";
 
     $stmt = $conn->prepare($sql);
     
-    // Bind parameters
     foreach ($queryParams as $key => $value) {
         $stmt->bindValue($key, $value);
     }
@@ -267,7 +369,6 @@ function getLocationsList() {
     $stmt->execute();
     $locations = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Format location data with user details from auth
     $formattedLocations = [];
     $currentLocation = null;
     
@@ -275,13 +376,11 @@ function getLocationsList() {
         $formattedLocation = formatLocationData($loc, $user);
         $formattedLocations[] = $formattedLocation;
         
-        // Identify current location (default or most recent)
         if ($loc['is_default']) {
             $currentLocation = $formattedLocation;
         }
     }
 
-    // If no default found, use most recent
     if (!$currentLocation && !empty($formattedLocations)) {
         usort($formattedLocations, function($a, $b) {
             $timeA = strtotime($a['last_used'] ?? $a['created_at']);
@@ -291,7 +390,6 @@ function getLocationsList() {
         $currentLocation = $formattedLocations[0];
     }
 
-    // Get user's statistics from database
     $statsStmt = $conn->prepare(
         "SELECT 
             COUNT(*) as total_locations,
@@ -305,7 +403,6 @@ function getLocationsList() {
     $statsStmt->execute([':user_id' => $userId]);
     $stats = $statsStmt->fetch(PDO::FETCH_ASSOC);
 
-    // Get streets, areas, sectors etc. from database
     $locationData = getLocationDataFromDB($conn, $userId);
 
     ResponseHandler::success([
@@ -351,26 +448,10 @@ function getLocationDetails($locationId) {
 
     $stmt = $conn->prepare(
         "SELECT 
-            id,
-            user_id,
-            label,
-            full_name,
-            phone,
-            address_line1,
-            address_line2,
-            street,
-            city,
-            neighborhood,
-            area,
-            sector,
-            location_type,
-            landmark,
-            latitude,
-            longitude,
-            is_default,
-            last_used,
-            created_at,
-            updated_at
+            id, user_id, label, full_name, phone, address_line1, address_line2,
+            street, city, neighborhood, area, sector, location_type, landmark,
+            latitude, longitude, is_default, last_used, created_at, updated_at,
+            formatted_address, street_number, route, place_id
         FROM addresses 
         WHERE id = :id AND user_id = :user_id"
     );
@@ -387,16 +468,9 @@ function getLocationDetails($locationId) {
 
     $formattedLocation = formatLocationData($location, $user);
     
-    // Get order history if any
     $orderStmt = $conn->prepare(
-        "SELECT 
-            o.id,
-            o.order_number,
-            o.merchant_id,
-            m.name as merchant_name,
-            o.total_amount,
-            o.status,
-            o.created_at
+        "SELECT o.id, o.order_number, o.merchant_id, m.name as merchant_name,
+                o.total_amount, o.status, o.created_at
         FROM orders o
         LEFT JOIN merchants m ON o.merchant_id = m.id
         WHERE o.user_id = :user_id 
@@ -415,29 +489,21 @@ function getLocationDetails($locationId) {
     
     $formattedLocation['order_history'] = $orders;
 
-    // Get nearby locations
-    $nearbyStmt = $conn->prepare(
-        "SELECT 
-            id,
-            label,
-            street,
-            area,
-            sector,
-            location_type,
-            latitude,
-            longitude,
-            (6371 * acos(cos(radians(:lat)) * cos(radians(latitude)) * cos(radians(longitude) - radians(:lng)) + sin(radians(:lat)) * sin(radians(latitude)))) AS distance
-        FROM addresses 
-        WHERE user_id = :user_id 
-            AND id != :location_id
-            AND latitude IS NOT NULL 
-            AND longitude IS NOT NULL
-        HAVING distance < 5
-        ORDER BY distance ASC
-        LIMIT 3"
-    );
-    
     if ($location['latitude'] && $location['longitude']) {
+        $nearbyStmt = $conn->prepare(
+            "SELECT id, label, street, area, sector, location_type, latitude, longitude,
+                    (6371 * acos(cos(radians(:lat)) * cos(radians(latitude)) * 
+                    cos(radians(longitude) - radians(:lng)) + sin(radians(:lat)) * sin(radians(latitude)))) AS distance
+            FROM addresses 
+            WHERE user_id = :user_id 
+                AND id != :location_id
+                AND latitude IS NOT NULL 
+                AND longitude IS NOT NULL
+            HAVING distance < 5
+            ORDER BY distance ASC
+            LIMIT 3"
+        );
+        
         $nearbyStmt->execute([
             ':user_id' => $userId,
             ':location_id' => $locationId,
@@ -472,7 +538,6 @@ function createLocation() {
         $input = $_POST;
     }
     
-    // Validate required fields
     $required = ['label', 'address_line1', 'city'];
     foreach ($required as $field) {
         if (empty($input[$field])) {
@@ -494,11 +559,39 @@ function createLocation() {
     $longitude = isset($input['longitude']) ? floatval($input['longitude']) : null;
     $isDefault = boolval($input['is_default'] ?? false);
     
-    // Pre-fill from auth
+    // Google Maps data
+    $formattedAddress = $input['formatted_address'] ?? null;
+    $streetNumber = $input['street_number'] ?? null;
+    $route = $input['route'] ?? null;
+    $placeId = $input['place_id'] ?? null;
+    
+    // If coordinates provided but no address, reverse geocode
+    if ($latitude && $longitude && !$formattedAddress) {
+        $geoData = reverseGeocode($latitude, $longitude);
+        if ($geoData) {
+            $formattedAddress = $geoData['formatted_address'];
+            $streetNumber = $geoData['street_number'];
+            $route = $geoData['route'];
+            $neighborhood = $geoData['neighborhood'] ?: $neighborhood;
+            $city = $geoData['locality'] ?: $city;
+            $placeId = $geoData['place_id'];
+        }
+    }
+    
+    // If address provided but no coordinates, geocode
+    if (!$latitude && !$longitude && $formattedAddress) {
+        $geoData = geocodeAddress($formattedAddress);
+        if ($geoData) {
+            $latitude = $geoData['latitude'];
+            $longitude = $geoData['longitude'];
+            $formattedAddress = $geoData['formatted_address'];
+            $placeId = $geoData['place_id'];
+        }
+    }
+    
     $fullName = trim($input['full_name'] ?? $user['full_name'] ?? '');
     $phone = trim($input['phone'] ?? $user['phone'] ?? '');
 
-    // Validate phone
     if (empty($phone)) {
         ResponseHandler::error('Phone number is required for delivery', 400);
     }
@@ -507,7 +600,6 @@ function createLocation() {
         ResponseHandler::error('Invalid phone number format', 400);
     }
 
-    // Validate location type
     $validTypes = ['home', 'work', 'other'];
     if (!in_array($locationType, $validTypes)) {
         ResponseHandler::error("Invalid location type. Must be one of: " . implode(', ', $validTypes), 400);
@@ -519,18 +611,16 @@ function createLocation() {
     $conn->beginTransaction();
 
     try {
-        // Check for duplicate
         $duplicateStmt = $conn->prepare(
             "SELECT id FROM addresses 
              WHERE user_id = :user_id 
-             AND address_line1 = :address_line1 
-             AND street = :street
+             AND (address_line1 = :address_line1 OR place_id = :place_id)
              AND city = :city"
         );
         $duplicateStmt->execute([
             ':user_id' => $userId,
             ':address_line1' => $addressLine1,
-            ':street' => $street,
+            ':place_id' => $placeId,
             ':city' => $city
         ]);
         
@@ -538,26 +628,24 @@ function createLocation() {
             ResponseHandler::error('This address already exists in your saved locations', 409);
         }
 
-        // Handle default
         if ($isDefault) {
             $updateStmt = $conn->prepare(
-                "UPDATE addresses 
-                 SET is_default = 0 
-                 WHERE user_id = :user_id AND is_default = 1"
+                "UPDATE addresses SET is_default = 0 WHERE user_id = :user_id AND is_default = 1"
             );
             $updateStmt->execute([':user_id' => $userId]);
         }
 
-        // Create location
         $stmt = $conn->prepare(
             "INSERT INTO addresses 
                 (user_id, label, full_name, phone, address_line1, address_line2, 
                  street, city, neighborhood, area, sector, location_type, landmark, 
-                 latitude, longitude, is_default, created_at, last_used)
+                 latitude, longitude, is_default, formatted_address, street_number,
+                 route, place_id, created_at, last_used)
              VALUES 
                 (:user_id, :label, :full_name, :phone, :address_line1, :address_line2, 
                  :street, :city, :neighborhood, :area, :sector, :location_type, :landmark, 
-                 :latitude, :longitude, :is_default, NOW(), NOW())"
+                 :latitude, :longitude, :is_default, :formatted_address, :street_number,
+                 :route, :place_id, NOW(), NOW())"
         );
         
         $stmt->execute([
@@ -576,27 +664,24 @@ function createLocation() {
             ':landmark' => $landmark,
             ':latitude' => $latitude,
             ':longitude' => $longitude,
-            ':is_default' => $isDefault ? 1 : 0
+            ':is_default' => $isDefault ? 1 : 0,
+            ':formatted_address' => $formattedAddress,
+            ':street_number' => $streetNumber,
+            ':route' => $route,
+            ':place_id' => $placeId
         ]);
 
         $locationId = $conn->lastInsertId();
 
-        // Auto-set default if none exists
         if (!$isDefault) {
             $checkDefaultStmt = $conn->prepare(
-                "SELECT COUNT(*) as default_count 
-                 FROM addresses 
-                 WHERE user_id = :user_id AND is_default = 1"
+                "SELECT COUNT(*) as default_count FROM addresses WHERE user_id = :user_id AND is_default = 1"
             );
             $checkDefaultStmt->execute([':user_id' => $userId]);
             $defaultCount = $checkDefaultStmt->fetch(PDO::FETCH_ASSOC)['default_count'];
 
             if ($defaultCount == 0) {
-                $setDefaultStmt = $conn->prepare(
-                    "UPDATE addresses 
-                     SET is_default = 1 
-                     WHERE id = :id"
-                );
+                $setDefaultStmt = $conn->prepare("UPDATE addresses SET is_default = 1 WHERE id = :id");
                 $setDefaultStmt->execute([':id' => $locationId]);
                 $isDefault = true;
             }
@@ -604,31 +689,8 @@ function createLocation() {
 
         $conn->commit();
 
-        // Get created location
         $locationStmt = $conn->prepare(
-            "SELECT 
-                id,
-                user_id,
-                label,
-                full_name,
-                phone,
-                address_line1,
-                address_line2,
-                street,
-                city,
-                neighborhood,
-                area,
-                sector,
-                location_type,
-                landmark,
-                latitude,
-                longitude,
-                is_default,
-                last_used,
-                created_at,
-                updated_at
-             FROM addresses 
-             WHERE id = :id"
+            "SELECT * FROM addresses WHERE id = :id"
         );
         $locationStmt->execute([':id' => $locationId]);
         $location = $locationStmt->fetch(PDO::FETCH_ASSOC);
@@ -638,8 +700,7 @@ function createLocation() {
         logUserActivity($conn, $userId, 'location_created', "Created location: $label", [
             'location_id' => $locationId,
             'location_type' => $locationType,
-            'street' => $street,
-            'is_default' => $isDefault
+            'has_coordinates' => !empty($latitude)
         ]);
 
         ResponseHandler::success([
@@ -673,10 +734,8 @@ function updateLocation($locationId) {
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Check if location exists
     $checkStmt = $conn->prepare(
-        "SELECT * FROM addresses 
-         WHERE id = :id AND user_id = :user_id"
+        "SELECT * FROM addresses WHERE id = :id AND user_id = :user_id"
     );
     $checkStmt->execute([
         ':id' => $locationId,
@@ -689,95 +748,33 @@ function updateLocation($locationId) {
         ResponseHandler::error('Location not found', 404);
     }
 
-    // Prepare update data
     $updateFields = [];
     $params = [':id' => $locationId];
 
-    if (isset($input['label'])) {
-        $updateFields[] = "label = :label";
-        $params[':label'] = trim($input['label']);
-    }
-
-    if (isset($input['full_name'])) {
-        $updateFields[] = "full_name = :full_name";
-        $params[':full_name'] = trim($input['full_name']);
-    }
-
-    if (isset($input['phone'])) {
-        $phone = trim($input['phone']);
-        if (!preg_match('/^\+?[0-9\s\-\(\)]{8,20}$/', $phone)) {
-            ResponseHandler::error('Invalid phone number format', 400);
+    $updatableFields = [
+        'label', 'full_name', 'phone', 'address_line1', 'address_line2',
+        'street', 'city', 'neighborhood', 'area', 'sector', 'location_type',
+        'landmark', 'latitude', 'longitude', 'formatted_address', 'street_number',
+        'route', 'place_id'
+    ];
+    
+    foreach ($updatableFields as $field) {
+        if (isset($input[$field])) {
+            if ($field == 'phone' && !preg_match('/^\+?[0-9\s\-\(\)]{8,20}$/', $input[$field])) {
+                ResponseHandler::error('Invalid phone number format', 400);
+            }
+            if (($field == 'latitude' || $field == 'longitude') && !is_numeric($input[$field])) {
+                ResponseHandler::error("Invalid $field value", 400);
+            }
+            if ($field == 'location_type') {
+                $validTypes = ['home', 'work', 'other'];
+                if (!in_array($input[$field], $validTypes)) {
+                    ResponseHandler::error("Invalid location type", 400);
+                }
+            }
+            $updateFields[] = "$field = :$field";
+            $params[":$field"] = trim($input[$field]);
         }
-        $updateFields[] = "phone = :phone";
-        $params[':phone'] = $phone;
-    }
-
-    if (isset($input['address_line1'])) {
-        $updateFields[] = "address_line1 = :address_line1";
-        $params[':address_line1'] = trim($input['address_line1']);
-    }
-
-    if (isset($input['address_line2'])) {
-        $updateFields[] = "address_line2 = :address_line2";
-        $params[':address_line2'] = trim($input['address_line2']);
-    }
-
-    if (isset($input['street'])) {
-        $updateFields[] = "street = :street";
-        $params[':street'] = trim($input['street']);
-    }
-
-    if (isset($input['city'])) {
-        $updateFields[] = "city = :city";
-        $params[':city'] = trim($input['city']);
-    }
-
-    if (isset($input['neighborhood'])) {
-        $updateFields[] = "neighborhood = :neighborhood";
-        $params[':neighborhood'] = trim($input['neighborhood']);
-    }
-
-    if (isset($input['area'])) {
-        $updateFields[] = "area = :area";
-        $params[':area'] = trim($input['area']);
-    }
-
-    if (isset($input['sector'])) {
-        $updateFields[] = "sector = :sector";
-        $params[':sector'] = trim($input['sector']);
-    }
-
-    if (isset($input['location_type'])) {
-        $locationType = trim($input['location_type']);
-        $validTypes = ['home', 'work', 'other'];
-        if (!in_array($locationType, $validTypes)) {
-            ResponseHandler::error("Invalid location type. Must be one of: " . implode(', ', $validTypes), 400);
-        }
-        $updateFields[] = "location_type = :location_type";
-        $params[':location_type'] = $locationType;
-    }
-
-    if (isset($input['landmark'])) {
-        $updateFields[] = "landmark = :landmark";
-        $params[':landmark'] = trim($input['landmark']);
-    }
-
-    if (isset($input['latitude'])) {
-        $latitude = floatval($input['latitude']);
-        if ($latitude < -90 || $latitude > 90) {
-            ResponseHandler::error('Invalid latitude value', 400);
-        }
-        $updateFields[] = "latitude = :latitude";
-        $params[':latitude'] = $latitude;
-    }
-
-    if (isset($input['longitude'])) {
-        $longitude = floatval($input['longitude']);
-        if ($longitude < -180 || $longitude > 180) {
-            ResponseHandler::error('Invalid longitude value', 400);
-        }
-        $updateFields[] = "longitude = :longitude";
-        $params[':longitude'] = $longitude;
     }
 
     if (empty($updateFields)) {
@@ -787,16 +784,12 @@ function updateLocation($locationId) {
     $conn->beginTransaction();
 
     try {
-        // Handle default
         if (isset($input['is_default']) && boolval($input['is_default']) !== boolval($currentLocation['is_default'])) {
             if (boolval($input['is_default'])) {
                 $removeDefaultStmt = $conn->prepare(
-                    "UPDATE addresses 
-                     SET is_default = 0 
-                     WHERE user_id = :user_id AND is_default = 1"
+                    "UPDATE addresses SET is_default = 0 WHERE user_id = :user_id AND is_default = 1"
                 );
                 $removeDefaultStmt->execute([':user_id' => $userId]);
-
                 $updateFields[] = "is_default = 1";
             } else {
                 $updateFields[] = "is_default = 0";
@@ -811,32 +804,7 @@ function updateLocation($locationId) {
 
         $conn->commit();
 
-        // Get updated location
-        $locationStmt = $conn->prepare(
-            "SELECT 
-                id,
-                user_id,
-                label,
-                full_name,
-                phone,
-                address_line1,
-                address_line2,
-                street,
-                city,
-                neighborhood,
-                area,
-                sector,
-                location_type,
-                landmark,
-                latitude,
-                longitude,
-                is_default,
-                last_used,
-                created_at,
-                updated_at
-             FROM addresses 
-             WHERE id = :id"
-        );
+        $locationStmt = $conn->prepare("SELECT * FROM addresses WHERE id = :id");
         $locationStmt->execute([':id' => $locationId]);
         $location = $locationStmt->fetch(PDO::FETCH_ASSOC);
 
@@ -871,10 +839,8 @@ function deleteLocation($locationId) {
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Check if location exists
     $checkStmt = $conn->prepare(
-        "SELECT id, label, is_default FROM addresses 
-         WHERE id = :id AND user_id = :user_id"
+        "SELECT id, label, is_default FROM addresses WHERE id = :id AND user_id = :user_id"
     );
     $checkStmt->execute([
         ':id' => $locationId,
@@ -887,7 +853,6 @@ function deleteLocation($locationId) {
         ResponseHandler::error('Location not found', 404);
     }
 
-    // Check if used in recent orders
     $orderCheckStmt = $conn->prepare(
         "SELECT COUNT(*) as order_count FROM orders 
          WHERE user_id = :user_id 
@@ -907,33 +872,21 @@ function deleteLocation($locationId) {
     $conn->beginTransaction();
 
     try {
-        // Delete the location
-        $deleteStmt = $conn->prepare(
-            "DELETE FROM addresses 
-             WHERE id = :id AND user_id = :user_id"
-        );
+        $deleteStmt = $conn->prepare("DELETE FROM addresses WHERE id = :id AND user_id = :user_id");
         $deleteStmt->execute([
             ':id' => $locationId,
             ':user_id' => $userId
         ]);
 
-        // If deleting default, set new default
         if ($location['is_default']) {
             $newDefaultStmt = $conn->prepare(
-                "SELECT id FROM addresses 
-                 WHERE user_id = :user_id 
-                 ORDER BY last_used DESC, created_at DESC 
-                 LIMIT 1"
+                "SELECT id FROM addresses WHERE user_id = :user_id ORDER BY last_used DESC, created_at DESC LIMIT 1"
             );
             $newDefaultStmt->execute([':user_id' => $userId]);
             $newDefault = $newDefaultStmt->fetch(PDO::FETCH_ASSOC);
 
             if ($newDefault) {
-                $setDefaultStmt = $conn->prepare(
-                    "UPDATE addresses 
-                     SET is_default = 1 
-                     WHERE id = :id"
-                );
+                $setDefaultStmt = $conn->prepare("UPDATE addresses SET is_default = 1 WHERE id = :id");
                 $setDefaultStmt->execute([':id' => $newDefault['id']]);
             }
         }
@@ -980,6 +933,15 @@ function handlePostRequest() {
         case 'get_areas_sectors':
             getLocationData();
             break;
+        case 'reverse_geocode':
+            handleReverseGeocode($input);
+            break;
+        case 'geocode_address':
+            handleGeocodeAddress($input);
+            break;
+        case 'address_suggestions':
+            handleAddressSuggestions($input);
+            break;
         default:
             ResponseHandler::error('Invalid action', 400);
     }
@@ -1014,6 +976,64 @@ function handlePatchRequest($locationId = null) {
 }
 
 /*********************************
+ * GOOGLE MAPS HANDLERS
+ *********************************/
+function handleReverseGeocode($input) {
+    $userId = authenticateUser();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required', 401);
+    }
+    
+    $lat = $input['latitude'] ?? null;
+    $lng = $input['longitude'] ?? null;
+    
+    if (!$lat || !$lng) {
+        ResponseHandler::error('Latitude and longitude required', 400);
+    }
+    
+    $result = reverseGeocode($lat, $lng);
+    
+    if ($result) {
+        ResponseHandler::success($result);
+    } else {
+        ResponseHandler::error('Could not find address for these coordinates', 404);
+    }
+}
+
+function handleGeocodeAddress($input) {
+    $userId = authenticateUser();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required', 401);
+    }
+    
+    $address = $input['address'] ?? '';
+    
+    if (empty($address)) {
+        ResponseHandler::error('Address required', 400);
+    }
+    
+    $result = geocodeAddress($address);
+    
+    if ($result) {
+        ResponseHandler::success($result);
+    } else {
+        ResponseHandler::error('Could not find location for this address', 404);
+    }
+}
+
+function handleAddressSuggestions($input) {
+    $userId = authenticateUser();
+    if (!$userId) {
+        ResponseHandler::error('Authentication required', 401);
+    }
+    
+    $input = $input['input'] ?? '';
+    
+    $suggestions = getAddressSuggestions($input);
+    ResponseHandler::success($suggestions);
+}
+
+/*********************************
  * SET DEFAULT LOCATION
  *********************************/
 function setDefaultLocation($locationId) {
@@ -1025,10 +1045,8 @@ function setDefaultLocation($locationId) {
     $db = new Database();
     $conn = $db->getConnection();
 
-    // Check if location exists
     $checkStmt = $conn->prepare(
-        "SELECT id, label FROM addresses 
-         WHERE id = :id AND user_id = :user_id"
+        "SELECT id, label FROM addresses WHERE id = :id AND user_id = :user_id"
     );
     $checkStmt->execute([
         ':id' => $locationId,
@@ -1044,52 +1062,19 @@ function setDefaultLocation($locationId) {
     $conn->beginTransaction();
 
     try {
-        // Remove default from all
         $removeDefaultStmt = $conn->prepare(
-            "UPDATE addresses 
-             SET is_default = 0 
-             WHERE user_id = :user_id AND is_default = 1"
+            "UPDATE addresses SET is_default = 0 WHERE user_id = :user_id AND is_default = 1"
         );
         $removeDefaultStmt->execute([':user_id' => $userId]);
 
-        // Set new default
         $setDefaultStmt = $conn->prepare(
-            "UPDATE addresses 
-             SET is_default = 1, 
-                 last_used = NOW(),
-                 updated_at = NOW()
-             WHERE id = :id"
+            "UPDATE addresses SET is_default = 1, last_used = NOW(), updated_at = NOW() WHERE id = :id"
         );
         $setDefaultStmt->execute([':id' => $locationId]);
 
         $conn->commit();
 
-        // Get updated location
-        $locationStmt = $conn->prepare(
-            "SELECT 
-                id,
-                user_id,
-                label,
-                full_name,
-                phone,
-                address_line1,
-                address_line2,
-                street,
-                city,
-                neighborhood,
-                area,
-                sector,
-                location_type,
-                landmark,
-                latitude,
-                longitude,
-                is_default,
-                last_used,
-                created_at,
-                updated_at
-             FROM addresses 
-             WHERE id = :id"
-        );
+        $locationStmt = $conn->prepare("SELECT * FROM addresses WHERE id = :id");
         $locationStmt->execute([':id' => $locationId]);
         $location = $locationStmt->fetch(PDO::FETCH_ASSOC);
 
@@ -1120,8 +1105,7 @@ function updateLastUsed($locationId) {
     $conn = $db->getConnection();
 
     $checkStmt = $conn->prepare(
-        "SELECT id FROM addresses 
-         WHERE id = :id AND user_id = :user_id"
+        "SELECT id FROM addresses WHERE id = :id AND user_id = :user_id"
     );
     $checkStmt->execute([
         ':id' => $locationId,
@@ -1134,10 +1118,7 @@ function updateLastUsed($locationId) {
 
     try {
         $stmt = $conn->prepare(
-            "UPDATE addresses 
-             SET last_used = NOW(),
-                 updated_at = NOW()
-             WHERE id = :id"
+            "UPDATE addresses SET last_used = NOW(), updated_at = NOW() WHERE id = :id"
         );
         $stmt->execute([':id' => $locationId]);
 
@@ -1180,7 +1161,7 @@ function searchLocations($input) {
     $params = [':user_id' => $userId];
     
     if ($query) {
-        $whereConditions[] = "(label LIKE :query OR address_line1 LIKE :query OR street LIKE :query OR landmark LIKE :query)";
+        $whereConditions[] = "(label LIKE :query OR address_line1 LIKE :query OR street LIKE :query OR landmark LIKE :query OR formatted_address LIKE :query)";
         $params[':query'] = "%$query%";
     }
     
@@ -1206,41 +1187,13 @@ function searchLocations($input) {
     
     $whereClause = "WHERE " . implode(" AND ", $whereConditions);
     
-    $sql = "SELECT 
-                id,
-                label,
-                full_name,
-                phone,
-                address_line1,
-                address_line2,
-                street,
-                city,
-                area,
-                sector,
-                landmark,
-                location_type,
-                is_default,
-                last_used
-            FROM addresses
-            $whereClause
-            ORDER BY 
-                CASE 
-                    WHEN label LIKE :query_exact THEN 1
-                    WHEN street LIKE :query_exact THEN 2
-                    WHEN address_line1 LIKE :query_exact THEN 3
-                    WHEN area LIKE :query_exact THEN 4
-                    ELSE 5
-                END,
-                is_default DESC,
-                last_used DESC
-            LIMIT :limit";
+    $sql = "SELECT id, label, full_name, phone, address_line1, address_line2, street, city, area, sector, landmark, location_type, is_default, last_used, formatted_address, latitude, longitude FROM addresses $whereClause ORDER BY is_default DESC, last_used DESC LIMIT :limit";
     
     $stmt = $conn->prepare($sql);
     
     foreach ($params as $key => $value) {
         $stmt->bindValue($key, $value);
     }
-    $stmt->bindValue(':query_exact', "$query%");
     $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
     
     $stmt->execute();
@@ -1301,7 +1254,7 @@ function validateAddress($input) {
 }
 
 /*********************************
- * GET LOCATION DATA (STREETS, AREAS, SECTORS)
+ * GET LOCATION DATA
  *********************************/
 function getLocationData() {
     $userId = authenticateUser();
@@ -1317,14 +1270,8 @@ function getLocationData() {
     ResponseHandler::success($locationData);
 }
 
-/*********************************
- * GET LOCATION DATA FROM DATABASE
- *********************************/
 function getLocationDataFromDB($conn, $userId = null) {
-    // Get unique streets
-    $streetsQuery = "SELECT DISTINCT street 
-                     FROM addresses 
-                     WHERE street IS NOT NULL AND street != ''";
+    $streetsQuery = "SELECT DISTINCT street FROM addresses WHERE street IS NOT NULL AND street != ''";
     $params = [];
     
     if ($userId) {
@@ -1337,63 +1284,34 @@ function getLocationDataFromDB($conn, $userId = null) {
     $streetsStmt->execute($params);
     $streets = $streetsStmt->fetchAll(PDO::FETCH_COLUMN);
     
-    // Get unique areas
-    $areasQuery = "SELECT DISTINCT area 
-                   FROM addresses 
-                   WHERE area IS NOT NULL AND area != ''";
-    
-    if ($userId) {
-        $areasQuery .= " AND user_id = :user_id";
-    }
-    
+    $areasQuery = "SELECT DISTINCT area FROM addresses WHERE area IS NOT NULL AND area != ''";
+    if ($userId) $areasQuery .= " AND user_id = :user_id";
     $areasQuery .= " ORDER BY area";
     $areasStmt = $conn->prepare($areasQuery);
     $areasStmt->execute($params);
     $areas = $areasStmt->fetchAll(PDO::FETCH_COLUMN);
     
-    // Get unique sectors
-    $sectorsQuery = "SELECT DISTINCT sector 
-                     FROM addresses 
-                     WHERE sector IS NOT NULL AND sector != ''";
-    
-    if ($userId) {
-        $sectorsQuery .= " AND user_id = :user_id";
-    }
-    
+    $sectorsQuery = "SELECT DISTINCT sector FROM addresses WHERE sector IS NOT NULL AND sector != ''";
+    if ($userId) $sectorsQuery .= " AND user_id = :user_id";
     $sectorsQuery .= " ORDER BY sector";
     $sectorsStmt = $conn->prepare($sectorsQuery);
     $sectorsStmt->execute($params);
     $sectors = $sectorsStmt->fetchAll(PDO::FETCH_COLUMN);
     
-    // Get unique cities
-    $citiesQuery = "SELECT DISTINCT city 
-                    FROM addresses 
-                    WHERE city IS NOT NULL AND city != ''";
-    
-    if ($userId) {
-        $citiesQuery .= " AND user_id = :user_id";
-    }
-    
+    $citiesQuery = "SELECT DISTINCT city FROM addresses WHERE city IS NOT NULL AND city != ''";
+    if ($userId) $citiesQuery .= " AND user_id = :user_id";
     $citiesQuery .= " ORDER BY city";
     $citiesStmt = $conn->prepare($citiesQuery);
     $citiesStmt->execute($params);
     $cities = $citiesStmt->fetchAll(PDO::FETCH_COLUMN);
     
-    // Get unique neighborhoods
-    $neighborhoodsQuery = "SELECT DISTINCT neighborhood 
-                           FROM addresses 
-                           WHERE neighborhood IS NOT NULL AND neighborhood != ''";
-    
-    if ($userId) {
-        $neighborhoodsQuery .= " AND user_id = :user_id";
-    }
-    
+    $neighborhoodsQuery = "SELECT DISTINCT neighborhood FROM addresses WHERE neighborhood IS NOT NULL AND neighborhood != ''";
+    if ($userId) $neighborhoodsQuery .= " AND user_id = :user_id";
     $neighborhoodsQuery .= " ORDER BY neighborhood";
     $neighborhoodsStmt = $conn->prepare($neighborhoodsQuery);
     $neighborhoodsStmt->execute($params);
     $neighborhoods = $neighborhoodsStmt->fetchAll(PDO::FETCH_COLUMN);
     
-    // If no data found for user, get global data
     if (empty($streets) && $userId) {
         return getLocationDataFromDB($conn, null);
     }
@@ -1411,11 +1329,9 @@ function getLocationDataFromDB($conn, $userId = null) {
  * FORMAT LOCATION DATA
  *********************************/
 function formatLocationData($loc, $user = null) {
-    if (empty($loc)) {
-        return null;
-    }
+    if (empty($loc)) return null;
     
-    $displayAddress = generateDisplayAddress($loc);
+    $displayAddress = $loc['formatted_address'] ?? generateDisplayAddress($loc);
     $shortAddress = generateShortAddress($loc);
     
     $typeInfo = getLocationTypeInfo($loc['location_type'] ?? 'other');
@@ -1448,105 +1364,53 @@ function formatLocationData($loc, $user = null) {
         'short_address' => $shortAddress,
         'type_icon' => $typeInfo['icon'],
         'type_color' => $typeInfo['color'],
+        'formatted_address' => $loc['formatted_address'] ?? null,
+        'street_number' => $loc['street_number'] ?? null,
+        'route' => $loc['route'] ?? null,
+        'place_id' => $loc['place_id'] ?? null,
         'contact_source' => empty($loc['full_name']) && empty($loc['phone']) ? 'auth' : 'location_specific'
     ];
 }
 
-/*********************************
- * GENERATE DISPLAY ADDRESS
- *********************************/
 function generateDisplayAddress($loc) {
     $parts = [];
-    
-    if (!empty($loc['street'])) {
-        $parts[] = $loc['street'];
-    }
-    
-    if (!empty($loc['address_line1'])) {
-        $parts[] = $loc['address_line1'];
-    }
-    
-    if (!empty($loc['address_line2'])) {
-        $parts[] = $loc['address_line2'];
-    }
-    
-    if (!empty($loc['landmark'])) {
-        $parts[] = 'Near ' . $loc['landmark'];
-    }
-    
+    if (!empty($loc['street'])) $parts[] = $loc['street'];
+    if (!empty($loc['address_line1'])) $parts[] = $loc['address_line1'];
+    if (!empty($loc['address_line2'])) $parts[] = $loc['address_line2'];
+    if (!empty($loc['landmark'])) $parts[] = 'Near ' . $loc['landmark'];
     if (!empty($loc['sector']) && !empty($loc['area'])) {
         $parts[] = $loc['sector'] . ', ' . $loc['area'];
     } elseif (!empty($loc['area'])) {
         $parts[] = $loc['area'];
     }
-    
-    if (!empty($loc['city'])) {
-        $parts[] = $loc['city'];
-    }
-    
+    if (!empty($loc['city'])) $parts[] = $loc['city'];
     return implode(', ', array_filter($parts));
 }
 
-/*********************************
- * GENERATE SHORT ADDRESS
- *********************************/
 function generateShortAddress($loc) {
     $parts = [];
-    
-    if (!empty($loc['street'])) {
-        $parts[] = $loc['street'];
-    }
-    
-    if (!empty($loc['landmark'])) {
-        $parts[] = 'Near ' . $loc['landmark'];
-    }
-    
-    if (!empty($loc['area'])) {
-        $parts[] = $loc['area'];
-    }
-    
-    if (!empty($loc['sector'])) {
-        $parts[] = $loc['sector'];
-    }
-    
+    if (!empty($loc['street'])) $parts[] = $loc['street'];
+    if (!empty($loc['landmark'])) $parts[] = 'Near ' . $loc['landmark'];
+    if (!empty($loc['area'])) $parts[] = $loc['area'];
+    if (!empty($loc['sector'])) $parts[] = $loc['sector'];
     return implode(', ', $parts);
 }
 
-/*********************************
- * GET LOCATION TYPE INFO
- *********************************/
 function getLocationTypeInfo($type) {
     $types = [
-        'home' => [
-            'icon' => 'home',
-            'color' => '#2196F3'
-        ],
-        'work' => [
-            'icon' => 'work',
-            'color' => '#4CAF50'
-        ],
-        'other' => [
-            'icon' => 'location_on',
-            'color' => '#FF9800'
-        ]
+        'home' => ['icon' => 'home', 'color' => '#2196F3'],
+        'work' => ['icon' => 'work', 'color' => '#4CAF50'],
+        'other' => ['icon' => 'location_on', 'color' => '#FF9800']
     ];
-
     return $types[$type] ?? $types['other'];
 }
 
-/*********************************
- * LOG USER ACTIVITY
- *********************************/
 function logUserActivity($conn, $userId, $activityType, $description, $metadata = null) {
     try {
         $stmt = $conn->prepare(
-            "INSERT INTO user_activities 
-                (user_id, activity_type, description, ip_address, user_agent, metadata, created_at)
-             VALUES 
-                (:user_id, :activity_type, :description, :ip_address, :user_agent, :metadata, NOW())"
+            "INSERT INTO user_activities (user_id, activity_type, description, ip_address, user_agent, metadata, created_at)
+             VALUES (:user_id, :activity_type, :description, :ip_address, :user_agent, :metadata, NOW())"
         );
-        
-        $metaJson = $metadata ? json_encode($metadata) : null;
         
         $stmt->execute([
             ':user_id' => $userId,
@@ -1554,7 +1418,7 @@ function logUserActivity($conn, $userId, $activityType, $description, $metadata 
             ':description' => $description,
             ':ip_address' => $_SERVER['REMOTE_ADDR'] ?? 'unknown',
             ':user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? 'unknown',
-            ':metadata' => $metaJson
+            ':metadata' => $metadata ? json_encode($metadata) : null
         ]);
     } catch (Exception $e) {
         error_log('Failed to log user activity: ' . $e->getMessage());
