@@ -185,17 +185,15 @@ function getNotificationsList($conn, $userId) {
     $unreadStmt->execute([':user_id' => $userId]);
     $unreadCount = $unreadStmt->fetch(PDO::FETCH_ASSOC)['unread_count'];
 
+    // Return data directly - ResponseHandler will wrap it properly
     ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'notifications' => $formattedNotifications,
-            'unread_count' => intval($unreadCount),
-            'pagination' => [
-                'current_page' => $page,
-                'per_page' => $limit,
-                'total_items' => intval($totalCount),
-                'total_pages' => ceil($totalCount / $limit)
-            ]
+        'notifications' => $formattedNotifications,
+        'unread_count' => intval($unreadCount),
+        'pagination' => [
+            'current_page' => $page,
+            'per_page' => $limit,
+            'total_items' => intval($totalCount),
+            'total_pages' => ceil($totalCount / $limit)
         ]
     ]);
 }
@@ -238,10 +236,7 @@ function getNotificationDetail($conn, $userId, $notificationId) {
     }
 
     ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'notification' => formatNotificationData($notification)
-        ]
+        'notification' => formatNotificationData($notification)
     ]);
 }
 
@@ -266,19 +261,16 @@ function getNotificationStatistics($conn, $userId) {
     $stats = $stmt->fetch(PDO::FETCH_ASSOC);
     
     ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'statistics' => [
-                'total' => intval($stats['total'] ?? 0),
-                'unread' => intval($stats['unread'] ?? 0),
-                'by_type' => [
-                    'order' => intval($stats['order_notifications'] ?? 0),
-                    'promotion' => intval($stats['promotion_notifications'] ?? 0),
-                    'delivery' => intval($stats['delivery_notifications'] ?? 0),
-                    'system' => intval($stats['system_notifications'] ?? 0),
-                    'payment' => intval($stats['payment_notifications'] ?? 0),
-                    'update' => intval($stats['update_notifications'] ?? 0)
-                ]
+        'statistics' => [
+            'total' => intval($stats['total'] ?? 0),
+            'unread' => intval($stats['unread'] ?? 0),
+            'by_type' => [
+                'order' => intval($stats['order_notifications'] ?? 0),
+                'promotion' => intval($stats['promotion_notifications'] ?? 0),
+                'delivery' => intval($stats['delivery_notifications'] ?? 0),
+                'system' => intval($stats['system_notifications'] ?? 0),
+                'payment' => intval($stats['payment_notifications'] ?? 0),
+                'update' => intval($stats['update_notifications'] ?? 0)
             ]
         ]
     ]);
@@ -319,10 +311,7 @@ function getNotificationPreferences($conn, $userId) {
     }
     
     ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'preferences' => $preferences
-        ]
+        'preferences' => $preferences
     ]);
 }
 
@@ -345,7 +334,7 @@ function handlePostRequest($conn, $userId, $input) {
         case 'update_preferences':
             updateNotificationPreferences($conn, $userId, $input);
             break;
-        case 'trigger_event': // ADDED: Support for trigger_event
+        case 'trigger_event':
             handleTriggerEvent($conn, $userId, $input);
             break;
         default:
@@ -396,7 +385,6 @@ function markAsRead($conn, $userId, $notificationId) {
     }
 
     ResponseHandler::success([
-        'success' => true,
         'message' => 'Notification marked as read'
     ]);
 }
@@ -424,10 +412,7 @@ function markAllAsRead($conn, $userId, $data) {
     $affectedRows = $stmt->rowCount();
     
     ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'marked_count' => $affectedRows
-        ],
+        'marked_count' => $affectedRows,
         'message' => "Marked $affectedRows notifications as read"
     ]);
 }
@@ -458,10 +443,7 @@ function clearAllNotifications($conn, $userId, $data) {
     $deletedCount = $stmt->rowCount();
     
     ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'deleted_count' => $deletedCount
-        ],
+        'deleted_count' => $deletedCount,
         'message' => "Cleared $deletedCount notifications"
     ]);
 }
@@ -482,7 +464,6 @@ function deleteNotification($conn, $userId, $notificationId) {
     }
 
     ResponseHandler::success([
-        'success' => true,
         'message' => 'Notification deleted successfully'
     ]);
 }
@@ -521,10 +502,7 @@ function batchUpdateNotifications($conn, $userId, $data) {
     $affectedRows = $stmt->rowCount();
     
     ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'affected_count' => $affectedRows
-        ],
+        'affected_count' => $affectedRows,
         'message' => "Successfully processed $affectedRows notifications"
     ]);
 }
@@ -627,10 +605,7 @@ function updateNotificationPreferences($conn, $userId, $data) {
     $preferences = $stmt->fetch(PDO::FETCH_ASSOC);
     
     ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'preferences' => $preferences
-        ],
+        'preferences' => $preferences,
         'message' => 'Notification preferences updated successfully'
     ]);
 }
@@ -671,12 +646,9 @@ function handleTriggerEvent($conn, $userId, $input) {
     $notificationCreated = createNotificationForEvent($conn, $userId, $eventName, $eventData);
     
     ResponseHandler::success([
-        'success' => true,
-        'data' => [
-            'event_logged' => true,
-            'notification_created' => $notificationCreated,
-            'event_name' => $eventName
-        ],
+        'event_logged' => true,
+        'notification_created' => $notificationCreated,
+        'event_name' => $eventName,
         'message' => 'Event logged successfully'
     ]);
 }
