@@ -59,7 +59,8 @@ function handleGetRequest() {
         $stmt = $conn->prepare(
             "SELECT id, full_name, email, phone, gender, avatar,
                     member_level, member_points, total_orders, login_method,
-                    rating, verified, member_since, created_at, updated_at
+                    rating, verified, member_since, created_at, updated_at,
+                    email_verified, phone_verified
              FROM users WHERE id = :id"
         );
         $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -70,6 +71,7 @@ function handleGetRequest() {
                 'authenticated' => true,
                 'user' => formatUserData($conn, $user)
             ]);
+            return;
         }
     }
 
@@ -77,7 +79,7 @@ function handleGetRequest() {
 }
 
 /*********************************
- * POST ROUTER
+ * POST ROUTER - Includes all verification actions
  *********************************/
 function handlePostRequest() {
     $db = new Database();
@@ -91,6 +93,7 @@ function handlePostRequest() {
     $action = $input['action'] ?? '';
 
     switch ($action) {
+        // Authentication
         case 'login':
             loginUser($conn, $input);
             break;
@@ -100,6 +103,8 @@ function handlePostRequest() {
         case 'logout':
             logoutUser();
             break;
+        
+        // Profile Management
         case 'update_profile':
             updateProfile($conn, $input);
             break;
@@ -112,8 +117,43 @@ function handlePostRequest() {
         case 'forgot_password':
             forgotPassword($conn, $input);
             break;
+        
+        // ========== EMAIL VERIFICATION ACTIONS ==========
+        case 'check_email_verification_status':
+            checkEmailVerificationStatus($conn, $input);
+            break;
+        case 'send_email_verification':
+        case 'resend_email_verification':
+            sendEmailVerification($conn, $input);
+            break;
+        case 'verify_email':
+            verifyEmail($conn, $input);
+            break;
+        
+        // ========== PHONE VERIFICATION ACTIONS ==========
+        case 'check_phone_verification_status':
+            checkPhoneVerificationStatus($conn, $input);
+            break;
+        case 'send_phone_verification':
+            sendPhoneVerification($conn, $input);
+            break;
+        case 'resend_phone_verification':
+            resendPhoneVerification($conn, $input);
+            break;
+        case 'verify_phone':
+            verifyPhone($conn, $input);
+            break;
+        
+        // Address Management
+        case 'get_addresses':
+            getAddresses($conn, $input);
+            break;
+        case 'delete_address':
+            deleteAddress($conn, $input);
+            break;
+        
         default:
-            ResponseHandler::error('Invalid action', 400);
+            ResponseHandler::error('Invalid action: ' . $action, 400);
     }
 }
 
@@ -182,16 +222,14 @@ function loginUser($conn, $data) {
 
 /*********************************
  * REGISTER - User chooses login method (email or phone)
- * Address fields removed - can be added later via update_address
  *********************************/
 function registerUser($conn, $data) {
-    // Registration fields - no address fields
     $fullName = trim($data['full_name'] ?? '');
     $email = trim($data['email'] ?? '');
     $phone = !empty($data['phone']) ? cleanPhoneNumber($data['phone']) : null;
     $password = $data['password'] ?? '';
     $gender = $data['gender'] ?? null;
-    $loginMethod = $data['login_method'] ?? 'email'; // 'email' or 'phone' - what user chose
+    $loginMethod = $data['login_method'] ?? 'email';
 
     // Validation
     if (!$fullName) {
@@ -214,7 +252,6 @@ function registerUser($conn, $data) {
         if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
             ResponseHandler::error('Enter a valid email address', 400);
         }
-        // Phone is optional
         if ($phone && strlen($phone) < 10) {
             ResponseHandler::error('Enter a valid phone number', 400);
         }
@@ -225,13 +262,12 @@ function registerUser($conn, $data) {
         if (strlen($phone) < 10) {
             ResponseHandler::error('Enter a valid phone number', 400);
         }
-        // Email is optional
         if ($email && !filter_var($email, FILTER_VALIDATE_EMAIL)) {
             ResponseHandler::error('Enter a valid email address', 400);
         }
     }
 
-    // Check if user already exists (email or phone)
+    // Check if user already exists
     $checkSql = "SELECT id FROM users WHERE ";
     $params = [];
     
@@ -254,13 +290,15 @@ function registerUser($conn, $data) {
         ResponseHandler::error('User already exists with this email or phone', 409);
     }
 
-    // Create user - no address fields
+    // Create user
     $stmt = $conn->prepare(
         "INSERT INTO users (full_name, email, phone, password, gender, 
                             member_level, member_points, total_orders, login_method,
-                            rating, verified, member_since, created_at, updated_at)
+                            rating, verified, member_since, created_at, updated_at,
+                            email_verified, phone_verified)
          VALUES (:full_name, :email, :phone, :password, :gender,
-                  'basic', 0, 0, :login_method, 0.00, 0, :member_since, NOW(), NOW())"
+                  'basic', 0, 0, :login_method, 0.00, 0, :member_since, NOW(), NOW(),
+                  0, 0)"
     );
     
     $stmt->execute([
@@ -270,7 +308,7 @@ function registerUser($conn, $data) {
         ':password' => password_hash($password, PASSWORD_DEFAULT),
         ':gender' => $gender,
         ':login_method' => $loginMethod,
-        ':member_since' => date('M d, Y') // Format: Jan 15, 2023
+        ':member_since' => date('M d, Y')
     ]);
 
     // Get the new user
@@ -278,7 +316,8 @@ function registerUser($conn, $data) {
     $stmt = $conn->prepare(
         "SELECT id, full_name, email, phone, gender, avatar,
                  member_level, member_points, total_orders, login_method,
-                 rating, verified, member_since, created_at, updated_at
+                 rating, verified, member_since, created_at, updated_at,
+                 email_verified, phone_verified
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $userId]);
@@ -294,21 +333,19 @@ function registerUser($conn, $data) {
 }
 
 /*********************************
- * UPDATE PROFILE - Update basic user info (no address)
+ * UPDATE PROFILE
  *********************************/
 function updateProfile($conn, $data) {
     if (empty($_SESSION['user_id'])) {
         ResponseHandler::error('Unauthorized', 401);
     }
 
-    // Fields from Flutter EditProfileScreen
     $fullName = trim($data['full_name'] ?? '');
     $email = trim($data['email'] ?? '');
     $phone = !empty($data['phone']) ? cleanPhoneNumber($data['phone']) : null;
     $gender = $data['gender'] ?? null;
     $avatar = $data['avatar'] ?? null;
 
-    // Validation
     if (!$fullName) {
         ResponseHandler::error('Full name is required', 400);
     }
@@ -325,7 +362,7 @@ function updateProfile($conn, $data) {
         ResponseHandler::error('Enter a valid phone number', 400);
     }
 
-    // Check if email or phone already exists (excluding current user)
+    // Check if email or phone already exists
     $checkSql = "SELECT id FROM users WHERE (email = :email OR phone = :phone) AND id != :id";
     $check = $conn->prepare($checkSql);
     $check->execute([
@@ -338,7 +375,6 @@ function updateProfile($conn, $data) {
         ResponseHandler::error('Email or phone already in use', 409);
     }
 
-    // Update user (no address fields)
     $stmt = $conn->prepare(
         "UPDATE users SET 
             full_name = :full_name,
@@ -359,11 +395,11 @@ function updateProfile($conn, $data) {
         ':id' => $_SESSION['user_id']
     ]);
 
-    // Get updated user
     $stmt = $conn->prepare(
         "SELECT id, full_name, email, phone, gender, avatar,
                  member_level, member_points, total_orders, login_method,
-                 rating, verified, member_since, created_at, updated_at
+                 rating, verified, member_since, created_at, updated_at,
+                 email_verified, phone_verified
          FROM users WHERE id = :id"
     );
     $stmt->execute([':id' => $_SESSION['user_id']]);
@@ -375,7 +411,7 @@ function updateProfile($conn, $data) {
 }
 
 /*********************************
- * UPDATE ADDRESS - Add or update user address
+ * UPDATE ADDRESS
  *********************************/
 function updateAddress($conn, $data) {
     if (empty($_SESSION['user_id'])) {
@@ -391,7 +427,6 @@ function updateAddress($conn, $data) {
     $addressType = $data['address_type'] ?? 'home';
     $isDefault = $data['is_default'] ?? true;
 
-    // Validation
     if (!$addressLine1) {
         ResponseHandler::error('Address line 1 is required', 400);
     }
@@ -402,14 +437,11 @@ function updateAddress($conn, $data) {
 
     $userId = $_SESSION['user_id'];
 
-    // Check if user already has a default address
     if ($isDefault) {
-        // Remove default flag from all existing addresses
-        $stmt = $conn->prepare("UPDATE user_addresses SET is_default = 0 WHERE user_id = :user_id");
-        $stmt->execute([':user_id' => $userId]);
+        $conn->prepare("UPDATE user_addresses SET is_default = 0 WHERE user_id = :user_id")
+             ->execute([':user_id' => $userId]);
     }
 
-    // Check if address already exists for this user
     $checkStmt = $conn->prepare(
         "SELECT id FROM user_addresses 
          WHERE user_id = :user_id AND address_line1 = :address_line1 AND city = :city"
@@ -423,7 +455,6 @@ function updateAddress($conn, $data) {
     $existingAddress = $checkStmt->fetch(PDO::FETCH_ASSOC);
     
     if ($existingAddress) {
-        // Update existing address
         $stmt = $conn->prepare(
             "UPDATE user_addresses SET 
                 address_line2 = :address_line2,
@@ -449,7 +480,6 @@ function updateAddress($conn, $data) {
         
         $addressId = $existingAddress['id'];
     } else {
-        // Insert new address
         $stmt = $conn->prepare(
             "INSERT INTO user_addresses 
                 (user_id, address_line1, address_line2, city, state, postal_code, 
@@ -474,7 +504,6 @@ function updateAddress($conn, $data) {
         $addressId = $conn->lastInsertId();
     }
 
-    // Get the updated address
     $stmt = $conn->prepare(
         "SELECT * FROM user_addresses WHERE id = :id AND user_id = :user_id"
     );
@@ -487,9 +516,9 @@ function updateAddress($conn, $data) {
 }
 
 /*********************************
- * GET ADDRESSES - Get all addresses for current user
+ * GET ADDRESSES
  *********************************/
-function getAddresses($conn) {
+function getAddresses($conn, $data) {
     if (empty($_SESSION['user_id'])) {
         ResponseHandler::error('Unauthorized', 401);
     }
@@ -504,11 +533,11 @@ function getAddresses($conn) {
     
     ResponseHandler::success([
         'addresses' => $addresses
-    ], 'Addresses retrieved successfully');
+    ]);
 }
 
 /*********************************
- * DELETE ADDRESS - Delete an address
+ * DELETE ADDRESS
  *********************************/
 function deleteAddress($conn, $data) {
     if (empty($_SESSION['user_id'])) {
@@ -521,22 +550,6 @@ function deleteAddress($conn, $data) {
         ResponseHandler::error('Address ID is required', 400);
     }
     
-    // Check if address belongs to user
-    $stmt = $conn->prepare(
-        "SELECT id, is_default FROM user_addresses 
-         WHERE id = :id AND user_id = :user_id"
-    );
-    $stmt->execute([
-        ':id' => $addressId,
-        ':user_id' => $_SESSION['user_id']
-    ]);
-    $address = $stmt->fetch(PDO::FETCH_ASSOC);
-    
-    if (!$address) {
-        ResponseHandler::error('Address not found', 404);
-    }
-    
-    // Delete address
     $stmt = $conn->prepare(
         "DELETE FROM user_addresses WHERE id = :id AND user_id = :user_id"
     );
@@ -572,7 +585,6 @@ function changePassword($conn, $data) {
         ResponseHandler::error('Password must be at least 6 characters', 400);
     }
 
-    // Get current user password
     $stmt = $conn->prepare("SELECT password FROM users WHERE id = :id");
     $stmt->execute([':id' => $_SESSION['user_id']]);
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -581,7 +593,6 @@ function changePassword($conn, $data) {
         ResponseHandler::error('Current password is incorrect', 401);
     }
 
-    // Update password
     $stmt = $conn->prepare(
         "UPDATE users SET password = :password, updated_at = NOW() WHERE id = :id"
     );
@@ -603,7 +614,6 @@ function forgotPassword($conn, $data) {
         ResponseHandler::error('Email or phone number is required', 400);
     }
 
-    // Check if identifier is email or phone
     $isPhone = preg_match('/^[\+]?[0-9\s\-\(\)]+$/', $identifier);
     $isEmail = filter_var($identifier, FILTER_VALIDATE_EMAIL);
 
@@ -623,14 +633,12 @@ function forgotPassword($conn, $data) {
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$user) {
-        // For security, don't reveal if user exists
         ResponseHandler::success([], 'If your account exists, you will receive reset instructions');
         return;
     }
 
-    // Generate reset token (in production, send actual email/SMS)
     $resetToken = bin2hex(random_bytes(32));
-    $expiresAt = date('Y-m-d H:i:s', time() + 3600); // 1 hour expiry
+    $expiresAt = date('Y-m-d H:i:s', time() + 3600);
     
     $stmt = $conn->prepare(
         "UPDATE users SET 
@@ -656,8 +664,323 @@ function logoutUser() {
 }
 
 /*********************************
- * CLEAN PHONE NUMBER
+ * ========== EMAIL VERIFICATION FUNCTIONS ==========
  *********************************/
+
+/**
+ * Check email verification status
+ */
+function checkEmailVerificationStatus($conn, $data) {
+    $email = trim($data['email'] ?? '');
+    
+    if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        ResponseHandler::error('Valid email address is required', 400);
+    }
+    
+    $stmt = $conn->prepare(
+        "SELECT email_verified FROM users WHERE email = :email"
+    );
+    $stmt->execute([':email' => $email]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    $isVerified = $user ? ($user['email_verified'] == 1) : false;
+    
+    ResponseHandler::success([
+        'is_verified' => $isVerified
+    ]);
+}
+
+/**
+ * Send email verification code
+ */
+function sendEmailVerification($conn, $data) {
+    $email = trim($data['email'] ?? '');
+    
+    if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        ResponseHandler::error('Valid email address is required', 400);
+    }
+    
+    // Check if user exists
+    $stmt = $conn->prepare("SELECT id FROM users WHERE email = :email");
+    $stmt->execute([':email' => $email]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$user) {
+        ResponseHandler::error('No account found with this email', 404);
+    }
+    
+    // Generate 6-digit code
+    $verificationCode = sprintf("%06d", random_int(0, 999999));
+    $expiresAt = date('Y-m-d H:i:s', time() + 300); // 5 minutes
+    
+    // Store in database
+    $stmt = $conn->prepare(
+        "INSERT INTO email_verifications (email, code, expires_at, created_at)
+         VALUES (:email, :code, :expires_at, NOW())
+         ON DUPLICATE KEY UPDATE
+         code = VALUES(code),
+         expires_at = VALUES(expires_at),
+         attempts = 0,
+         created_at = NOW()"
+    );
+    
+    $stmt->execute([
+        ':email' => $email,
+        ':code' => $verificationCode,
+        ':expires_at' => $expiresAt
+    ]);
+    
+    // Send email
+    $emailSent = sendEmailVerificationCode($email, $verificationCode);
+    
+    if (!$emailSent) {
+        error_log("Failed to send verification email to: $email - Code: $verificationCode");
+        ResponseHandler::success([
+            'code' => $verificationCode,
+            'expires_in' => 300
+        ], 'Verification code generated (email sending failed - check logs)');
+        return;
+    }
+    
+    ResponseHandler::success([
+        'expires_in' => 300
+    ], 'Verification code sent to your email');
+}
+
+/**
+ * Verify email with code
+ */
+function verifyEmail($conn, $data) {
+    $email = trim($data['email'] ?? '');
+    $code = $data['verification_code'] ?? '';
+    
+    if (!$email || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        ResponseHandler::error('Valid email address is required', 400);
+    }
+    
+    if (!$code || strlen($code) != 6) {
+        ResponseHandler::error('Valid 6-digit verification code is required', 400);
+    }
+    
+    // Get verification record
+    $stmt = $conn->prepare(
+        "SELECT id, code, expires_at, attempts 
+         FROM email_verifications 
+         WHERE email = :email 
+         ORDER BY created_at DESC 
+         LIMIT 1"
+    );
+    $stmt->execute([':email' => $email]);
+    $verification = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$verification) {
+        ResponseHandler::error('No verification code found. Please request a new code.', 400);
+    }
+    
+    // Check attempts
+    if ($verification['attempts'] >= 5) {
+        $conn->prepare("DELETE FROM email_verifications WHERE email = :email")
+             ->execute([':email' => $email]);
+        ResponseHandler::error('Too many failed attempts. Please request a new code.', 400);
+    }
+    
+    // Check expiration
+    if (strtotime($verification['expires_at']) < time()) {
+        $conn->prepare("DELETE FROM email_verifications WHERE email = :email")
+             ->execute([':email' => $email]);
+        ResponseHandler::error('Verification code expired. Please request a new code.', 400);
+    }
+    
+    // Verify code
+    if ($verification['code'] !== $code) {
+        $conn->prepare(
+            "UPDATE email_verifications SET attempts = attempts + 1 WHERE id = :id"
+        )->execute([':id' => $verification['id']]);
+        
+        $remaining = 5 - ($verification['attempts'] + 1);
+        ResponseHandler::error("Invalid code. $remaining attempts remaining.", 400);
+    }
+    
+    // Update user's email verification status
+    $stmt = $conn->prepare(
+        "UPDATE users SET email_verified = 1, updated_at = NOW() 
+         WHERE email = :email"
+    );
+    $stmt->execute([':email' => $email]);
+    
+    // Delete used verification
+    $conn->prepare("DELETE FROM email_verifications WHERE email = :email")
+         ->execute([':email' => $email]);
+    
+    ResponseHandler::success([], 'Email verified successfully');
+}
+
+/*********************************
+ * ========== PHONE VERIFICATION FUNCTIONS ==========
+ *********************************/
+
+/**
+ * Check phone verification status
+ */
+function checkPhoneVerificationStatus($conn, $data) {
+    $phone = cleanPhoneNumber($data['phone'] ?? '');
+    
+    if (!$phone || strlen($phone) < 10) {
+        ResponseHandler::error('Valid phone number is required', 400);
+    }
+    
+    $stmt = $conn->prepare(
+        "SELECT phone_verified FROM users WHERE phone = :phone"
+    );
+    $stmt->execute([':phone' => $phone]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    $isVerified = $user ? ($user['phone_verified'] == 1) : false;
+    
+    ResponseHandler::success([
+        'is_verified' => $isVerified
+    ]);
+}
+
+/**
+ * Send phone verification code (SMS)
+ */
+function sendPhoneVerification($conn, $data) {
+    $phone = cleanPhoneNumber($data['phone'] ?? '');
+    
+    if (!$phone || strlen($phone) < 10) {
+        ResponseHandler::error('Valid phone number is required', 400);
+    }
+    
+    // Check if user exists
+    $stmt = $conn->prepare("SELECT id FROM users WHERE phone = :phone");
+    $stmt->execute([':phone' => $phone]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$user) {
+        ResponseHandler::error('No account found with this phone number', 404);
+    }
+    
+    // Generate 6-digit code
+    $verificationCode = sprintf("%06d", random_int(0, 999999));
+    $expiresAt = date('Y-m-d H:i:s', time() + 300); // 5 minutes
+    
+    // Store in database
+    $stmt = $conn->prepare(
+        "INSERT INTO phone_verifications (phone, code, expires_at, created_at)
+         VALUES (:phone, :code, :expires_at, NOW())
+         ON DUPLICATE KEY UPDATE
+         code = VALUES(code),
+         expires_at = VALUES(expires_at),
+         attempts = 0,
+         created_at = NOW()"
+    );
+    
+    $stmt->execute([
+        ':phone' => $phone,
+        ':code' => $verificationCode,
+        ':expires_at' => $expiresAt
+    ]);
+    
+    // Send SMS
+    $smsSent = sendSmsVerificationCode($phone, $verificationCode);
+    
+    if (!$smsSent) {
+        error_log("Failed to send SMS to: $phone - Code: $verificationCode");
+        ResponseHandler::success([
+            'code' => $verificationCode,
+            'expires_in' => 300
+        ], 'Verification code generated (SMS sending failed - check logs)');
+        return;
+    }
+    
+    ResponseHandler::success([
+        'expires_in' => 300
+    ], 'Verification code sent to your phone');
+}
+
+/**
+ * Resend phone verification code
+ */
+function resendPhoneVerification($conn, $data) {
+    sendPhoneVerification($conn, $data);
+}
+
+/**
+ * Verify phone with code
+ */
+function verifyPhone($conn, $data) {
+    $phone = cleanPhoneNumber($data['phone'] ?? '');
+    $code = $data['verification_code'] ?? '';
+    
+    if (!$phone || strlen($phone) < 10) {
+        ResponseHandler::error('Valid phone number is required', 400);
+    }
+    
+    if (!$code || strlen($code) != 6) {
+        ResponseHandler::error('Valid 6-digit verification code is required', 400);
+    }
+    
+    // Get verification record
+    $stmt = $conn->prepare(
+        "SELECT id, code, expires_at, attempts 
+         FROM phone_verifications 
+         WHERE phone = :phone 
+         ORDER BY created_at DESC 
+         LIMIT 1"
+    );
+    $stmt->execute([':phone' => $phone]);
+    $verification = $stmt->fetch(PDO::FETCH_ASSOC);
+    
+    if (!$verification) {
+        ResponseHandler::error('No verification code found. Please request a new code.', 400);
+    }
+    
+    // Check attempts
+    if ($verification['attempts'] >= 5) {
+        $conn->prepare("DELETE FROM phone_verifications WHERE phone = :phone")
+             ->execute([':phone' => $phone]);
+        ResponseHandler::error('Too many failed attempts. Please request a new code.', 400);
+    }
+    
+    // Check expiration
+    if (strtotime($verification['expires_at']) < time()) {
+        $conn->prepare("DELETE FROM phone_verifications WHERE phone = :phone")
+             ->execute([':phone' => $phone]);
+        ResponseHandler::error('Verification code expired. Please request a new code.', 400);
+    }
+    
+    // Verify code
+    if ($verification['code'] !== $code) {
+        $conn->prepare(
+            "UPDATE phone_verifications SET attempts = attempts + 1 WHERE id = :id"
+        )->execute([':id' => $verification['id']]);
+        
+        $remaining = 5 - ($verification['attempts'] + 1);
+        ResponseHandler::error("Invalid code. $remaining attempts remaining.", 400);
+    }
+    
+    // Update user's phone verification status
+    $stmt = $conn->prepare(
+        "UPDATE users SET phone_verified = 1, updated_at = NOW() 
+         WHERE phone = :phone"
+    );
+    $stmt->execute([':phone' => $phone]);
+    
+    // Delete used verification
+    $conn->prepare("DELETE FROM phone_verifications WHERE phone = :phone")
+         ->execute([':phone' => $phone]);
+    
+    ResponseHandler::success([], 'Phone number verified successfully');
+}
+
+/*********************************
+ * HELPER FUNCTIONS
+ *********************************/
+
+/**
+ * Clean phone number - remove non-digits, preserve leading +
+ */
 function cleanPhoneNumber($phone) {
     $phone = trim($phone);
     $hasPlus = substr($phone, 0, 1) === '+';
@@ -670,12 +993,149 @@ function cleanPhoneNumber($phone) {
     return $digits;
 }
 
-/*********************************
- * FORMAT USER DATA FOR FLUTTER
- * Now includes address from user_addresses table
- *********************************/
+/**
+ * Send SMS verification code (implement with your SMS provider)
+ */
+function sendSmsVerificationCode($phone, $code) {
+    // TODO: Implement your SMS provider here (Twilio, Vonage, etc.)
+    // Example with Twilio:
+    /*
+    require_once '/path/to/twilio-php/Twilio/autoload.php';
+    
+    $sid = 'your_account_sid';
+    $token = 'your_auth_token';
+    $twilio = new Twilio\Rest\Client($sid, $token);
+    
+    $message = $twilio->messages->create(
+        $phone,
+        [
+            'from' => '+1234567890',
+            'body' => "Your verification code is: $code"
+        ]
+    );
+    
+    return $message->sid ? true : false;
+    */
+    
+    // For development, log the code
+    error_log("SMS to $phone: Your verification code is $code");
+    
+    // Return true for development (assume success)
+    return true;
+}
+
+/**
+ * Send email verification code
+ */
+function sendEmailVerificationCode($email, $code) {
+    $subject = "Verify Your Account - DropX";
+    $message = "
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset='UTF-8'>
+        <title>Email Verification</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                background-color: #f5f5f5;
+                margin: 0;
+                padding: 0;
+            }
+            .container {
+                max-width: 600px;
+                margin: 20px auto;
+                background-color: #ffffff;
+                border-radius: 10px;
+                overflow: hidden;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            }
+            .header {
+                background-color: #44A3E3;
+                padding: 30px;
+                text-align: center;
+            }
+            .header h1 {
+                color: #ffffff;
+                margin: 0;
+                font-size: 28px;
+            }
+            .content {
+                padding: 40px 30px;
+                text-align: center;
+            }
+            .code {
+                font-size: 48px;
+                font-weight: bold;
+                color: #44A3E3;
+                letter-spacing: 10px;
+                background-color: #f0f7ff;
+                padding: 20px;
+                border-radius: 10px;
+                margin: 20px 0;
+                font-family: monospace;
+            }
+            .message {
+                color: #666666;
+                line-height: 1.6;
+                margin-bottom: 30px;
+            }
+            .footer {
+                background-color: #f9f9f9;
+                padding: 20px;
+                text-align: center;
+                color: #999999;
+                font-size: 12px;
+            }
+            .button {
+                background-color: #44A3E3;
+                color: #ffffff;
+                text-decoration: none;
+                padding: 12px 30px;
+                border-radius: 5px;
+                display: inline-block;
+                margin: 20px 0;
+            }
+        </style>
+    </head>
+    <body>
+        <div class='container'>
+            <div class='header'>
+                <h1>DropX</h1>
+            </div>
+            <div class='content'>
+                <h2>Verify Your Email Address</h2>
+                <p class='message'>
+                    Thank you for registering with DropX. Please use the verification code below to complete your registration.
+                </p>
+                <div class='code'>
+                    $code
+                </div>
+                <p class='message'>
+                    This code will expire in <strong>5 minutes</strong>.<br>
+                    If you didn't request this, please ignore this email.
+                </p>
+            </div>
+            <div class='footer'>
+                &copy; " . date('Y') . " DropX. All rights reserved.
+            </div>
+        </div>
+    </body>
+    </html>
+    ";
+    
+    $headers = "MIME-Version: 1.0\r\n";
+    $headers .= "Content-type: text/html; charset=UTF-8\r\n";
+    $headers .= "From: DropX <noreply@dropx.com>\r\n";
+    $headers .= "Reply-To: support@dropx.com\r\n";
+    
+    return mail($email, $subject, $message, $headers);
+}
+
+/**
+ * Format user data for Flutter
+ */
 function formatUserData($conn, $user) {
-    // Get default address if exists
     $address = null;
     $city = null;
     
@@ -704,7 +1164,7 @@ function formatUserData($conn, $user) {
         'full_name' => $user['full_name'] ?: 'User',
         'email' => $user['email'] ?? '',
         'phone' => $user['phone'] ?? '',
-        'address' => $address ?? '', // Comes from user_addresses table
+        'address' => $address ?? '',
         'city' => $city ?? '',
         'gender' => $user['gender'] ?? '',
         'avatar' => $user['avatar'] ?? null,
@@ -716,7 +1176,9 @@ function formatUserData($conn, $user) {
         'verified' => (bool) ($user['verified'] ?? false),
         'member_since' => $user['member_since'] ?? date('M d, Y'),
         'created_at' => $user['created_at'] ?? '',
-        'updated_at' => $user['updated_at'] ?? ''
+        'updated_at' => $user['updated_at'] ?? '',
+        'email_verified' => (bool) ($user['email_verified'] ?? false),
+        'phone_verified' => (bool) ($user['phone_verified'] ?? false)
     ];
 }
 ?>
