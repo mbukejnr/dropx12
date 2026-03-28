@@ -1472,68 +1472,69 @@ function getMultipleMerchants($conn, $data, $baseUrl) {
 }
 
 /*********************************
- * GET ADS PHOTOS FOR HOME PAGE
+ * GET ADS PHOTOS FOR HOME PAGE - SIMPLIFIED
+ * Just returns photos from ad_photos table
  *********************************/
 function getAdsPhotos($conn, $baseUrl) {
     $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
-    $limit = isset($_GET['limit']) ? max(1, intval($_GET['limit'])) : 30;
+    $limit = isset($_GET['limit']) ? min(50, max(1, intval($_GET['limit']))) : 30;
     $offset = ($page - 1) * $limit;
 
-    // Get all active ads with photos
+    // Get all ad photos directly from ad_photos table
     $stmt = $conn->prepare(
         "SELECT 
-            a.id as ad_id,
-            a.user_id as merchant_id,
-            COALESCE(
-                (SELECT photo_path FROM ad_photos WHERE ad_id = a.id AND is_primary = 1 LIMIT 1),
-                (SELECT photo_path FROM ad_photos WHERE ad_id = a.id ORDER BY sort_order ASC LIMIT 1)
-            ) as photo
-         FROM customer_ads a
-         WHERE a.status = 'active' 
-            AND a.expiry_date > NOW()
-            AND EXISTS (SELECT 1 FROM ad_photos WHERE ad_id = a.id)
-         ORDER BY a.created_at DESC
-         LIMIT :limit OFFSET :offset"
+            ap.id as photo_id,
+            ap.photo_path,
+            ap.is_primary,
+            ap.sort_order,
+            ap.created_at
+        FROM ad_photos ap
+        ORDER BY ap.is_primary DESC, ap.sort_order ASC, ap.created_at DESC
+        LIMIT :limit OFFSET :offset"
     );
     
     $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
     $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
     $stmt->execute();
-    $ads = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    $photos = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // Format for display - just ad_id, merchant_id, and photo_url
-$formattedAds = [];
-foreach ($ads as $ad) {
-    if ($ad['photo']) {
-        // Make sure the photo path includes the full directory
-        $photoPath = $ad['photo'];
-        
-        // If it doesn't start with /uploads/, add it
-        if (strpos($photoPath, '/uploads/') !== 0) {
-            $photoPath = '/uploads/ads/' . ltrim($photoPath, '/');
+    // Format for display
+    $formattedAds = [];
+    foreach ($photos as $photo) {
+        if ($photo['photo_path']) {
+            $photoPath = $photo['photo_path'];
+            
+            // Build full URL
+            if (strpos($photoPath, 'http://') === 0 || strpos($photoPath, 'https://') === 0) {
+                // Already a full URL
+                $fullUrl = $photoPath;
+            } elseif (strpos($photoPath, '/uploads/') === 0) {
+                // Already has /uploads/ prefix
+                $fullUrl = rtrim($baseUrl, '/') . $photoPath;
+            } else {
+                // Add /uploads/ads/ prefix
+                $fullUrl = rtrim($baseUrl, '/') . '/uploads/ads/' . ltrim($photoPath, '/');
+            }
+            
+            $formattedAds[] = [
+                'id' => $photo['photo_id'],
+                'image' => $fullUrl,
+                'is_primary' => (bool)$photo['is_primary'],
+                'sort_order' => (int)$photo['sort_order'],
+                'created_at' => $photo['created_at']
+            ];
         }
-        
-        $formattedAds[] = [
-            'ad_id' => $ad['ad_id'],
-            'merchant_id' => $ad['merchant_id'],
-            'image' => rtrim($baseUrl, '/') . $photoPath
-        ];
     }
-}
 
-    // Get total count for pagination
-    $countStmt = $conn->query(
-        "SELECT COUNT(*) as total 
-         FROM customer_ads a
-         WHERE a.status = 'active' 
-            AND a.expiry_date > NOW()
-            AND EXISTS (SELECT 1 FROM ad_photos WHERE ad_id = a.id)"
-    );
+    // Get total count
+    $countStmt = $conn->query("SELECT COUNT(*) as total FROM ad_photos");
     $total = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
 
     ResponseHandler::success([
         'ads' => $formattedAds,
         'page' => $page,
+        'limit' => $limit,
+        'total' => (int)$total,
         'total_pages' => ceil($total / $limit)
     ]);
 }
