@@ -31,6 +31,26 @@ if (session_status() === PHP_SESSION_NONE) {
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/ResponseHandler.php';
 
+// Load Twilio SDK (install via composer: composer require twilio/sdk)
+// If you haven't installed, comment out the next line and uncomment the manual require
+if (file_exists(__DIR__ . '/../vendor/autoload.php')) {
+    require_once __DIR__ . '/../vendor/autoload.php';
+}
+
+use Twilio\Rest\Client;
+
+/*********************************
+ * MALAWI SMS CONFIGURATION
+ * REPLACE THESE WITH YOUR ACTUAL TWILIO CREDENTIALS
+ *********************************/
+// Get from Twilio Console: https://www.twilio.com/console
+$twilioSid = 'ACa25c0ca1e0864e842329e36bedb6b42a'; // REPLACE WITH YOUR TWILIO SID
+$twilioToken = '69ab66ee8bb1031a850a4c8849897290'; // REPLACE WITH YOUR TWILIO TOKEN
+$twilioPhoneNumber = '+265998969229'; // REPLACE WITH YOUR TWILIO PHONE NUMBER
+
+// Malawi country code
+$malawiCountryCode = '+265';
+
 /*********************************
  * ROUTER
  *********************************/
@@ -423,7 +443,7 @@ function updateAddress($conn, $data) {
     $city = trim($data['city'] ?? '');
     $state = trim($data['state'] ?? '');
     $postalCode = trim($data['postal_code'] ?? '');
-    $country = trim($data['country'] ?? 'Egypt');
+    $country = trim($data['country'] ?? 'Malawi');
     $addressType = $data['address_type'] ?? 'home';
     $isDefault = $data['is_default'] ?? true;
 
@@ -843,9 +863,11 @@ function checkPhoneVerificationStatus($conn, $data) {
 }
 
 /**
- * Send phone verification code (SMS)
+ * Send phone verification code (SMS) - MALAWI VERSION
  */
 function sendPhoneVerification($conn, $data) {
+    global $twilioSid, $twilioToken, $twilioPhoneNumber, $malawiCountryCode;
+    
     $phone = cleanPhoneNumber($data['phone'] ?? '');
     
     if (!$phone || strlen($phone) < 10) {
@@ -887,10 +909,15 @@ function sendPhoneVerification($conn, $data) {
     
     if (!$smsSent) {
         error_log("Failed to send SMS to: $phone - Code: $verificationCode");
-        ResponseHandler::success([
-            'code' => $verificationCode,
-            'expires_in' => 300
-        ], 'Verification code generated (SMS sending failed - check logs)');
+        // In development, return the code for testing
+        if (getenv('APP_ENV') === 'development') {
+            ResponseHandler::success([
+                'code' => $verificationCode,
+                'expires_in' => 300
+            ], 'Verification code generated (SMS sending failed - check logs)');
+        } else {
+            ResponseHandler::error('Failed to send verification code. Please try again.', 500);
+        }
         return;
     }
     
@@ -994,34 +1021,98 @@ function cleanPhoneNumber($phone) {
 }
 
 /**
- * Send SMS verification code (implement with your SMS provider)
+ * Send SMS verification code using Twilio - MALAWI VERSION
+ * REPLACE WITH YOUR ACTUAL TWILIO CREDENTIALS
  */
 function sendSmsVerificationCode($phone, $code) {
-    // TODO: Implement your SMS provider here (Twilio, Vonage, etc.)
-    // Example with Twilio:
-    /*
-    require_once '/path/to/twilio-php/Twilio/autoload.php';
+    global $twilioSid, $twilioToken, $twilioPhoneNumber, $malawiCountryCode;
     
-    $sid = 'your_account_sid';
-    $token = 'your_auth_token';
-    $twilio = new Twilio\Rest\Client($sid, $token);
+    // Check if Twilio is configured
+    if (empty($twilioSid) || $twilioSid === 'ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx') {
+        error_log("Twilio not configured. Please add your Twilio credentials to the file.");
+        return false;
+    }
     
-    $message = $twilio->messages->create(
-        $phone,
-        [
-            'from' => '+1234567890',
-            'body' => "Your verification code is: $code"
-        ]
-    );
+    if (empty($twilioToken) || $twilioToken === 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx') {
+        error_log("Twilio not configured. Please add your Twilio credentials to the file.");
+        return false;
+    }
     
-    return $message->sid ? true : false;
-    */
+    if (empty($twilioPhoneNumber) || $twilioPhoneNumber === '+1234567890') {
+        error_log("Twilio not configured. Please add your Twilio phone number to the file.");
+        return false;
+    }
     
-    // For development, log the code
-    error_log("SMS to $phone: Your verification code is $code");
+    try {
+        // Format phone number for Malawi
+        $formattedPhone = formatPhoneNumberForMalawi($phone);
+        
+        // Initialize Twilio client
+        $twilio = new Client($twilioSid, $twilioToken);
+        
+        // Create and send message
+        $message = $twilio->messages->create(
+            $formattedPhone,
+            [
+                'from' => $twilioPhoneNumber,
+                'body' => "DropX Verification\n\nYour verification code is: $code\n\nThis code will expire in 5 minutes.\n\nNever share this code with anyone."
+            ]
+        );
+        
+        // Log success (optional)
+        error_log("SMS sent successfully to $phone: " . $message->sid);
+        
+        return true;
+        
+    } catch (Exception $e) {
+        // Log error
+        error_log("Twilio SMS failed for $phone: " . $e->getMessage());
+        return false;
+    }
+}
+
+/**
+ * Format phone number for Malawi (+265)
+ * Handles various formats:
+ * - 0999123456 -> +265999123456
+ * - 999123456 -> +265999123456
+ * - +265999123456 -> +265999123456
+ */
+function formatPhoneNumberForMalawi($phone) {
+    global $malawiCountryCode;
     
-    // Return true for development (assume success)
-    return true;
+    // Remove all non-numeric characters except '+'
+    $phone = preg_replace('/[^0-9+]/', '', $phone);
+    
+    // If phone already has +, assume it's properly formatted
+    if (substr($phone, 0, 1) === '+') {
+        // Check if it's already Malawi format
+        if (substr($phone, 0, 4) === '+265') {
+            return $phone;
+        }
+        // If it's a different country code, keep as is
+        return $phone;
+    }
+    
+    // Remove leading zero if present
+    $phone = ltrim($phone, '0');
+    
+    // If phone is 9 digits (Malawi local without country code)
+    if (strlen($phone) === 9) {
+        return $malawiCountryCode . $phone;
+    }
+    
+    // If phone is 10-12 digits, assume it's local with possible country code
+    if (strlen($phone) >= 10 && strlen($phone) <= 12) {
+        // Check if it already has 265 at the beginning
+        if (substr($phone, 0, 3) === '265') {
+            return '+' . $phone;
+        }
+        return $malawiCountryCode . $phone;
+    }
+    
+    // Default: just add Malawi code
+    return $malawiCountryCode . $phone;
 }
 
 /**
@@ -1086,15 +1177,6 @@ function sendEmailVerificationCode($email, $code) {
                 text-align: center;
                 color: #999999;
                 font-size: 12px;
-            }
-            .button {
-                background-color: #44A3E3;
-                color: #ffffff;
-                text-decoration: none;
-                padding: 12px 30px;
-                border-radius: 5px;
-                display: inline-block;
-                margin: 20px 0;
             }
         </style>
     </head>
