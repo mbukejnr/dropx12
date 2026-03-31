@@ -258,6 +258,79 @@ try {
 }
 
 /*********************************
+ * GET ADS PHOTOS FOR HOME PAGE - WITH MERCHANT ID
+ *********************************/
+function getAdsPhotos($conn, $baseUrl) {
+    $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
+    $limit = isset($_GET['limit']) ? min(50, max(1, intval($_GET['limit']))) : 30;
+    $offset = ($page - 1) * $limit;
+
+    // Get ads with merchant_id from ad_photos table
+    // IMPORTANT: Your ad_photos table MUST have a merchant_id column
+    // Run this SQL if not exists:
+    // ALTER TABLE ad_photos ADD COLUMN merchant_id INT NULL;
+    // ALTER TABLE ad_photos ADD FOREIGN KEY (merchant_id) REFERENCES merchants(id) ON DELETE SET NULL;
+    
+    $stmt = $conn->prepare(
+        "SELECT 
+            ap.id as ad_id,
+            ap.merchant_id,
+            ap.photo_path as image,
+            ap.is_primary,
+            ap.sort_order,
+            ap.created_at
+        FROM ad_photos ap
+        WHERE ap.merchant_id IS NOT NULL
+        ORDER BY ap.is_primary DESC, ap.sort_order ASC, ap.created_at DESC
+        LIMIT :limit OFFSET :offset"
+    );
+    
+    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+    $photos = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    // Format for display
+    $formattedAds = [];
+    foreach ($photos as $photo) {
+        if ($photo['image']) {
+            $photoPath = $photo['image'];
+            
+            // Build full URL
+            if (strpos($photoPath, 'http://') === 0 || strpos($photoPath, 'https://') === 0) {
+                $fullUrl = $photoPath;
+            } elseif (strpos($photoPath, '/uploads/') === 0) {
+                $fullUrl = rtrim($baseUrl, '/') . $photoPath;
+            } else {
+                $fullUrl = rtrim($baseUrl, '/') . '/uploads/ads/' . ltrim($photoPath, '/');
+            }
+            
+            $formattedAds[] = [
+                'ad_id' => $photo['ad_id'],
+                'merchant_id' => $photo['merchant_id'],
+                'image' => $fullUrl,
+                'is_primary' => (bool)$photo['is_primary'],
+                'sort_order' => (int)$photo['sort_order'],
+                'created_at' => $photo['created_at']
+            ];
+        }
+    }
+
+    // Get total count
+    $countStmt = $conn->prepare("SELECT COUNT(*) as total FROM ad_photos WHERE merchant_id IS NOT NULL");
+    $countStmt->execute();
+    $total = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
+
+    ResponseHandler::success([
+        'ads' => $formattedAds,
+        'page' => $page,
+        'limit' => $limit,
+        'total' => (int)$total,
+        'total_pages' => ceil($total / $limit)
+    ]);
+}
+
+/*********************************
  * GET MERCHANTS LIST - ENHANCED
  *********************************/
 function getMerchantsList($conn, $baseUrl) {
@@ -1472,74 +1545,6 @@ function getMultipleMerchants($conn, $data, $baseUrl) {
 }
 
 /*********************************
- * GET ADS PHOTOS FOR HOME PAGE - SIMPLIFIED
- * Just returns photos from ad_photos table
- *********************************/
-function getAdsPhotos($conn, $baseUrl) {
-    $page = isset($_GET['page']) ? max(1, intval($_GET['page'])) : 1;
-    $limit = isset($_GET['limit']) ? min(50, max(1, intval($_GET['limit']))) : 30;
-    $offset = ($page - 1) * $limit;
-
-    // Get all ad photos directly from ad_photos table
-    $stmt = $conn->prepare(
-        "SELECT 
-            ap.id as photo_id,
-            ap.photo_path,
-            ap.is_primary,
-            ap.sort_order,
-            ap.created_at
-        FROM ad_photos ap
-        ORDER BY ap.is_primary DESC, ap.sort_order ASC, ap.created_at DESC
-        LIMIT :limit OFFSET :offset"
-    );
-    
-    $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
-    $stmt->bindValue(':offset', $offset, PDO::PARAM_INT);
-    $stmt->execute();
-    $photos = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
-    // Format for display
-    $formattedAds = [];
-    foreach ($photos as $photo) {
-        if ($photo['photo_path']) {
-            $photoPath = $photo['photo_path'];
-            
-            // Build full URL
-            if (strpos($photoPath, 'http://') === 0 || strpos($photoPath, 'https://') === 0) {
-                // Already a full URL
-                $fullUrl = $photoPath;
-            } elseif (strpos($photoPath, '/uploads/') === 0) {
-                // Already has /uploads/ prefix
-                $fullUrl = rtrim($baseUrl, '/') . $photoPath;
-            } else {
-                // Add /uploads/ads/ prefix
-                $fullUrl = rtrim($baseUrl, '/') . '/uploads/ads/' . ltrim($photoPath, '/');
-            }
-            
-            $formattedAds[] = [
-                'id' => $photo['photo_id'],
-                'image' => $fullUrl,
-                'is_primary' => (bool)$photo['is_primary'],
-                'sort_order' => (int)$photo['sort_order'],
-                'created_at' => $photo['created_at']
-            ];
-        }
-    }
-
-    // Get total count
-    $countStmt = $conn->query("SELECT COUNT(*) as total FROM ad_photos");
-    $total = $countStmt->fetch(PDO::FETCH_ASSOC)['total'];
-
-    ResponseHandler::success([
-        'ads' => $formattedAds,
-        'page' => $page,
-        'limit' => $limit,
-        'total' => (int)$total,
-        'total_pages' => ceil($total / $limit)
-    ]);
-}
-
-/*********************************
  * POST REQUEST HANDLER - ENHANCED
  *********************************/
 function handlePostRequest($conn, $baseUrl) {
@@ -2261,6 +2266,7 @@ function formatMenuItemData($item, $baseUrl) {
         'updated_at' => $item['updated_at'] ?? ''
     ];
 }
+
 function formatCategoryData($category, $baseUrl) {
     $imageUrl = '';
     if (!empty($category['image_url'])) {
