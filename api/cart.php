@@ -617,17 +617,20 @@ function addItemToCart($conn, $data, $userId) {
 }
 
 /*********************************
- * ADD QUICK ORDER TO CART - SIMPLIFIED
+ * ADD QUICK ORDER TO CART - PROFESSIONAL VERSION
+ * Treats quick orders as single combo items
+ * No dependency on quick_order_items (optional for display only)
  *********************************/
 function addQuickOrderToCart($conn, $data, $userId) {
     global $baseUrl;
     
+    // ========== 1. VALIDATE INPUT ==========
     $quickOrderId = $data['quick_order_id'] ?? null;
     $quickOrderItemId = $data['quick_order_item_id'] ?? null;
     $merchantId = $data['merchant_id'] ?? null;
-    $quantity = intval($data['quantity'] ?? 1);
+    $quantity = max(1, intval($data['quantity'] ?? 1));
     $selectedAddOns = $data['selected_add_ons'] ?? [];
-    $specialInstructions = $data['special_instructions'] ?? '';
+    $specialInstructions = trim($data['special_instructions'] ?? '');
     $variantId = $data['variant_id'] ?? null;
     $variantData = $data['variant_data'] ?? null;
     
@@ -635,126 +638,152 @@ function addQuickOrderToCart($conn, $data, $userId) {
         ResponseHandler::error('Quick order ID and merchant ID are required', 400);
     }
     
-    if ($quantity < 1) {
-        ResponseHandler::error('Quantity must be at least 1', 400);
-    }
+    // ========== 2. GET QUICK ORDER (THE COMBO ITSELF) ==========
+    $quickOrderStmt = $conn->prepare("
+        SELECT 
+            qo.id,
+            qo.title,
+            qo.description,
+            qo.price,
+            qo.image_url,
+            qo.category,
+            qo.item_type,
+            qo.delivery_time,
+            qo.preparation_time,
+            qo.merchant_id,
+            qo.is_available,
+            qo.has_variants,
+            qo.variant_type,
+            COALESCE(qom.custom_price, qo.price) as final_price,
+            m.name as merchant_name,
+            m.is_active as merchant_active
+        FROM quick_orders qo
+        INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
+        INNER JOIN merchants m ON qom.merchant_id = m.id
+        WHERE qo.id = :quick_order_id
+        AND qom.merchant_id = :merchant_id
+        AND qom.is_active = 1
+        AND qo.is_available = 1
+        AND m.is_active = 1
+    ");
     
-    // Get quick order details
-    $qoStmt = $conn->prepare(
-        "SELECT 
-            qo.*,
-            qom.custom_price,
-            qoi.id as item_id,
-            qoi.name as item_name,
-            qoi.description as item_description,
-            qoi.price as item_price,
-            qoi.image_url as item_image,
-            qoi.measurement_type,
-            qoi.unit,
-            qoi.has_variants,
-            qoi.variants_json,
-            m.name as merchant_name
-         FROM quick_orders qo
-         INNER JOIN quick_order_merchants qom ON qo.id = qom.quick_order_id
-         LEFT JOIN quick_order_items qoi ON qo.id = qoi.quick_order_id
-         LEFT JOIN merchants m ON qom.merchant_id = m.id
-         WHERE qo.id = :quick_order_id
-         AND qom.merchant_id = :merchant_id
-         AND qom.is_active = 1
-         AND m.is_active = 1"
-    );
-    
-    $qoStmt->execute([
+    $quickOrderStmt->execute([
         ':quick_order_id' => $quickOrderId,
         ':merchant_id' => $merchantId
     ]);
     
-    $items = $qoStmt->fetchAll(PDO::FETCH_ASSOC);
+    $quickOrder = $quickOrderStmt->fetch(PDO::FETCH_ASSOC);
     
-    if (empty($items)) {
-        ResponseHandler::error('Quick order not available', 404);
+    if (!$quickOrder) {
+        ResponseHandler::error('Quick order not available for this merchant', 404);
     }
     
-    $quickOrder = $items[0];
-    
-    // Find specific item
-    $selectedItem = null;
+    // ========== 3. GET OPTIONAL ITEMS FOR DISPLAY (NOT REQUIRED FOR CART) ==========
+    // These are for reference only - the combo is treated as 1 item
+    $displayItems = [];
     if ($quickOrderItemId) {
-        foreach ($items as $item) {
-            if ($item['item_id'] == $quickOrderItemId) {
-                $selectedItem = $item;
-                break;
-            }
-        }
-        if (!$selectedItem) {
-            ResponseHandler::error('Quick order item not found', 404);
-        }
-    } else {
-        $selectedItem = $items[0];
-        $quickOrderItemId = $selectedItem['item_id'];
+        // Get specific item for display reference
+        $itemStmt = $conn->prepare("
+            SELECT 
+                id, name, description, price, image_url,
+                measurement_type, unit, quantity, has_variants, variants_json
+            FROM quick_order_items 
+            WHERE id = :item_id AND quick_order_id = :quick_order_id
+        ");
+        $itemStmt->execute([
+            ':item_id' => $quickOrderItemId,
+            ':quick_order_id' => $quickOrderId
+        ]);
+        $displayItems = $itemStmt->fetchAll(PDO::FETCH_ASSOC);
+    } elseif ($quickOrder['has_variants'] == 0) {
+        // Optionally get all items for display reference (not stored in cart)
+        $itemsStmt = $conn->prepare("
+            SELECT id, name, description, price, image_url, measurement_type, unit, quantity
+            FROM quick_order_items 
+            WHERE quick_order_id = :quick_order_id AND is_available = 1
+            LIMIT 10
+        ");
+        $itemsStmt->execute([':quick_order_id' => $quickOrderId]);
+        $displayItems = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
     }
     
-    // Calculate price
-    $basePrice = floatval($quickOrder['custom_price'] ?? $quickOrder['price'] ?? 0);
-    $itemPrice = floatval($selectedItem['item_price'] ?? 0);
-    $finalPrice = $basePrice + $itemPrice;
-    
-    // Handle variant
+    // ========== 4. CALCULATE FINAL PRICE ==========
+    $basePrice = floatval($quickOrder['final_price']);
+    $variantPrice = 0;
     $variantName = '';
-    if ($variantId && !empty($selectedItem['variants_json'])) {
-        $variants = json_decode($selectedItem['variants_json'], true) ?? [];
-        foreach ($variants as $variant) {
-            if (($variant['id'] ?? null) == $variantId) {
-                $variantName = ' (' . ($variant['name'] ?? '') . ')';
-                $finalPrice += floatval($variant['price'] ?? 0);
-                if (!$variantData) {
-                    $variantData = $variant;
+    $selectedVariantData = $variantData;
+    
+    // Handle variant if provided (optional feature)
+    if ($variantId && $quickOrder['has_variants'] == 1) {
+        // Try to get variant from quick_order_items
+        $variantStmt = $conn->prepare("
+            SELECT variants_json FROM quick_order_items 
+            WHERE quick_order_id = :quick_order_id 
+            AND has_variants = 1
+            LIMIT 1
+        ");
+        $variantStmt->execute([':quick_order_id' => $quickOrderId]);
+        $variantItem = $variantStmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($variantItem && !empty($variantItem['variants_json'])) {
+            $variants = json_decode($variantItem['variants_json'], true);
+            foreach ($variants as $variant) {
+                if (($variant['id'] ?? null) == $variantId) {
+                    $variantPrice = floatval($variant['price'] ?? 0);
+                    $variantName = ' (' . ($variant['name'] ?? 'Variant') . ')';
+                    $selectedVariantData = $selectedVariantData ?? $variant;
+                    break;
                 }
-                break;
             }
         }
     }
     
-    // Get or create cart
+    $finalPrice = $basePrice + $variantPrice;
+    $itemTotal = $finalPrice * $quantity;
+    $itemName = $quickOrder['title'] . $variantName;
+    
+    // ========== 5. GET OR CREATE USER CART ==========
     $cart = getOrCreateUserCart($conn, $userId);
     
-    // Check if item already in cart
-    $existingStmt = $conn->prepare(
-        "SELECT id, quantity FROM cart_items 
-         WHERE cart_id = :cart_id 
-         AND quick_order_id = :quick_order_id
-         AND quick_order_item_id = :item_id
-         AND (variant_id = :variant_id OR (:variant_id IS NULL AND variant_id IS NULL))
-         AND is_active = 1"
-    );
+    // ========== 6. CHECK FOR EXISTING ITEM IN CART ==========
+    $existingStmt = $conn->prepare("
+        SELECT id, quantity FROM cart_items 
+        WHERE cart_id = :cart_id 
+        AND quick_order_id = :quick_order_id
+        AND (variant_id = :variant_id OR (:variant_id IS NULL AND variant_id IS NULL))
+        AND is_active = 1
+    ");
     
     $existingStmt->execute([
         ':cart_id' => $cart['id'],
         ':quick_order_id' => $quickOrderId,
-        ':item_id' => $quickOrderItemId,
         ':variant_id' => $variantId
     ]);
     $existingItem = $existingStmt->fetch(PDO::FETCH_ASSOC);
     
-    $itemName = $selectedItem['item_name'] . $variantName;
-    $total = $finalPrice * $quantity;
+    // ========== 7. ADD OR UPDATE CART ITEM ==========
+    $cartItemId = null;
+    $message = '';
     
     if ($existingItem) {
+        // Update existing item quantity
         $newQuantity = $existingItem['quantity'] + $quantity;
         $newTotal = $finalPrice * $newQuantity;
         
-        $updateStmt = $conn->prepare(
-            "UPDATE cart_items 
-             SET quantity = :quantity,
-                 total = price * :quantity,
-                 grand_total = (price * :quantity) + add_ons_total,
-                 special_instructions = :instructions,
-                 updated_at = NOW()
-             WHERE id = :id"
-        );
+        $updateStmt = $conn->prepare("
+            UPDATE cart_items 
+            SET quantity = :quantity,
+                total = :total,
+                grand_total = :grand_total,
+                special_instructions = :instructions,
+                updated_at = NOW()
+            WHERE id = :id
+        ");
         
         $updateStmt->execute([
             ':quantity' => $newQuantity,
+            ':total' => $newTotal,
+            ':grand_total' => $newTotal,
             ':instructions' => $specialInstructions,
             ':id' => $existingItem['id']
         ]);
@@ -762,53 +791,56 @@ function addQuickOrderToCart($conn, $data, $userId) {
         $cartItemId = $existingItem['id'];
         $message = 'Quick order quantity updated';
     } else {
-        $insertStmt = $conn->prepare(
-            "INSERT INTO cart_items (
-                cart_id, user_id, quick_order_id, quick_order_item_id,
-                merchant_id, merchant_name, name, description, price,
-                image_url, quantity, total, grand_total,
+        // Add new combo item to cart as a single item
+        $insertStmt = $conn->prepare("
+            INSERT INTO cart_items (
+                cart_id, user_id, 
+                quick_order_id, merchant_id, merchant_name,
+                name, description, price, image_url, 
+                quantity, total, grand_total,
                 measurement_type, unit, item_type, category,
                 variant_id, variant_data, variant_name, has_variants,
                 special_instructions, source_type,
                 is_active, created_at, updated_at
             ) VALUES (
-                :cart_id, :user_id, :quick_order_id, :quick_order_item_id,
-                :merchant_id, :merchant_name, :name, :description, :price,
-                :image_url, :quantity, :total, :total,
+                :cart_id, :user_id,
+                :quick_order_id, :merchant_id, :merchant_name,
+                :name, :description, :price, :image_url,
+                :quantity, :total, :grand_total,
                 :measurement_type, :unit, :item_type, :category,
                 :variant_id, :variant_data, :variant_name, :has_variants,
                 :instructions, 'quick_order',
                 1, NOW(), NOW()
-            )"
-        );
+            )
+        ");
         
         $insertStmt->execute([
             ':cart_id' => $cart['id'],
             ':user_id' => $userId,
             ':quick_order_id' => $quickOrderId,
-            ':quick_order_item_id' => $quickOrderItemId,
-            ':merchant_id' => $merchantId,
+            ':merchant_id' => $quickOrder['merchant_id'],
             ':merchant_name' => $quickOrder['merchant_name'],
             ':name' => $itemName,
-            ':description' => $selectedItem['item_description'],
+            ':description' => $quickOrder['description'],
             ':price' => $finalPrice,
-            ':image_url' => $selectedItem['item_image'],
+            ':image_url' => $quickOrder['image_url'],
             ':quantity' => $quantity,
-            ':total' => $total,
-            ':measurement_type' => $selectedItem['measurement_type'] ?? 'count',
-            ':unit' => $selectedItem['unit'] ?? null,
+            ':total' => $itemTotal,
+            ':grand_total' => $itemTotal,
+            ':measurement_type' => 'combo',
+            ':unit' => 'serving',
             ':item_type' => $quickOrder['item_type'] ?? 'quick_order',
             ':category' => $quickOrder['category'] ?? '',
             ':variant_id' => $variantId,
-            ':variant_data' => $variantData ? json_encode($variantData) : null,
+            ':variant_data' => $selectedVariantData ? json_encode($selectedVariantData) : null,
             ':variant_name' => $variantName,
-            ':has_variants' => $selectedItem['has_variants'] ? 1 : 0,
+            ':has_variants' => $quickOrder['has_variants'] ?? 0,
             ':instructions' => $specialInstructions
         ]);
         
         $cartItemId = $conn->lastInsertId();
         
-        // Add add-ons if any
+        // Add add-ons if any (optional)
         if (!empty($selectedAddOns)) {
             addCartItemAddOns($conn, $cartItemId, $selectedAddOns, $quantity);
         }
@@ -816,25 +848,35 @@ function addQuickOrderToCart($conn, $data, $userId) {
         $message = 'Quick order added to cart';
     }
     
-    // Update cart timestamp
+    // ========== 8. UPDATE CART TIMESTAMP ==========
     $updateCartStmt = $conn->prepare("UPDATE carts SET updated_at = NOW() WHERE id = :cart_id");
     $updateCartStmt->execute([':cart_id' => $cart['id']]);
     
-    // Get updated cart summary
+    // ========== 9. GET UPDATED CART SUMMARY ==========
     $cartItems = getCartItemsByCartId($conn, $cart['id']);
     $subtotal = 0;
+    $totalQuantity = 0;
     foreach ($cartItems as $cartItem) {
         $subtotal += $cartItem['grand_total'];
+        $totalQuantity += $cartItem['quantity'];
     }
     
+    // ========== 10. RETURN SUCCESS RESPONSE ==========
     ResponseHandler::success([
         'message' => $message,
         'cart_item_id' => $cartItemId,
         'cart_id' => $cart['id'],
+        'quick_order' => [
+            'id' => $quickOrder['id'],
+            'title' => $quickOrder['title'],
+            'price' => $finalPrice,
+            'quantity' => $quantity,
+            'total' => $itemTotal
+        ],
         'summary' => [
             'subtotal' => round($subtotal, 2),
             'item_count' => count($cartItems),
-            'total_quantity' => array_sum(array_column($cartItems, 'quantity'))
+            'total_quantity' => $totalQuantity
         ]
     ]);
 }
